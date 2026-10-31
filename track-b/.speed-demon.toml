@@ -1,5 +1,5 @@
 # Read by the board and the scoring harness.
 track = "b"
 team = "another ello"
-language = "Rust"
+language = "C++"
 dependency_count = 0

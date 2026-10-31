@@ -16,7 +16,6 @@
 #include <vector>
 
 using u8 = uint8_t;
-using u16 = uint16_t;
 using u32 = uint32_t;
 using u64 = uint64_t;
 using v4 = __m256i;
@@ -150,10 +149,8 @@ INLINE v4 decode(u64 a, u64 b, u64 c) {
   return _mm256_madd_epi16(x, _mm256_set1_epi32(0x00012710));
 }
 
-alignas(64) static const u8 LOW_BYTES[64] = {
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255};
+// 32 set bytes, then 32 clear ones, to mask a vector to a length.
+static u8 LOW_BYTES[64];
 
 // Up to 32 bytes are masked and mixed at a fixed cost, as a loop per word would
 // mispredict on names of varying length. Longer names, which are rare, loop over
@@ -395,10 +392,10 @@ static char *money(char *out, long long cents) {
 }
 
 int main() {
-  threads = std::thread::hardware_concurrency();
+  memset(LOW_BYTES, 255, 32);
   cpu_set_t cpus;
-  if (!sched_getaffinity(0, sizeof cpus, &cpus))
-    threads = CPU_COUNT(&cpus);
+  sched_getaffinity(0, sizeof cpus, &cpus);
+  threads = CPU_COUNT(&cpus);
   regions = map_input("/data/regions.csv", regions_size);
   input = map_input("/data/records.csv", input_size);
   size_t line = regions_size - 1;
