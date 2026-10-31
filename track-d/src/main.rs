@@ -256,11 +256,14 @@ impl Distances {
         Self { keys: vec![0; TABLE_START], values: vec![0; TABLE_START], mask: TABLE_START - 1, used: 0 }
     }
 
+    // Capacity is kept between searches, but only the part this search used is cleared, and the
+    // next search starts small again. Rare huge tables are released rather than kept per thread.
     fn reset(&mut self) {
         if self.keys.len() > TABLE_KEEP {
             *self = Self::new();
-        } else if self.used > 0 {
-            self.keys.fill(0);
+        } else {
+            self.keys[..=self.mask].fill(0);
+            self.mask = TABLE_START - 1;
             self.used = 0;
         }
     }
@@ -300,7 +303,7 @@ impl Distances {
         self.keys[slot] = node + 1;
         self.values[slot] = distance;
         self.used += 1;
-        if self.used * 2 > self.keys.len() {
+        if self.used * 2 > self.mask {
             self.grow();
         }
         true
@@ -308,18 +311,23 @@ impl Distances {
 
     #[cold]
     fn grow(&mut self) {
-        let size = self.keys.len() * 4;
-        let (old_keys, old_values) = (
-            std::mem::replace(&mut self.keys, vec![0; size]),
-            std::mem::replace(&mut self.values, vec![0; size]),
-        );
+        let old_size = self.mask + 1;
+        let size = old_size * 4;
+        let live: Vec<(u32, u64)> = (0..old_size)
+            .filter(|&i| self.keys[i] != 0)
+            .map(|i| (self.keys[i], self.values[i]))
+            .collect();
+        if size > self.keys.len() {
+            self.keys = vec![0; size];
+            self.values = vec![0; size];
+        } else {
+            self.keys[..size].fill(0);
+        }
         self.mask = size - 1;
-        for (&key, &value) in old_keys.iter().zip(&old_values) {
-            if key != 0 {
-                let slot = self.slot(key - 1);
-                self.keys[slot] = key;
-                self.values[slot] = value;
-            }
+        for (key, value) in live {
+            let slot = self.slot(key - 1);
+            self.keys[slot] = key;
+            self.values[slot] = value;
         }
     }
 }
@@ -408,6 +416,9 @@ fn shortest_path(graphs: [&Graph; 2], s: u32, t: u32, sides: &mut [Side; 2]) -> 
         let (near, far) = if this == 0 { (&mut left[0], &right[0]) } else { (&mut right[0], &left[0]) };
         let (d, u) = near.heap.pop().unwrap();
         let (dist, other) = (near.dist.as_mut().unwrap(), far.dist.as_ref().unwrap());
+        // Any path through a node this far out already costs at least `best` once the far side's
+        // frontier is added, so those nodes need not be pushed at all.
+        let far_top = far.heap.items[0].0;
         if d > dist.get(u) {
             continue;
         }
@@ -416,10 +427,14 @@ fn shortest_path(graphs: [&Graph; 2], s: u32, t: u32, sides: &mut [Side; 2]) -> 
         let end = graph.offsets[u as usize + 1] as usize;
         for &(v, w) in &graph.edges[begin..end] {
             let next = d + w as u64;
-            if next < best && dist.improve(v, next) {
+            if next + far_top < best && dist.improve(v, next) {
                 let across = other.get(v);
                 if across != u64::MAX {
                     best = best.min(next + across);
+                }
+                unsafe {
+                    let offset = graph.offsets.as_ptr().add(v as usize).cast::<i8>();
+                    std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(offset);
                 }
                 near.heap.push((next, v));
             }
