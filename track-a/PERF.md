@@ -5,4 +5,4 @@ Every step from the reference to your final version, each with the live-board ru
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 32.05 | 228 | 0 |
-| 1 | | | | | |
+| 1 | Rust rewrite: per-hour logs with no atomics, SWAR and AVX2 parsing, selection for percentiles, mmap input | run-f84389cf2c3a | 0.043 | 29 | 74.0 |
