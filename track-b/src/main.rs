@@ -135,11 +135,18 @@ fn is_token_byte(b: u8) -> bool {
 
 // Calls `visit` with each token of the document text at `p`, and returns what follows its
 // newline. One classification covers 64 bytes, and tokens then come straight from bit masks. A
-// window restarts at a token that runs past its end, so tokens never need joining up.
+// window restarts at a token that runs past its end, so tokens never need joining up. A window's
+// tokens are hashed and announced to `prepare` first, then visited, so that the cache misses of
+// their lookups overlap instead of stalling one after another.
 #[inline(always)]
-fn scan_document(mut p: *const u8, mut visit: impl FnMut(*const u8, usize)) -> *const u8 {
+fn scan_document(
+    mut p: *const u8,
+    prepare: impl Fn(u64),
+    mut visit: impl FnMut(*const u8, usize, u64),
+) -> *const u8 {
     unsafe {
         let newline = _mm256_set1_epi8(b'\n' as i8);
+        let mut batch = [(0u32, 0u32, 0u64); 32];
         loop {
             let (first, second) = (_mm256_loadu_si256(p.cast()), _mm256_loadu_si256(p.add(32).cast()));
             let mask = token_mask(first) as u64 | (token_mask(second) as u64) << 32;
@@ -148,11 +155,19 @@ fn scan_document(mut p: *const u8, mut visit: impl FnMut(*const u8, usize)) -> *
             let tokens = mask & newlines.wrapping_sub(1) & !newlines;
             let mut starts = tokens & !(tokens << 1);
             let mut ends = !tokens & (tokens << 1);
+            let mut count = 0;
             while ends != 0 {
                 let start = starts.trailing_zeros() as usize;
-                visit(p.add(start), ends.trailing_zeros() as usize - start);
+                let len = ends.trailing_zeros() as usize - start;
+                let hash = token_hash(p.add(start), len);
+                prepare(hash);
+                *batch.get_unchecked_mut(count) = (start as u32, len as u32, hash);
+                count += 1;
                 starts &= starts - 1;
                 ends &= ends - 1;
+            }
+            for &(start, len, hash) in batch.get_unchecked(..count) {
+                visit(p.add(start as usize), len as usize, hash);
             }
             if newlines != 0 {
                 return p.add(newlines.trailing_zeros() as usize + 1);
@@ -235,6 +250,11 @@ impl Table {
             at += 1;
         }
         self.slots[at] = ((hash | TAG_ONE) & TAG_MASK) | if anchor { ANCHOR_FLAG } else { 0 } | id;
+    }
+
+    #[inline(always)]
+    fn prefetch(&self, hash: u64) {
+        unsafe { _mm_prefetch::<_MM_HINT_T0>(self.slots.as_ptr().add(hash as usize & self.mask).cast()) };
     }
 
     #[inline(always)]
@@ -405,8 +425,8 @@ fn sample_counts(input: &[u8], vocabulary: &Vocabulary, docs: usize) -> Vec<u32>
     let mut pos = input.as_ptr();
     for _ in 0..docs / SAMPLE_SHARE {
         let (doc, text) = parse_id(pos);
-        pos = scan_document(text, |start, len| {
-            if let Ok(term) = vocabulary.find(unsafe { token_hash(start, len) }) {
+        pos = scan_document(text, |_| {}, |_, _, hash| {
+            if let Ok(term) = vocabulary.find(hash) {
                 if last[term as usize] != doc {
                     last[term as usize] = doc;
                     seen[term as usize] += 1;
@@ -528,8 +548,9 @@ fn parse_docs(input: &'static [u8], plan: &Plan, bits: &mut [u64], words: usize,
                                 buckets.iter_mut().for_each(|bucket| bucket.push(MARKER | group as u16));
                             }
                             let position = doc & (GROUP_DOCS - 1);
-                            let end = scan_document(text, |start, len| unsafe {
-                                let slot = plan.table.find(token_hash(start, len));
+                            let prepare = |hash| plan.table.prefetch(hash);
+                            let end = scan_document(text, prepare, |start, len, hash| unsafe {
+                                let slot = plan.table.find(hash);
                                 let id = slot & ID_MASK;
                                 if slot & ANCHOR_FLAG != 0 {
                                     plan.phrases.check(id as usize, start, len, doc, &mut hits);
