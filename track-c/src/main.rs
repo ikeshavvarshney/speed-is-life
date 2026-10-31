@@ -12,6 +12,7 @@ const START_BITS: u32 = 17;
 unsafe extern "C" {
     #[link_name = "_exit"]
     fn exit(code: i32) -> !;
+    fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
     fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
 }
 
@@ -126,7 +127,7 @@ fn hash_name(p: *const u8, len: usize) -> u64 {
 // instead of bytes never touches the input again, which is what keeps this fast. With 100,000
 // names a collision has a chance of about 3e-10, and would only make one name count as another.
 struct Names {
-    slots: Vec<AtomicU64>,
+    slots: &'static [AtomicU64],
     shift: u32,
     used: AtomicUsize,
 }
@@ -171,10 +172,18 @@ impl Names {
     }
 }
 
-// Calloc-backed, so untouched pages cost neither time nor memory.
-fn zeroed_atomics(len: usize) -> Vec<AtomicU64> {
-    let mut zeros = std::mem::ManuallyDrop::new(vec![0u64; len]);
-    unsafe { Vec::from_raw_parts(zeros.as_mut_ptr().cast(), len, len) }
+// Zeroed anonymous memory on 2 MB boundaries, with huge pages requested: random access over
+// several megabytes would otherwise pay a TLB miss on most records. Lives until process exit.
+fn zeroed_atomics(len: usize) -> &'static [AtomicU64] {
+    const HUGE: usize = 1 << 21;
+    const MADV_HUGEPAGE: i32 = 14;
+    let bytes = (len * 8).next_multiple_of(HUGE);
+    unsafe {
+        let raw = mmap(std::ptr::null_mut(), bytes + HUGE, 3, 0x22, -1, 0) as usize;
+        let aligned = raw.next_multiple_of(HUGE) as *mut c_void;
+        madvise(aligned, bytes, MADV_HUGEPAGE);
+        std::slice::from_raw_parts(aligned as *const AtomicU64, len)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -231,7 +240,7 @@ fn load_regions() -> Regions {
 struct Shared {
     input: *const u8,
     names: Names,
-    bits: Vec<AtomicU64>,
+    bits: &'static [AtomicU64],
     words: usize,
 }
 unsafe impl Sync for Shared {}
