@@ -488,12 +488,21 @@ int main() {
   vector<std::thread> pool;
   for (auto &reader : readers)
     pool.emplace_back(read_edges, &reader);
+  for (auto &thread : pool)
+    thread.join();
+  // Each reader's list is freed once copied, so the edges exist only twice at
+  // worst for one reader, which keeps the peak down.
   vector<Loose> loose[2];
-  for (int t = 0; t < threads; t++) {
-    pool[t].join();
-    for (int side = 0; side < 2; side++)
-      loose[side].insert(loose[side].end(), readers[t].loose[side].begin(),
-                         readers[t].loose[side].end());
+  for (int side = 0; side < 2; side++) {
+    size_t total = 0;
+    for (auto &reader : readers)
+      total += reader.loose[side].size();
+    loose[side].reserve(total);
+    for (auto &reader : readers) {
+      auto &from = reader.loose[side];
+      loose[side].insert(loose[side].end(), from.begin(), from.end());
+      vector<Loose>().swap(from);
+    }
   }
   Graph graphs[2];
   std::thread finisher([&] {
