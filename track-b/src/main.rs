@@ -2,7 +2,6 @@ use std::arch::x86_64::*;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fs::File;
-use std::hash::{BuildHasherDefault, Hasher};
 use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
 use std::sync::Mutex;
@@ -14,7 +13,9 @@ const BLOCK: usize = 1 << 14;
 const QUERY_BATCH: usize = 64;
 const HIGH_BIT: u32 = 1 << 31;
 const NO_TERM: u32 = u32::MAX;
-const PHRASE_ONLY: u32 = 1;
+const ANCHOR_BIT: u32 = 1 << 30;
+const PHRASE_ONLY: u32 = 1 << 29;
+const INDEX_MASK: u32 = PHRASE_ONLY - 1;
 const SAMPLE_SHARE: usize = 100;
 // A term in more than 1/32 of documents is smaller as a bitset than as 32-bit ids.
 const HIGH_SHARE: usize = 32;
@@ -118,7 +119,8 @@ impl Terms {
                 }
                 if entry >> 32 == tag {
                     let id = (entry as u32) - 1;
-                    if self.keys.get_unchecked(id as usize) == key {
+                    let k = self.keys.get_unchecked(id as usize);
+                    if (k[0] ^ key[0]) | (k[1] ^ key[1]) | (k[2] ^ key[2]) | (k[3] ^ key[3]) == 0 {
                         return id;
                     }
                 }
@@ -271,7 +273,7 @@ impl Index {
     fn term(&self, id: u32) -> Term<'_> {
         let route = self.routes[id as usize];
         if route & HIGH_BIT != 0 {
-            let at = (route & !HIGH_BIT) as usize * self.words;
+            let at = (route & INDEX_MASK) as usize * self.words;
             Term::Bits(&self.bits[at..at + self.words])
         } else {
             let (a, b) = (self.offsets[id as usize] as usize, self.offsets[id as usize + 1] as usize);
@@ -450,64 +452,90 @@ fn push_int(out: &mut Vec<u8>, mut value: u64) {
     out.extend_from_slice(&digits[i..]);
 }
 
-// All phrases are known before any document is read, so they are matched live during tokenizing
-// instead of being looked up afterwards. Each phrase is filed under its last two terms. When a
-// document's latest two tokens match a filed pair, only the tokens before them need checking. No
-// positions are stored, no documents are re-read, and phrase-only terms need no postings.
+// All phrases are known before any document is read, so they are matched live during tokenizing.
+// Any document matching a phrase must contain its rarest term, its anchor, so nothing happens
+// until an anchor token appears. The phrase is then checked once its remaining tokens have been
+// read. No positions are stored, no documents are re-read, and phrase-only terms need no postings.
 #[derive(Default)]
 struct Phrases {
     list: Vec<Vec<u32>>,
-    by_pair: HashMap<u64, Vec<u32>, BuildHasherDefault<PairHasher>>,
-    filter: Vec<u64>,
-}
-
-#[derive(Default)]
-struct PairHasher(u64);
-
-impl Hasher for PairHasher {
-    fn write(&mut self, _: &[u8]) {}
-    fn write_u64(&mut self, value: u64) {
-        self.0 = value;
-    }
-    fn finish(&self) -> u64 {
-        self.0
-    }
-}
-
-const FILTER_BITS: u32 = 22;
-const RING: usize = 8;
-
-#[inline(always)]
-fn pair_key(before: u32, last: u32) -> u64 {
-    mum((before as u64) << 32 | last as u64, 0x9E37_79B9_7F4A_7C15) | 1
+    anchor_starts: Vec<u32>,
+    anchored: Vec<(u32, u32)>,
 }
 
 impl Phrases {
-    fn build(&mut self) {
-        self.filter = vec![0; 1 << (FILTER_BITS - 6)];
+    // `seen` estimates term frequency, and is only used to choose anchors.
+    fn choose_anchors(&mut self, seen: &[u32], routes: &mut [u32]) {
+        let mut by_term: Vec<(u32, u32, u32)> = Vec::with_capacity(self.list.len());
         for (index, phrase) in self.list.iter().enumerate() {
-            let key = pair_key(phrase[phrase.len() - 2], phrase[phrase.len() - 1]);
-            self.by_pair.entry(key).or_default().push(index as u32);
-            let bit = key >> (64 - FILTER_BITS);
-            self.filter[bit as usize / 64] |= 1 << (bit % 64);
+            let at = (0..phrase.len()).min_by_key(|&i| seen[phrase[i] as usize]).unwrap();
+            by_term.push((phrase[at], index as u32, at as u32));
+            routes[phrase[at] as usize] |= ANCHOR_BIT;
+        }
+        by_term.sort_unstable();
+        self.anchor_starts = vec![0; seen.len() + 1];
+        for &(term, _, _) in &by_term {
+            self.anchor_starts[term as usize + 1] += 1;
+        }
+        for i in 1..self.anchor_starts.len() {
+            self.anchor_starts[i] += self.anchor_starts[i - 1];
+        }
+        self.anchored = by_term.iter().map(|&(_, index, at)| (index, at)).collect();
+    }
+}
+
+const RING: usize = 16;
+const NOT_DUE: u32 = u32::MAX;
+
+// Tracks one document's latest tokens and the phrase checks that are waiting for more tokens.
+struct Matcher {
+    ring: [u32; RING],
+    count: u32,
+    next_due: u32,
+    pending: Vec<(u32, u32)>,
+}
+
+impl Matcher {
+    #[inline(always)]
+    fn start(&mut self) {
+        self.ring = [NO_TERM; RING];
+        self.count = 0;
+        self.next_due = NOT_DUE;
+        self.pending.clear();
+    }
+
+    #[cold]
+    fn add_anchor(&mut self, phrases: &Phrases, term: u32) {
+        let (a, b) = (phrases.anchor_starts[term as usize], phrases.anchor_starts[term as usize + 1]);
+        for &(index, at) in &phrases.anchored[a as usize..b as usize] {
+            let due = self.count + phrases.list[index as usize].len() as u32 - 1 - at;
+            self.pending.push((due, index));
+            self.next_due = self.next_due.min(due);
         }
     }
 
-    // `ring` holds the document's latest tokens, and `at` is where the newest one sits.
     #[cold]
-    fn check(&self, key: u64, ring: &[u32; RING], at: usize, doc: u32, hits: &mut Vec<(u32, u32)>) {
-        let Some(candidates) = self.by_pair.get(&key) else { return };
-        for &index in candidates {
-            let phrase = &self.list[index as usize];
+    fn run_due(&mut self, phrases: &Phrases, doc: u32, hits: &mut Vec<(u32, u32)>) {
+        let (count, ring) = (self.count, self.ring);
+        self.next_due = NOT_DUE;
+        let mut next_due = NOT_DUE;
+        self.pending.retain(|&(due, index)| {
+            if due != count {
+                next_due = next_due.min(due);
+                return true;
+            }
+            let phrase = &phrases.list[index as usize];
             let matched = phrase
                 .iter()
                 .rev()
                 .enumerate()
-                .all(|(back, &term)| ring[(at + RING - back) % RING] == term);
+                .all(|(back, &term)| ring[count.wrapping_sub(back as u32) as usize % RING] == term);
             if matched {
                 hits.push((index, doc));
             }
-        }
+            false
+        });
+        self.next_due = next_due;
     }
 }
 
@@ -550,7 +578,7 @@ fn parse_queries(text: &[u8], terms: &mut Terms, phrases: &mut Phrases, in_bool:
 
 // Estimates which terms are common from the first documents and gives those a bitset. A wrong
 // guess only costs space, as both forms hold the same exact answer.
-fn choose_routes(input: &[u8], terms: &Terms, in_bool: &[bool], doc_count: usize) -> (Vec<u32>, usize) {
+fn choose_routes(input: &[u8], terms: &Terms, in_bool: &[bool], doc_count: usize, phrases: &mut Phrases) -> (Vec<u32>, usize) {
     let sample = doc_count / SAMPLE_SHARE;
     let threshold = (sample / HIGH_SHARE).max(1);
     let mut seen = vec![0u32; terms.keys.len()];
@@ -567,7 +595,7 @@ fn choose_routes(input: &[u8], terms: &Terms, in_bool: &[bool], doc_count: usize
         });
     }
     let mut high = 0;
-    let routes = seen
+    let mut routes: Vec<u32> = seen
         .iter()
         .enumerate()
         .map(|(term, &count)| {
@@ -581,6 +609,7 @@ fn choose_routes(input: &[u8], terms: &Terms, in_bool: &[bool], doc_count: usize
             }
         })
         .collect();
+    phrases.choose_anchors(&seen, &mut routes);
     (routes, high)
 }
 
@@ -615,6 +644,7 @@ fn parse_docs(
                     let mut columns = vec![0u64; high];
                     let mut group = usize::MAX;
                     let mut hits = Vec::new();
+                    let mut matcher = Matcher { ring: [NO_TERM; RING], count: 0, next_due: NOT_DUE, pending: Vec::new() };
                     // Common terms set one bit per token, so 64 documents are gathered in a small
                     // local buffer. Writing the shared bitsets directly would be a cache miss and
                     // an atomic on nearly every token.
@@ -646,8 +676,7 @@ fn parse_docs(
                         let mut i = first;
                         while i < stop {
                             let (doc, text) = parse_id(unsafe { base.add(i) });
-                            let mut ring = [NO_TERM; RING];
-                            let mut at = 0;
+                            matcher.start();
                             if doc as usize / 64 != group {
                                 if group != usize::MAX {
                                     flush(&mut columns, group);
@@ -656,26 +685,24 @@ fn parse_docs(
                             }
                             let end = scan_tokens(text, |key| {
                                 let term = terms.find(key);
-                                let before = ring[at];
-                                at = (at + 1) % RING;
-                                ring[at] = term;
-                                if term == NO_TERM {
-                                    return;
+                                matcher.count += 1;
+                                matcher.ring[matcher.count as usize % RING] = term;
+                                let route = if term == NO_TERM {
+                                    PHRASE_ONLY
+                                } else {
+                                    unsafe { *routes.get_unchecked(term as usize) }
+                                };
+                                if route & ANCHOR_BIT != 0 {
+                                    matcher.add_anchor(phrases, term);
                                 }
-                                if before != NO_TERM {
-                                    let pair = pair_key(before, term);
-                                    let bit = pair >> (64 - FILTER_BITS);
-                                    let word = unsafe { *phrases.filter.get_unchecked(bit as usize / 64) };
-                                    if word >> (bit % 64) & 1 != 0 {
-                                        phrases.check(pair, &ring, at, doc, &mut hits);
-                                    }
+                                if matcher.count == matcher.next_due {
+                                    matcher.run_due(phrases, doc, &mut hits);
                                 }
-                                let route = unsafe { *routes.get_unchecked(term as usize) };
-                                if route == PHRASE_ONLY {
+                                if route & PHRASE_ONLY != 0 {
                                     return;
                                 }
                                 if route & HIGH_BIT != 0 {
-                                    let at = (route & !HIGH_BIT) as usize;
+                                    let at = (route & INDEX_MASK) as usize;
                                     unsafe { *columns.get_unchecked_mut(at) |= 1u64 << (doc % 64) };
                                 } else {
                                     let seen = unsafe { last.get_unchecked_mut(term as usize) };
@@ -786,7 +813,6 @@ fn main() {
     let mut phrases = Phrases::default();
     let mut in_bool = Vec::new();
     let queries = parse_queries(&text, &mut terms, &mut phrases, &mut in_bool);
-    phrases.build();
     drop(text);
 
     let file = File::open("/data/docs.txt").unwrap();
@@ -794,7 +820,7 @@ fn main() {
     let input = map_input(&file, size);
     let count = doc_count(input);
     let words = count / 64 + 1;
-    let (routes, high) = choose_routes(input, &terms, &in_bool, count);
+    let (routes, high) = choose_routes(input, &terms, &in_bool, count, &mut phrases);
     let mut bits = vec![0u64; high * words];
     let (parsed, mut hits) = parse_docs(input, &terms, &routes, &mut bits, words, high, &phrases, threads);
     let (offsets, ids) = build_postings(parsed, terms.keys.len(), threads);
