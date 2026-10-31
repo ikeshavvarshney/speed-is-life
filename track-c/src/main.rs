@@ -318,6 +318,8 @@ fn parse_chunk(job: &Job, first: usize, stop: usize, groups: &mut [Group]) {
     loop {
         unsafe {
             for _ in 0..BLOCKS {
+                // Hardware prefetchers stop at page boundaries; this one crosses them.
+                _mm_prefetch::<_MM_HINT_T0>(base.add(block + 1024).cast());
                 let (quotes, mut seps) = block_masks(base.add(block), &mut inside);
                 let found = seps.count_ones() as usize;
                 let mut k = filled;
