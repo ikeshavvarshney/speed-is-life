@@ -194,7 +194,7 @@ struct Job {
 }
 unsafe impl Sync for Job {}
 
-const BLOCKS: usize = 16;
+const BLOCKS: usize = 8;
 // A record is at least 11 bytes, of which 5 are structural.
 const MAX_MARKS: usize = BLOCKS * 64 + 64;
 const MAX_RECORDS: usize = MAX_MARKS / 5 + 1;
