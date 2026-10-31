@@ -142,6 +142,12 @@ impl Names {
     }
 
     #[inline(always)]
+    fn prefetch(&self, hash: u64) {
+        let slot = self.slots[(hash >> self.shift) as usize].as_ptr();
+        unsafe { _mm_prefetch::<_MM_HINT_T0>(slot as *const i8) };
+    }
+
+    #[inline(always)]
     fn intern(&self, hash: u64) -> usize {
         let mask = self.slots.len() - 1;
         let mut slot = (hash >> self.shift) as usize;
@@ -230,8 +236,70 @@ struct Shared {
 }
 unsafe impl Sync for Shared {}
 
+const PIPE: usize = 16;
+const NO_COUNTRY: u32 = u32::MAX;
+
+// Name lookups and bitset writes are random accesses that miss cache on nearly every record. Each
+// is prefetched here and performed PIPE records later, so the misses overlap instead of stalling.
+struct Pipe {
+    names: [(u64, u32); PIPE],
+    bits: [(u32, u64); PIPE],
+    head: usize,
+}
+
+impl Pipe {
+    fn new() -> Self {
+        Self { names: [(0, NO_COUNTRY); PIPE], bits: [(0, 0); PIPE], head: 0 }
+    }
+
+    #[inline(always)]
+    fn step(&mut self, shared: &Shared, hash: u64, country: u32) {
+        let head = self.head;
+        self.head = (head + 1) % PIPE;
+        let (old_hash, old_country) = self.names[head];
+        self.names[head] = (hash, country);
+        if country != NO_COUNTRY && hash != 0 {
+            shared.names.prefetch(hash);
+        }
+        if old_country == NO_COUNTRY {
+            return;
+        }
+        // One bitset per country over name ids. Bit 0 is the empty name, however it was quoted.
+        let bit = if old_hash == 0 { 0 } else { shared.names.intern(old_hash) + 1 };
+        let word = old_country as usize * shared.words + bit / 64;
+        unsafe {
+            _mm_prefetch::<_MM_HINT_T0>(shared.bits.as_ptr().add(word).cast());
+        }
+        let (old_word, old_mask) = self.bits[head];
+        self.bits[head] = (word as u32, 1u64 << (bit % 64));
+        Self::set(shared, old_word, old_mask);
+    }
+
+    #[inline(always)]
+    fn set(shared: &Shared, word: u32, mask: u64) {
+        if mask != 0 {
+            let word = unsafe { shared.bits.get_unchecked(word as usize) };
+            if word.load(Relaxed) & mask == 0 {
+                word.fetch_or(mask, Relaxed);
+            }
+        }
+    }
+
+    fn drain(&mut self, shared: &Shared) {
+        for _ in 0..PIPE {
+            self.step(shared, 0, NO_COUNTRY);
+        }
+        for i in 0..PIPE {
+            let (word, mask) = self.bits[i];
+            Self::set(shared, word, mask);
+            self.bits[i] = (0, 0);
+        }
+    }
+}
+
 fn parse_chunk(shared: &Shared, by_id: &[u8], first: usize, stop: usize, totals: &mut [Totals]) {
     let base = shared.input;
+    let mut pipe = Pipe::new();
     let mut i = first;
     while i < stop {
         unsafe {
@@ -262,19 +330,11 @@ fn parse_chunk(shared: &Shared, by_id: &[u8], first: usize, stop: usize, totals:
             total.name_bytes += name_len as u64;
             total.note_bytes += note_len as u64;
 
-            // One bitset per country over name ids. Bit 0 is the empty name, however it was quoted.
-            let bit = if name_raw == 0 {
-                0
-            } else {
-                shared.names.intern(hash_name(name, name_raw)) + 1
-            };
-            let word = shared.bits.get_unchecked(country * shared.words + bit / 64);
-            let mask = 1u64 << (bit % 64);
-            if word.load(Relaxed) & mask == 0 {
-                word.fetch_or(mask, Relaxed);
-            }
+            let hash = if name_raw == 0 { 0 } else { hash_name(name, name_raw) };
+            pipe.step(shared, hash, country as u32);
         }
     }
+    pipe.drain(shared);
 }
 
 // Past a chunk's start, the next record starts after an LF followed by a digit or BOM. Newlines
