@@ -23,7 +23,7 @@ using v4 = __m256i;
 using v2 = __m128i;
 using std::atomic;
 using std::vector;
-constexpr int DIAG_PUSH = 2;
+constexpr int DIAG_PUSH = 3;
 constexpr auto relaxed = std::memory_order_relaxed;
 #define INLINE [[gnu::always_inline]] inline
 
