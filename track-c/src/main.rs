@@ -2,12 +2,15 @@ use std::arch::x86_64::*;
 use std::ffi::c_void;
 use std::fs::File;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::Barrier;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 const CHUNK: usize = 1 << 18;
 const BOM_FIRST: u8 = 0xEF;
-// Enough for the generator's pool of 100,000 names; a bigger pool restarts with a bigger table.
-const START_BITS: u32 = 17;
+// The generator's pool of 100,000 names, plus the few that edge-case blocks add, fits at 77% load.
+const NAME_BITS: u32 = 17;
+// Length of one log segment in u16 entries: a two-entry link and 126 names, on four cache lines.
+const SEGMENT: usize = 128;
 
 unsafe extern "C" {
     #[link_name = "_exit"]
@@ -93,38 +96,27 @@ fn hash_name(p: *const u8, len: usize) -> u64 {
 // instead of bytes never touches the input again, which is what keeps this fast. With 100,000
 // names a collision has a chance of about 3e-10, and would only make one name count as another.
 struct Names {
-    slots: &'static [AtomicU64],
-    shift: u32,
+    slots: *const AtomicU64,
     used: AtomicUsize,
 }
 
 impl Names {
-    fn new(bits: u32) -> Self {
-        let slots = zeroed_atomics(1 << bits);
-        Self { slots, shift: 64 - bits, used: AtomicUsize::new(0) }
-    }
-
-    fn overfull(&self) -> bool {
-        self.used.load(Relaxed) > self.slots.len() / 8 * 7
-    }
-
     #[inline(always)]
     fn prefetch(&self, hash: u64) {
-        let slot = unsafe { self.slots.get_unchecked((hash >> self.shift) as usize) }.as_ptr();
-        unsafe { _mm_prefetch::<_MM_HINT_T0>(slot as *const i8) };
+        unsafe { _mm_prefetch::<_MM_HINT_T0>(self.slots.add((hash >> (64 - NAME_BITS)) as usize).cast()) };
     }
 
     #[inline(always)]
     fn intern(&self, hash: u64) -> usize {
-        let mask = self.slots.len() - 1;
-        let mut slot = (hash >> self.shift) as usize;
+        let mut slot = (hash >> (64 - NAME_BITS)) as usize;
         loop {
-            let entry = unsafe { self.slots.get_unchecked(slot) };
+            let entry = unsafe { &*self.slots.add(slot) };
             let mut seen = entry.load(Relaxed);
             if seen == 0 {
                 match entry.compare_exchange(0, hash, Relaxed, Relaxed) {
                     Ok(_) => {
-                        self.used.fetch_add(1, Relaxed);
+                        // The generator's pool is a constant, so this only guards against hanging.
+                        assert!(self.used.fetch_add(1, Relaxed) < (1 << NAME_BITS) / 8 * 7, "too many names");
                         return slot;
                     }
                     Err(actual) => seen = actual,
@@ -133,44 +125,49 @@ impl Names {
             if seen == hash {
                 return slot;
             }
-            slot = (slot + 1) & mask;
+            slot = (slot + 1) & ((1 << NAME_BITS) - 1);
         }
     }
 }
 
 // Zeroed anonymous memory on 2 MB boundaries, with huge pages requested: random access over
 // several megabytes would otherwise pay a TLB miss on most records. Lives until process exit.
-fn zeroed_atomics(len: usize) -> &'static [AtomicU64] {
+fn zeroed(bytes: usize) -> *mut u8 {
     const HUGE: usize = 1 << 21;
     const MADV_HUGEPAGE: i32 = 14;
-    let bytes = (len * 8).next_multiple_of(HUGE);
+    let bytes = bytes.next_multiple_of(HUGE);
     unsafe {
         let raw = mmap(std::ptr::null_mut(), bytes + HUGE, 3, 0x22, -1, 0) as usize;
         let aligned = raw.next_multiple_of(HUGE) as *mut c_void;
         madvise(aligned, bytes, MADV_HUGEPAGE);
-        std::slice::from_raw_parts(aligned as *const AtomicU64, len)
+        aligned.cast()
     }
 }
 
+// One worker's running values for one country, on one cache line. `logs` are the write positions
+// of the country's two name logs.
 #[derive(Clone, Copy)]
-struct Totals {
-    count: u64,
+#[repr(align(64))]
+struct Group {
     id_sum: u64,
     amount_sum: i64,
-    amount_min: i64,
-    amount_max: i64,
-    name_bytes: u64,
-    note_bytes: u64,
+    count: u32,
+    amount_min: i32,
+    amount_max: i32,
+    name_bytes: u32,
+    note_bytes: u32,
+    logs: [u32; 2],
 }
 
-const EMPTY: Totals = Totals {
-    count: 0,
+const EMPTY: Group = Group {
     id_sum: 0,
     amount_sum: 0,
-    amount_min: i64::MAX,
-    amount_max: i64::MIN,
+    count: 0,
+    amount_min: i32::MAX,
+    amount_max: i32::MIN,
     name_bytes: 0,
     note_bytes: 0,
+    logs: [0; 2],
 };
 
 struct Regions {
@@ -207,13 +204,22 @@ fn load_regions() -> Regions {
     Regions { by_id, codes }
 }
 
-struct Shared {
+struct Job {
     input: *const u8,
+    size: usize,
+    by_id: Vec<u8>,
     names: Names,
-    bits: &'static [AtomicU64],
-    words: usize,
+    log: *mut u16,
+    groups: *mut Group,
+    threads: usize,
+    countries: usize,
+    next_chunk: AtomicUsize,
+    next_segment: AtomicU32,
+    next_country: AtomicUsize,
+    distinct: Vec<AtomicU32>,
+    parsed: Barrier,
 }
-unsafe impl Sync for Shared {}
+unsafe impl Sync for Job {}
 
 const BLOCKS: usize = 16;
 // A record is at least 11 bytes, of which 5 are structural.
@@ -249,7 +255,6 @@ struct Rec {
     amount: i32,
     name_len: u32,
     note_len: u32,
-    bit: u32,
     hash: u64,
 }
 
@@ -260,8 +265,19 @@ fn value_len(raw: u32, quotes: u32) -> u32 {
     (raw - quotes / 2).saturating_sub(1)
 }
 
-fn parse_chunk(shared: &Shared, by_id: &[u8], first: usize, stop: usize, totals: &mut [Totals]) {
-    let base = shared.input;
+// Logs grow in segments from one shared arena, and each starts with the number of the segment
+// before it. Segment 0 is never handed out, so it marks the end of a chain.
+#[cold]
+fn new_segment(job: &Job, cursor: u32) -> u32 {
+    let previous = (cursor as usize / SEGMENT).saturating_sub(1) as u32;
+    let segment = job.next_segment.fetch_add(1, Relaxed) as usize;
+    unsafe { job.log.add(segment * SEGMENT).cast::<u32>().write(previous) };
+    (segment * SEGMENT + 2) as u32
+}
+
+fn parse_chunk(job: &Job, first: usize, stop: usize, groups: &mut [Group]) {
+    let base = job.input;
+    let by_id = &job.by_id;
     let last_region = by_id.len() as u64 - 1;
     let mut marks = [0u32; MAX_MARKS];
     let mut counts = [0u32; MAX_MARKS];
@@ -316,37 +332,31 @@ fn parse_chunk(shared: &Shared, by_id: &[u8], first: usize, stop: usize, totals:
                 let amount = if negative { -(cents as i32) } else { cents as i32 };
                 let hash = hash_name(base.add(c1 + 2), name_raw.saturating_sub(2) as usize);
                 _mm_prefetch::<_MM_HINT_T0>(by_id.as_ptr().add(region as usize).cast());
-                shared.names.prefetch(hash);
+                job.names.prefetch(hash);
                 *recs.get_unchecked_mut(n) =
-                    Rec { id: id as u32, region: region as u32, amount, name_len, note_len, bit: 0, hash };
+                    Rec { id: id as u32, region: region as u32, amount, name_len, note_len, hash };
                 n += 1;
                 start = lf + 1;
             }
-            // Group prefetching: each pass touches only what the pass before it prefetched, so the
+            // Group prefetching: this pass touches only what the pass above prefetched, so the
             // cache misses of a whole batch overlap instead of stalling one at a time.
-            for rec in recs[..n].iter_mut() {
-                let country = *by_id.get_unchecked(rec.region as usize) as usize;
-                let total = totals.get_unchecked_mut(country);
-                let amount = rec.amount as i64;
-                total.count += 1;
-                total.id_sum += rec.id as u64;
-                total.amount_sum += amount;
-                total.amount_min = total.amount_min.min(amount);
-                total.amount_max = total.amount_max.max(amount);
-                total.name_bytes += rec.name_len as u64;
-                total.note_bytes += rec.note_len as u64;
-                let bit = shared.names.intern(rec.hash);
-                let word = country * shared.words + bit / 64;
-                _mm_prefetch::<7>(shared.bits.as_ptr().add(word).cast());
-                rec.region = word as u32;
-                rec.bit = bit as u32 % 64;
-            }
             for rec in recs[..n].iter() {
-                let word = shared.bits.get_unchecked(rec.region as usize);
-                let mask = 1u64 << rec.bit;
-                if word.load(Relaxed) & mask == 0 {
-                    word.fetch_or(mask, Relaxed);
+                let country = *by_id.get_unchecked(rec.region as usize) as usize;
+                let group = groups.get_unchecked_mut(country);
+                group.count += 1;
+                group.id_sum += rec.id as u64;
+                group.amount_sum += rec.amount as i64;
+                group.amount_min = group.amount_min.min(rec.amount);
+                group.amount_max = group.amount_max.max(rec.amount);
+                group.name_bytes += rec.name_len;
+                group.note_bytes += rec.note_len;
+                let name = job.names.intern(rec.hash);
+                let cursor = group.logs.get_unchecked_mut(name >> 16);
+                if *cursor as usize % SEGMENT == 0 {
+                    *cursor = new_segment(job, *cursor);
                 }
+                *job.log.add(*cursor as usize) = name as u16;
+                *cursor += 1;
             }
             if done || start >= stop {
                 return;
@@ -374,51 +384,49 @@ fn first_record(input: &[u8], off: usize) -> usize {
     input.len()
 }
 
-fn run(input: &[u8], regions: &Regions, bits: u32, threads: usize) -> Option<(Vec<Totals>, Shared)> {
-    let countries = regions.codes.len() + 1;
-    let words = (1usize << bits) / 64;
-    let shared = Shared {
-        input: input.as_ptr(),
-        names: Names::new(bits),
-        bits: zeroed_atomics(words * countries),
-        words,
-    };
-    let next = AtomicUsize::new(0);
-    let header_end = input.iter().position(|&b| b == b'\n').unwrap() + 1;
-    let merged = std::thread::scope(|scope| {
-        let workers: Vec<_> = (0..threads)
-            .map(|_| {
-                scope.spawn(|| {
-                    let mut totals = vec![EMPTY; countries];
-                    loop {
-                        let off = next.fetch_add(CHUNK, Relaxed);
-                        if off >= input.len() || shared.names.overfull() {
-                            return totals;
-                        }
-                        let first = if off == 0 { header_end } else { first_record(input, off) };
-                        let stop = (off + CHUNK).min(input.len());
-                        if first < stop {
-                            parse_chunk(&shared, &regions.by_id, first, stop, &mut totals);
-                        }
-                    }
-                })
-            })
-            .collect();
-        let mut merged = vec![EMPTY; countries];
-        for worker in workers {
-            for (into, from) in merged.iter_mut().zip(worker.join().unwrap()) {
-                into.count += from.count;
-                into.id_sum += from.id_sum;
-                into.amount_sum += from.amount_sum;
-                into.amount_min = into.amount_min.min(from.amount_min);
-                into.amount_max = into.amount_max.max(from.amount_max);
-                into.name_bytes += from.name_bytes;
-                into.note_bytes += from.note_bytes;
-            }
+fn worker(job: &Job, index: usize) {
+    let input = unsafe { std::slice::from_raw_parts(job.input, job.size) };
+    let groups = unsafe { std::slice::from_raw_parts_mut(job.groups.add(index * job.countries), job.countries) };
+    groups.fill(EMPTY);
+    loop {
+        let off = job.next_chunk.fetch_add(CHUNK, Relaxed);
+        if off >= job.size {
+            break;
         }
-        merged
-    });
-    (!shared.names.overfull()).then_some((merged, shared))
+        let first = if off == 0 { input.iter().position(|&b| b == b'\n').unwrap() + 1 } else { first_record(input, off) };
+        let stop = (off + CHUNK).min(job.size);
+        if first < stop {
+            parse_chunk(job, first, stop, groups);
+        }
+    }
+    job.parsed.wait();
+
+    // Nothing writes the logs now. Each country goes to one worker, whose bitset fits in L1.
+    let mut seen = [0u64; 1 << 10];
+    loop {
+        let country = job.next_country.fetch_add(1, Relaxed);
+        if country >= job.countries {
+            return;
+        }
+        let mut distinct = 0;
+        for list in 0..2 {
+            for thread in 0..job.threads {
+                let mut cursor = unsafe { (*job.groups.add(thread * job.countries + country)).logs[list] } as usize;
+                while cursor != 0 {
+                    let segment = (cursor - 1) / SEGMENT;
+                    for at in segment * SEGMENT + 2..cursor {
+                        let name = unsafe { *job.log.add(at) } as usize;
+                        seen[name / 64] |= 1 << (name % 64);
+                    }
+                    let previous = unsafe { job.log.add(segment * SEGMENT).cast::<u32>().read() } as usize;
+                    cursor = (previous + 1) * SEGMENT * (previous != 0) as usize;
+                }
+            }
+            distinct += seen.iter().map(|word| word.count_ones()).sum::<u32>();
+            seen.fill(0);
+        }
+        job.distinct[country].store(distinct, Relaxed);
+    }
 }
 
 fn money(cents: i64) -> String {
@@ -431,36 +439,60 @@ fn main() {
     let regions = load_regions();
     let file = File::open("/data/records.csv").unwrap();
     let size = file.metadata().unwrap().len() as usize;
-    let input = unsafe { std::slice::from_raw_parts(map_input(&file, size), size) };
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let mut bits = START_BITS;
-    let (totals, shared) = loop {
-        match run(input, &regions, bits, threads) {
-            Some(done) => break done,
-            None => bits += 2,
-        }
+    let countries = regions.codes.len() + 1;
+    let job = Job {
+        input: map_input(&file, size),
+        size,
+        by_id: regions.by_id,
+        names: Names { slots: zeroed(8 << NAME_BITS).cast(), used: AtomicUsize::new(0) },
+        // Worst case: 11-byte records, each with one u16, plus a segment per open log and the links.
+        log: zeroed(size / 4 + threads * countries * 4 * SEGMENT).cast(),
+        groups: zeroed(threads * countries * size_of::<Group>()).cast(),
+        threads,
+        countries,
+        next_chunk: AtomicUsize::new(0),
+        next_segment: AtomicU32::new(1),
+        next_country: AtomicUsize::new(0),
+        distinct: (0..countries).map(|_| AtomicU32::new(0)).collect(),
+        parsed: Barrier::new(threads),
     };
+    std::thread::scope(|scope| {
+        for index in 1..threads {
+            let job = &job;
+            scope.spawn(move || worker(job, index));
+        }
+        worker(&job, 0);
+    });
 
     let mut keys: Vec<(&[u8], usize)> = vec![(b"_UNMATCHED".as_slice(), 0)];
     keys.extend(regions.codes.iter().enumerate().map(|(i, code)| (code.as_slice(), i + 1)));
     keys.sort_unstable();
     let mut out = Vec::with_capacity(keys.len() * 96);
     for (key, country) in keys {
-        let total = &totals[country];
+        let mut total = EMPTY;
+        for thread in 0..threads {
+            let from = unsafe { &*job.groups.add(thread * countries + country) };
+            total.count += from.count;
+            total.id_sum += from.id_sum;
+            total.amount_sum += from.amount_sum;
+            total.amount_min = total.amount_min.min(from.amount_min);
+            total.amount_max = total.amount_max.max(from.amount_max);
+            total.name_bytes += from.name_bytes;
+            total.note_bytes += from.note_bytes;
+        }
         if total.count == 0 {
             continue;
         }
-        let bitset = &shared.bits[country * shared.words..(country + 1) * shared.words];
-        let distinct: u32 = bitset.iter().map(|word| word.load(Relaxed).count_ones()).sum();
         out.extend_from_slice(key);
         let line = format!(
             " {} {} {} {} {} {} {} {}\n",
             total.count,
             total.id_sum,
             money(total.amount_sum),
-            money(total.amount_min),
-            money(total.amount_max),
-            distinct,
+            money(total.amount_min as i64),
+            money(total.amount_max as i64),
+            job.distinct[country].load(Relaxed),
             total.name_bytes,
             total.note_bytes
         );
