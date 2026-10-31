@@ -22,7 +22,7 @@ run() {
       echo "'"$1"' $ok ${t}s peak=$(( $(cat /sys/fs/cgroup/memory.peak) / 1000000 ))MB"'
 }
 
-for name in worked edge tiny-seed1 sample-seed1 full-seed1 sample-seed2 full-seed2 tiny-seed3 sample-seed3; do
+for name in worked edge edge2 empty tiny-seed1 sample-seed1 full-seed1 sample-seed2 full-seed2 tiny-seed3 sample-seed3; do
   run "$name"
 done
 echo "--- timed"
