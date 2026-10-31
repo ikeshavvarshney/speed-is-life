@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <barrier>
 #include <charconv>
 #include <cstdint>
 #include <cstdlib>
@@ -28,9 +29,11 @@ constexpr auto relaxed = std::memory_order_relaxed;
 #define INLINE [[gnu::always_inline]] inline
 
 const size_t CHUNK = 1 << 18, QUERY_CHUNK = 1 << 14, PREFETCH_AHEAD = 12;
-const size_t SAMPLE_SHARE = 512;
-// A term in over 1/32 of documents is smaller as a bitset than in the hit log.
-const size_t HIGH_SHARE = 32;
+// A term this frequent among the queries is likely in over 1/32 of documents,
+// where a bitset is smaller than the hit log and its list. The queries sample the
+// corpus: phrases are windows of documents, and boolean terms are drawn by band.
+const size_t HIGH_COUNT = 25;
+const size_t UNMAP_STEP = 1 << 22;
 
 // A table slot holds the high bits of the term's hash, an anchor flag and the
 // term's id. While queries are read, the lowest bit instead records that a
@@ -170,36 +173,25 @@ INLINE u32 parse_id(const u8 *&p) {
   return id;
 }
 
-template <class F> static void on_threads(F &&run) {
-  vector<std::thread> pool;
-  for (int t = 1; t < threads; t++)
-    pool.emplace_back(run);
-  run();
-  for (auto &thread : pool)
-    thread.join();
-}
-
-// Runs `work` on all threads, which claim numbers below `count` until none are
-// left.
-template <class F> static void on_all_threads(size_t count, F &&work) {
-  atomic<size_t> next{0};
-  on_threads([&] {
-    for (size_t i; (i = next.fetch_add(1, relaxed)) < count;)
-      work(i);
-  });
-}
+// Counters that every thread writes, away from what the hot loops read.
+struct alignas(64) Counter {
+  atomic<size_t> value{0};
+  size_t take(size_t n = 1) { return value.fetch_add(n, relaxed); }
+};
 
 // The one lookup table, about 1 MB, with everything in an 8-byte slot. A slot is
 // found by the hash's low bits and confirmed by its high bits. Query reading fills
 // it from all threads.
 struct Table {
   atomic<u64> *slots;
+  u16 *seen;
   size_t mask, len;
 
   explicit Table(size_t query_bytes) {
     size_t size = std::max<size_t>(std::bit_ceil(query_bytes / 16 + 16), 1 << 10);
     len = size + TABLE_PADDING;
     slots = (atomic<u64> *)calloc(len, 8);
+    seen = (u16 *)calloc(len, 2);
     mask = size - 1;
   }
 
@@ -207,11 +199,11 @@ struct Table {
     u64 tag = (hash | TAG_ONE) & TAG_MASK;
     for (size_t at = hash & mask;; at++) {
       u64 value = 0;
-      if (slots[at].compare_exchange_strong(value, tag | flag, relaxed))
-        return at;
-      if ((value & TAG_MASK) == tag) {
+      if (slots[at].compare_exchange_strong(value, tag | flag, relaxed) ||
+          (value & TAG_MASK) == tag) {
         if ((value & flag) != flag)
           slots[at].fetch_or(flag, relaxed);
+        std::atomic_ref(seen[at]).fetch_add(1, relaxed);
         return at;
       }
     }
@@ -219,18 +211,6 @@ struct Table {
 
   INLINE void prefetch(u64 hash) const {
     _mm_prefetch((const char *)(slots + (hash & mask)), _MM_HINT_T0);
-  }
-
-  // The hash's slot, or -1 if it has none.
-  INLINE long position(u64 hash) const {
-    u64 tag = (hash | TAG_ONE) & TAG_MASK;
-    for (size_t at = hash & mask;; at++) {
-      u64 value = slots[at].load(relaxed);
-      if ((value & TAG_MASK) == tag)
-        return at;
-      if (!value)
-        return -1;
-    }
   }
 
   // Compares four slots at once. Tokens missing from the table are unpredictable,
@@ -330,23 +310,6 @@ static ChunkPhrases read_chunk(const u8 *text, size_t from, size_t to,
   return chunk;
 }
 
-// Counts tokens rather than documents, which is close enough to decide how to
-// store a term.
-static vector<u16> sample_counts(const u8 *input, const Table &table,
-                                 size_t docs) {
-  vector<u16> seen(table.len);
-  const u8 *p = input;
-  for (size_t i = 0; i < docs / SAMPLE_SHARE; i++) {
-    parse_id(p);
-    p = scan_line(p, [&](const u8 *, u64 hash) {
-      long at = table.position(hash);
-      if (at >= 0 && seen[at] < UINT16_MAX)
-        seen[at]++;
-    });
-  }
-  return seen;
-}
-
 struct Plan {
   Phrases phrases;
   vector<u32> phrase_bases;
@@ -355,23 +318,22 @@ struct Plan {
 
 // Final ids run through the common terms, then those with lists, then phrase-only
 // terms, so an id alone says how a token is handled.
-static Plan plan_index(Table &table, const vector<ChunkPhrases> &chunks,
-                       const vector<u16> &seen, size_t sample) {
+static Plan plan_index(Table &table, const vector<ChunkPhrases> &chunks) {
   Plan plan;
-  auto threshold = (u16)std::max<size_t>(sample / HIGH_SHARE, 1);
   auto slots = (u64 *)table.slots;
+  const u16 *seen = table.seen;
   size_t terms = 0;
   for (size_t at = 0; at < table.len; at++)
     if (slots[at]) {
       terms++;
       if (slots[at] & IN_BOOL)
-        (seen[at] > threshold ? plan.high : plan.low)++;
+        (seen[at] > HIGH_COUNT ? plan.high : plan.low)++;
     }
   size_t next_high = 0, next_low = plan.high, next_other = plan.high + plan.low;
   for (size_t at = 0; at < table.len; at++)
     if (slots[at]) {
       size_t &next = !(slots[at] & IN_BOOL)  ? next_other
-                     : seen[at] > threshold ? next_high
+                     : seen[at] > HIGH_COUNT ? next_high
                                             : next_low;
       slots[at] = (slots[at] & TAG_MASK) | next++;
     }
@@ -450,7 +412,7 @@ static const u8 *input;
 static size_t input_size;
 
 static void parse_docs(const Table &table, const Plan &plan, u64 *bits,
-                       size_t words, Worker &out, atomic<size_t> &next) {
+                       size_t words, Worker &out, Counter &next) {
   const u64 high = plan.high, low = plan.low;
   const size_t partitions = plan.low / PARTITION_TERMS + 1, sink = partitions;
   // One extra bucket takes the writes of tokens that need no list. It is never
@@ -473,7 +435,7 @@ static void parse_docs(const Table &table, const Plan &plan, u64 *bits,
       }
   };
   for (;;) {
-    size_t off = next.fetch_add(CHUNK, relaxed);
+    size_t off = next.take(CHUNK);
     if (off >= input_size)
       break;
     size_t i = off;
@@ -558,19 +520,27 @@ struct Segment {
 // One thread builds each partition of terms inside its cache, and frees its logs
 // as it goes. Runs of hits are visited by group, so every list comes out sorted
 // without sorting.
-static Lists build_lists(const vector<Worker> &workers, size_t terms,
-                         size_t docs) {
+static Lists prepare_lists(const vector<Worker> &workers, size_t terms,
+                           size_t docs, vector<size_t> &bases) {
   const size_t partitions = terms / PARTITION_TERMS + 1;
-  vector<size_t> bases(partitions + 1);
+  bases.resize(partitions + 1);
   for (size_t p = 0; p < partitions; p++) {
     bases[p + 1] = bases[p];
     for (auto &worker : workers)
       bases[p + 1] += worker.buckets[p].len;
   }
   const size_t blocks = (docs >> BLOCK_BITS) + 1;
-  auto ids = (u16 *)calloc(bases[partitions] + 1, 2);
-  auto marks = (u32 *)calloc((terms + 1) * (blocks + 1), 4);
-  on_all_threads(partitions, [&](size_t p) {
+  return {(u16 *)calloc(bases[partitions] + 1, 2),
+          (u32 *)calloc((terms + 1) * (blocks + 1), 4), blocks};
+}
+
+static void build_partition(const vector<Worker> &workers, size_t terms,
+                            const vector<size_t> &bases, const Lists &lists,
+                            size_t p) {
+  u16 *ids = lists.ids;
+  u32 *marks = lists.marks;
+  const size_t blocks = lists.blocks;
+  {
     vector<Segment> segments;
     u32 counts[PARTITION_TERMS] = {};
     for (size_t b = 0; b < workers.size(); b++) {
@@ -637,8 +607,7 @@ static Lists build_lists(const vector<Worker> &workers, size_t terms,
       mark(++block);
     for (auto &worker : workers)
       free(worker.buckets[p].data);
-  });
-  return {ids, marks, blocks};
+  }
 }
 
 struct Index {
@@ -890,6 +859,111 @@ struct Evaluator {
   }
 };
 
+static const u8 *text;
+static size_t text_size, docs, words, chunks;
+static vector<size_t> bounds, list_bases;
+static vector<ChunkPhrases> phrase_chunks;
+static Plan plan;
+static Table *table;
+static u64 *bits;
+static vector<Worker> workers;
+static Index index_all;
+static vector<u32> matched, phrase_docs;
+static vector<std::string> outputs;
+static Counter next_query, next_chunk, next_unmap, next_partition, next_answer;
+
+// Runs once on one thread each time all threads have arrived at the barrier.
+static void between_steps() noexcept {
+  static int step = 0;
+  if (step == 0) {
+    plan = plan_index(*table, phrase_chunks);
+    bits = (u64 *)calloc(plan.high * words + 1, 8);
+  } else if (step == 1) {
+    index_all = {plan.high, words, bits,
+                 prepare_lists(workers, plan.low, docs, list_bases)};
+    // A document can match a phrase more than once, but it counts once. Answers
+    // sort each phrase's few documents.
+    size_t phrase_count = plan.phrases.starts.size() - 1, total = 0;
+    matched.resize(phrase_count + 1);
+    for (auto &worker : workers)
+      for (const Hit &hit : worker.hits)
+        matched[hit.phrase + 1]++, total++;
+    for (size_t i = 1; i <= phrase_count; i++)
+      matched[i] += matched[i - 1];
+    phrase_docs.resize(total);
+    vector<u32> cursors(matched);
+    for (auto &worker : workers)
+      for (const Hit &hit : worker.hits)
+        phrase_docs[cursors[hit.phrase]++] = hit.doc;
+  } else if (step == 2) {
+  } else {
+    int fd = open("/out/results.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    for (auto &out : outputs)
+      if (write(fd, out.data(), out.size()) != (ssize_t)out.size())
+        abort();
+    _exit(0);
+  }
+  step++;
+}
+
+static std::barrier<void (*)() noexcept> *sync_all;
+
+static void answer_queries() {
+  Evaluator evaluator(index_all, docs);
+  u64 terms[64];
+  for (size_t c; (c = next_answer.take()) < chunks;) {
+    std::string &out = outputs[c];
+    out.reserve(bounds[c + 1] - bounds[c]);
+    size_t phrase = plan.phrase_bases[c];
+    for (const u8 *p = text + bounds[c]; p < text + bounds[c + 1];) {
+      if (*p == 'B') {
+        size_t position = 0, count = 0;
+        u8 op = 'A';
+        p = scan_line(p, [&](const u8 *word, u64 hash) {
+          if (position % 2 == 0) {
+            if (position)
+              op = *word;
+          } else {
+            terms[count++] = (table->find(hash) & ID_MASK) << 8 | op;
+          }
+          position++;
+        });
+        evaluator.answer(terms, count, out);
+      } else {
+        u32 *first = phrase_docs.data() + matched[phrase];
+        u32 *end = phrase_docs.data() + matched[phrase + 1];
+        std::sort(first, end);
+        end = std::unique(first, end);
+        u64 sum = 0;
+        for (u32 *at = first; at < end; at++)
+          sum += *at;
+        write_line(out, end - first, sum, first);
+        phrase++;
+        p = (const u8 *)memchr(p, '\n', text + text_size - p) + 1;
+      }
+    }
+  }
+}
+
+static void work(int t) {
+  for (size_t c; (c = next_query.take()) < chunks;)
+    phrase_chunks[c] = read_chunk(text, bounds[c], bounds[c + 1], *table);
+  sync_all->arrive_and_wait();
+  parse_docs(*table, plan, bits, words, workers[t], next_chunk);
+  // Exit would otherwise clear the input's page tables page by page on one
+  // thread, with the clock still running.
+  for (size_t off; (off = next_unmap.take(UNMAP_STEP)) < input_size;)
+    madvise((void *)(input + off), std::min(UNMAP_STEP, input_size - off),
+            MADV_DONTNEED);
+  sync_all->arrive_and_wait();
+  const size_t partitions = plan.low / PARTITION_TERMS + 1;
+  for (size_t p; (p = next_partition.take()) < partitions;)
+    build_partition(workers, plan.low, list_bases, index_all.lists, p);
+  sync_all->arrive_and_wait();
+  answer_queries();
+  sync_all->arrive_and_wait();
+}
+
 int main() {
   // The box has huge pages set to always, which charges 2 MB for a first touch
   // of a sparse region or a thread stack, and more when threads race to fault one.
@@ -899,99 +973,25 @@ int main() {
   cpu_set_t cpus;
   sched_getaffinity(0, sizeof cpus, &cpus);
   threads = CPU_COUNT(&cpus);
-  size_t length;
-  const u8 *text = map_input("/data/queries.txt", length);
-  vector<size_t> bounds = query_chunks(text, length);
-  size_t chunks = bounds.size() - 1;
-  Table table(length);
-  vector<ChunkPhrases> phrase_chunks(chunks);
-  on_all_threads(chunks, [&](size_t c) {
-    phrase_chunks[c] = read_chunk(text, bounds[c], bounds[c + 1], table);
-  });
-
+  text = map_input("/data/queries.txt", text_size);
+  bounds = query_chunks(text, text_size);
+  chunks = bounds.size() - 1;
+  table = new Table(text_size);
+  phrase_chunks.resize(chunks);
+  outputs.resize(chunks);
   input = map_input("/data/docs.txt", input_size);
-  size_t docs = 0;
   if (input_size) {
     const u8 *last = input + input_size - 1;
     while (last > input && last[-1] != '\n')
       last--;
     docs = parse_id(last) + 1;
   }
-  size_t words = (docs / 64 | 3) + 1;
-  Plan plan;
-  {
-    vector<u16> seen = sample_counts(input, table, docs);
-    plan = plan_index(table, phrase_chunks, seen, docs / SAMPLE_SHARE);
-  }
-
-  auto bits = (u64 *)calloc(plan.high * words + 1, 8);
-  vector<Worker> workers(threads);
-  atomic<size_t> next_chunk{0};
+  words = (docs / 64 | 3) + 1;
+  workers.resize(threads);
+  std::barrier<void (*)() noexcept> barrier(threads, between_steps);
+  sync_all = &barrier;
   vector<std::thread> pool;
-  for (auto &worker : workers)
-    pool.emplace_back([&, w = &worker] {
-      parse_docs(table, plan, bits, words, *w, next_chunk);
-    });
-  for (auto &thread : pool)
-    thread.join();
-  vector<Hit> hits;
-  for (auto &worker : workers)
-    hits.insert(hits.end(), worker.hits.begin(), worker.hits.end());
-  Lists lists = build_lists(workers, plan.low, docs);
-  Index index{plan.high, words, bits, lists};
-
-  // A document can match a phrase more than once, but it counts once.
-  std::sort(hits.begin(), hits.end());
-  hits.erase(std::unique(hits.begin(), hits.end()), hits.end());
-  size_t phrase_count = plan.phrases.starts.size() - 1;
-  vector<u32> matched(phrase_count + 1);
-  for (const Hit &hit : hits)
-    matched[hit.phrase + 1]++;
-  for (size_t i = 1; i <= phrase_count; i++)
-    matched[i] += matched[i - 1];
-
-  vector<std::string> outputs(chunks);
-  atomic<size_t> next_answer{0};
-  on_threads([&] {
-    Evaluator evaluator(index, docs);
-    u64 terms[64];
-    for (size_t c; (c = next_answer.fetch_add(1, relaxed)) < chunks;) {
-      std::string &out = outputs[c];
-      out.reserve(bounds[c + 1] - bounds[c]);
-      size_t phrase = plan.phrase_bases[c];
-      for (const u8 *p = text + bounds[c]; p < text + bounds[c + 1];) {
-        if (*p == 'B') {
-          size_t position = 0, count = 0;
-          u8 op = 'A';
-          p = scan_line(p, [&](const u8 *word, u64 hash) {
-            if (position % 2 == 0) {
-              if (position)
-                op = *word;
-            } else {
-              terms[count++] = (table.find(hash) & ID_MASK) << 8 | op;
-            }
-            position++;
-          });
-          evaluator.answer(terms, count, out);
-        } else {
-          const Hit *found = hits.data() + matched[phrase];
-          u32 total = matched[phrase + 1] - matched[phrase], first[10];
-          u64 sum = 0;
-          for (u32 i = 0; i < total; i++) {
-            sum += found[i].doc;
-            if (i < 10)
-              first[i] = found[i].doc;
-          }
-          write_line(out, total, sum, first);
-          phrase++;
-          p = (const u8 *)memchr(p, '\n', text + length - p) + 1;
-        }
-      }
-    }
-  });
-  int fd = open("/out/results.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  for (auto &out : outputs)
-    if (write(fd, out.data(), out.size()) != (ssize_t)out.size())
-      abort();
-  _exit(0);
+  for (int t = 1; t < threads; t++)
+    pool.emplace_back(work, t);
+  work(0);
 }
