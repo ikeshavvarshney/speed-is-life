@@ -4,17 +4,23 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-Rust, standard library only, one thread per available CPU.
+C++20 with gcc 16, standard library only, one thread per available CPU. The first version was Rust. The same algorithm in C++ ran at the same speed in 28% fewer scored lines, so it moved.
 
-The input is mapped with `mmap` and workers claim 256 KB ranges. Splitting relies on spec section 2.2: a newline inside a note is always followed by a lowercase word or a quote, so a newline followed by a digit or a BOM is always a record boundary. No quote-parity pass is needed.
+The input is mapped with `mmap` and workers claim 256 KB ranges. Splitting relies on spec section 2.2: a newline inside a note is always followed by a lowercase word or a quote, so a newline followed by a digit or a BOM is always a record boundary. No quote-parity pass over the file is needed.
 
-Fields are parsed in place with no copying or unescaping. Quoted fields are scanned with AVX2, and each `""` pair found reduces the value length by one, which is all the byte totals need. Numbers use SWAR. Money stays in integer cents throughout.
+Each 64-byte block becomes bitmasks with AVX2. A carry-less multiply of the quote bits by all ones gives a running XOR, which marks what lies inside quotes, as in simdjson. Commas and LFs outside quotes become a flat list of positions, and every record is exactly five of them. Field lengths are then known without a branch on their contents.
 
-The join is a flat `u8` array indexed by `region_id`. Each worker keeps its own running totals per country, merged at the end.
+Numbers are read backwards from their known ends. Three numbers are converted together in one vector. Money stays in integer cents throughout.
 
-`names_distinct` is the interesting part. A hash set per country would hold about three million entries. Instead, each name's 64-bit hash goes into one shared lock-free table, and its slot number becomes a small id. Each country then needs only a bitset over those ids, about 4 MB in total. A given name value always has the same raw spelling, so hashing the raw bytes is safe. A hash collision would merge two names, at a chance of about 3e-10 for 100,000 names. If a future pool outgrew the table, the run restarts with a larger one.
+A `""` pair is an opening quote directly after a closing quote, because fields always have a comma between them. Each pair reduces its field's value length by one, which is all the byte totals need, so nothing is unescaped or copied.
 
-Those two tables are the main cost, as both are random memory accesses on nearly every record. Each access is prefetched and then performed 16 records later, so the misses overlap instead of stalling the parser, and the tables use huge pages to reduce TLB misses.
+The join is a flat `u8` array indexed by `region_id`. Each worker keeps its own totals per country on one cache line, added to as one vector, and they are merged at the end.
+
+`names_distinct` is the interesting part. A hash set per country would hold about three million entries. Instead, each name's 64-bit hash goes into one shared lock-free table, whose buckets are one cache line of eight hashes compared at once. The slot number becomes a small id, and each country needs only a bitset over those ids, about 4 MB in total. A given name value always has the same raw spelling, so hashing raw bytes is safe. A collision would merge two names, at a chance of about 3e-10 for 100,000 names.
+
+The name table, region table and bitsets are random accesses on nearly every record. Group prefetching makes their misses overlap: one pass parses a batch and prefetches, the next looks up, and the last writes the bits.
+
+Setup and teardown are parallel as well. Workers load `regions.csv` together and clear the input's page tables together, as process exit would otherwise do that on one thread while the clock runs.
 
 ## Dependencies
 
@@ -22,4 +28,4 @@ None.
 
 ## With another 24 hours
 
-Tune the prefetch distance, chunk size and thread count on the scoring box, and try profile-guided optimisation.
+Measure the mispredictions at batch ends and on bucket overflow, which are only estimates so far. Trim output formatting and setup code. Try dense name ids to shrink the bitsets.
