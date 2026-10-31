@@ -17,7 +17,8 @@
 
 using u8 = uint8_t;
 using u32 = uint32_t;
-using u64 = uint64_t;
+// Not size_t's type, so writing one never forces sizes and masks to be reloaded.
+using u64 = unsigned long long;
 using v4 = __m256i;
 using std::atomic;
 constexpr auto relaxed = std::memory_order_relaxed;
@@ -150,7 +151,7 @@ INLINE v4 decode(u64 a, u64 b, u64 c) {
 }
 
 // 32 set bytes, then 32 clear ones, to mask a vector to a length.
-static u8 LOW_BYTES[64];
+alignas(64) static u8 LOW_BYTES[64];
 
 // Up to 32 bytes are masked and mixed at a fixed cost, as a loop per word would
 // mispredict on names of varying length. Longer names, which are rare, loop over

@@ -17,7 +17,8 @@
 using u8 = uint8_t;
 using u16 = uint16_t;
 using u32 = uint32_t;
-using u64 = uint64_t;
+// Not size_t's type, so writing one never forces sizes and masks to be reloaded.
+using u64 = unsigned long long;
 using v4 = __m256i;
 using v2 = __m128i;
 using std::atomic;
@@ -55,17 +56,18 @@ struct Text {
 // load. After the first few lines it is only read, so it is shared without
 // contention and nothing needs merging. A tag and its bucket give 40 bits of
 // hash, which over 1,842 names collide with odds of 2e-6.
-alignas(32) static atomic<u32> tags[SLOTS];
+alignas(64) static atomic<u32> tags[SLOTS];
 // Ids are given out in the order names are first seen. Popular names come early,
 // which packs the counters they use later into few cache lines.
-static atomic<u16> ids[SLOTS];
+alignas(64) static atomic<u16> ids[SLOTS];
 // Each name's offset and length in the block of name bytes. Id n is at n - 1.
 static std::mutex names_lock;
 static vector<Span> spans;
 static vector<char> name_bytes;
-static atomic<u64> stamps[HOURS];
-static atomic<size_t> cursors[HOURS];
-static atomic<size_t> next_chunk, next_unmap, next_hour, next_worker, parsed;
+// Written by every thread, so kept off the lines that each line of input reads.
+alignas(64) static atomic<u64> stamps[HOURS];
+alignas(64) static atomic<size_t> cursors[HOURS];
+alignas(64) static atomic<size_t> next_chunk, next_unmap, next_hour, next_worker, parsed;
 static std::mutex big_lock;
 static vector<BigLists> all_big;
 static vector<Named> order; // Each name and its id, in output order.
@@ -76,13 +78,13 @@ static bool writing;
 static Text waiting[HOURS];
 static vector<Text> spare_texts;
 
-static const u8 *input;
+alignas(64) static const u8 *input;
 static size_t input_size, capacity;
 static u32 *logs;
 static int threads, out_fd;
 
 // A vector whose first `n` bytes are set, for n up to 64, then clear bytes.
-static u8 masks[128];
+alignas(64) static u8 masks[128];
 INLINE const u8 *low_bytes(size_t n) { return masks + 64 - n; }
 INLINE u32 *region(size_t index) { return logs + index * capacity; }
 INLINE v4 load(const void *p) { return _mm256_loadu_si256((const v4 *)p); }

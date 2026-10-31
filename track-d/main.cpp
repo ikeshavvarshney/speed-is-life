@@ -15,7 +15,8 @@
 
 using u8 = uint8_t;
 using u32 = uint32_t;
-using u64 = uint64_t;
+// Not size_t's type, so writing one never forces sizes and masks to be reloaded.
+using u64 = unsigned long long;
 using std::atomic;
 using std::vector;
 constexpr auto relaxed = std::memory_order_relaxed;

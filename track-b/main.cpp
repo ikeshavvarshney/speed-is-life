@@ -17,7 +17,8 @@
 using u8 = uint8_t;
 using u16 = uint16_t;
 using u32 = uint32_t;
-using u64 = uint64_t;
+// Not size_t's type, so writing one never forces sizes and masks to be reloaded.
+using u64 = unsigned long long;
 using v4 = __m256i;
 using v2 = __m128i;
 using std::atomic;
@@ -62,7 +63,7 @@ struct Log {
 };
 
 static int threads;
-static u8 low_bytes[64];
+alignas(64) static u8 low_bytes[64];
 
 // Mapped over a larger anonymous mapping so vector loads near the end of the file
 // stay readable.
