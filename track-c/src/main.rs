@@ -66,12 +66,6 @@ unsafe fn decode(a: u64, b: u64, c: u64) -> (u32, u32, u32) {
     }
 }
 
-#[inline(always)]
-fn mum(a: u64, b: u64) -> u64 {
-    let product = a as u128 * b as u128;
-    product as u64 ^ (product >> 64) as u64
-}
-
 const LOW_BYTES: [u8; 64] = {
     let mut table = [0u8; 64];
     let mut i = 0;
@@ -83,26 +77,24 @@ const LOW_BYTES: [u8; 64] = {
 };
 
 // Names vary in length, so a loop per word mispredicts constantly. Up to 32 bytes are masked and
-// mixed at a fixed cost. Longer names, which are rare, loop over the rest.
+// mixed at a fixed cost. Longer names, which are rare, loop over the rest. Every input byte passes
+// through at least two AES rounds after it enters, which spreads it over the whole state.
 #[inline(always)]
 fn hash_name(p: *const u8, len: usize) -> u64 {
     unsafe {
         let mask = _mm256_loadu_si256(LOW_BYTES.as_ptr().add(32 - len.min(32)).cast());
         let bytes = _mm256_and_si256(_mm256_loadu_si256(p.cast()), mask);
-        let word0 = _mm256_extract_epi64::<0>(bytes) as u64;
-        let word1 = _mm256_extract_epi64::<1>(bytes) as u64;
-        let word2 = _mm256_extract_epi64::<2>(bytes) as u64;
-        let word3 = _mm256_extract_epi64::<3>(bytes) as u64;
-        let mut h = mum(word0 ^ 0x2D35_8DCC_AA6C_78A5, word1 ^ 0x8BB8_4B93_962E_ACC9)
-            ^ mum(word2 ^ 0x4B33_A62E_D433_D4A3, word3 ^ len as u64 ^ 0xC2B2_AE3D_27D4_EB4F);
+        let key = _mm_set_epi64x(0x8BB8_4B93_962E_ACC9u64 as i64, 0x2D35_8DCC_AA6C_78A5u64 as i64 ^ len as i64);
+        let low = _mm_xor_si128(_mm256_castsi256_si128(bytes), key);
+        let mut state = _mm_aesenc_si128(low, _mm256_extracti128_si256::<1>(bytes));
         let mut i = 32;
         while i < len {
-            let left = len - i;
-            let word = load64(p.add(i)) & if left >= 8 { u64::MAX } else { (1u64 << (left * 8)) - 1 };
-            h = mum(h ^ word, 0x8BB8_4B93_962E_ACC9);
-            i += 8;
+            let tail = _mm_loadu_si128(LOW_BYTES.as_ptr().add(32 - (len - i).min(16)).cast());
+            state = _mm_aesenc_si128(state, _mm_and_si128(_mm_loadu_si128(p.add(i).cast()), tail));
+            i += 16;
         }
-        mum(h, 0x9E37_79B9_7F4A_7C15) | 1
+        state = _mm_aesenc_si128(state, key);
+        _mm_cvtsi128_si64(_mm_aesenc_si128(state, key)) as u64 | 1
     }
 }
 
@@ -118,31 +110,19 @@ fn zeroed(bytes: usize, advice: i32) -> *mut u8 {
     }
 }
 
-// One worker's running values for one country, on one cache line. `logs` are the write positions
-// of the country's two name logs.
+// One worker's running values for one country, on one cache line. `sums` is added to as one vector:
+// id sum, amount sum, count << 32 | name bytes, note bytes. Neither half of the third can carry
+// into the other, as both stay below 2^31. `logs` are the write positions of the two name logs.
 #[derive(Clone, Copy)]
 #[repr(align(64))]
 struct Group {
-    id_sum: u64,
-    amount_sum: i64,
-    count: u32,
+    sums: [u64; 4],
     amount_min: i32,
     amount_max: i32,
-    name_bytes: u32,
-    note_bytes: u32,
     logs: [u32; 2],
 }
 
-const EMPTY: Group = Group {
-    id_sum: 0,
-    amount_sum: 0,
-    count: 0,
-    amount_min: i32::MAX,
-    amount_max: i32::MIN,
-    name_bytes: 0,
-    note_bytes: 0,
-    logs: [0; 2],
-};
+const EMPTY: Group = Group { sums: [0; 4], amount_min: i32::MAX, amount_max: i32::MIN, logs: [0; 2] };
 
 // Counters that every thread writes, each on its own line, away from what records read.
 #[repr(align(64))]
@@ -219,11 +199,13 @@ const BLOCKS: usize = 16;
 const MAX_MARKS: usize = BLOCKS * 64 + 64;
 const MAX_RECORDS: usize = MAX_MARKS / 5 + 1;
 
-// One 64-byte block as bitmasks: quotes, and commas or LFs outside quotes. A carry-less multiply
-// by all ones is a running XOR of the quote bits, so it marks exactly the bytes inside quotes;
-// a "" pair toggles twice and leaves the state alone.
+// One 64-byte block as bitmasks: commas or LFs outside quotes, and second quotes of "" pairs. A
+// carry-less multiply by all ones is a running XOR of the quote bits, which is set from an opening
+// quote up to its closing quote. A pair inside a value closes and at once reopens, while the fields
+// of a record always have a comma between them, so an opening quote right after a closing quote
+// is exactly a pair.
 #[inline(always)]
-unsafe fn block_masks(p: *const u8, inside: &mut u64) -> (u64, u64) {
+unsafe fn block_masks(p: *const u8, inside: &mut u64, closed: &mut u64) -> (u64, u64) {
     unsafe {
         let finder = _mm256_setr_epi8(
             -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0x0A, -1, 0x2C, -1, -1, -1,
@@ -237,25 +219,19 @@ unsafe fn block_masks(p: *const u8, inside: &mut u64) -> (u64, u64) {
         let q = _mm_set_epi64x(0, quotes as i64);
         let running = _mm_cvtsi128_si64(_mm_clmulepi64_si128::<0>(q, _mm_set1_epi8(-1))) as u64 ^ *inside;
         *inside = ((running as i64) >> 63) as u64;
-        (quotes, seps & !running)
+        let closers = quotes & !running;
+        let pairs = quotes & running & (closers << 1 | *closed);
+        *closed = closers >> 63;
+        (seps & !running, pairs)
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct Rec {
-    id: u32,
+    sums: __m256i,
+    hash: u64,
     region: u32,
     amount: i32,
-    name_len: u32,
-    note_len: u32,
-    hash: u64,
-}
-
-// A quoted field holds q quotes: two delimiters and q/2 - 1 pairs, so its value is raw - q/2 - 1
-// bytes. An unquoted field here is always empty, with q = 0 and raw = 0.
-#[inline(always)]
-fn value_len(raw: u32, quotes: u32) -> u32 {
-    (raw - quotes / 2).saturating_sub(1)
 }
 
 // Logs grow in segments from one shared arena, and each starts with the number of the segment
@@ -311,21 +287,26 @@ fn parse_chunk(job: &Job, first: usize, stop: usize, groups: &mut [Group]) {
     let base = job.input;
     let (by_id, last_region, slots, log) = (job.by_id as *const u8, job.last_region, job.names, job.log);
     let mut marks = [0u32; MAX_MARKS];
-    let mut counts = [0u32; MAX_MARKS];
-    let mut recs = [Rec::default(); MAX_RECORDS];
-    let (mut block, mut filled, mut inside, mut seen) = (first, 0usize, 0u64, 0u32);
+    // Number of "" pairs in the field that each mark ends. Pairs are rare, so it stays mostly zero.
+    let mut pairs = [0u32; MAX_MARKS + 1];
+    let mut recs = [Rec { sums: unsafe { _mm256_setzero_si256() }, hash: 0, region: 0, amount: 0 }; MAX_RECORDS];
+    let (mut block, mut filled, mut inside, mut closed) = (first, 0usize, 0u64, 0u64);
     let mut start = first;
     loop {
         unsafe {
             for _ in 0..BLOCKS {
-                let (quotes, mut seps) = block_masks(base.add(block), &mut inside);
+                let (mut seps, mut found_pairs) = block_masks(base.add(block), &mut inside, &mut closed);
+                while found_pairs != 0 {
+                    let before = found_pairs & found_pairs.wrapping_neg();
+                    pairs[filled + (seps & (before - 1)).count_ones() as usize] += 1;
+                    found_pairs ^= before;
+                }
                 let found = seps.count_ones() as usize;
                 let mut k = filled;
                 // Blocks hold about six marks. Writing eight every time beats a branch on the count.
                 loop {
                     for _ in 0..8 {
                         *marks.get_unchecked_mut(k) = block as u32 + seps.trailing_zeros();
-                        *counts.get_unchecked_mut(k) = seen + (quotes & (seps ^ seps.wrapping_sub(1))).count_ones();
                         seps &= seps.wrapping_sub(1);
                         k += 1;
                     }
@@ -334,7 +315,6 @@ fn parse_chunk(job: &Job, first: usize, stop: usize, groups: &mut [Group]) {
                     }
                 }
                 filled += found;
-                seen += quotes.count_ones();
                 block += 64;
             }
             let whole = filled / 5;
@@ -346,14 +326,13 @@ fn parse_chunk(job: &Job, first: usize, stop: usize, groups: &mut [Group]) {
                     break;
                 }
                 let m = marks.as_ptr().add(r * 5);
-                let c = counts.as_ptr().add(r * 5);
                 let (c1, c2, c3, c4, lf) =
                     (*m as usize, *m.add(1) as usize, *m.add(2) as usize, *m.add(3) as usize, *m.add(4) as usize);
                 let id_at = start + 3 * (*base.add(start) == BOM_FIRST) as usize;
                 let name_raw = (c2 - c1 - 1) as u32;
                 let note_raw = (c3 - c2 - 1) as u32;
-                let name_len = value_len(name_raw, *c.add(1) - *c);
-                let note_len = value_len(note_raw, *c.add(2) - *c.add(1));
+                let name_len = name_raw.saturating_sub(2) - pairs.get_unchecked(r * 5 + 1);
+                let note_len = note_raw.saturating_sub(2) - pairs.get_unchecked(r * 5 + 2);
                 let end = lf - (*base.add(lf - 1) == b'\r') as usize;
                 let negative = *base.add(c4 + 1) == b'-';
                 let text = load64(base.add(end - 8)) & (u64::MAX << ((8 - (end - c4 - 1 - negative as usize)) * 8));
@@ -366,8 +345,13 @@ fn parse_chunk(job: &Job, first: usize, stop: usize, groups: &mut [Group]) {
                 let hash = hash_name(base.add(c1 + 2), name_raw.saturating_sub(2) as usize);
                 _mm_prefetch::<_MM_HINT_T0>(by_id.add(region as usize).cast());
                 _mm_prefetch::<_MM_HINT_T0>(slots.add((hash >> (67 - NAME_BITS)) as usize * 8).cast());
-                *recs.get_unchecked_mut(n) =
-                    Rec { id, region, amount, name_len, note_len, hash };
+                let sums = _mm256_set_epi64x(
+                    note_len as i64,
+                    (1i64 << 32) | name_len as i64,
+                    amount as i64,
+                    id as i64,
+                );
+                *recs.get_unchecked_mut(n) = Rec { sums, hash, region, amount };
                 n += 1;
                 start = lf + 1;
             }
@@ -376,13 +360,10 @@ fn parse_chunk(job: &Job, first: usize, stop: usize, groups: &mut [Group]) {
             for rec in recs[..n].iter() {
                 let country = *by_id.add(rec.region as usize) as usize;
                 let group = groups.get_unchecked_mut(country);
-                group.count += 1;
-                group.id_sum += rec.id as u64;
-                group.amount_sum += rec.amount as i64;
+                let sums = group.sums.as_mut_ptr().cast();
+                _mm256_store_si256(sums, _mm256_add_epi64(_mm256_load_si256(sums), rec.sums));
                 group.amount_min = group.amount_min.min(rec.amount);
                 group.amount_max = group.amount_max.max(rec.amount);
-                group.name_bytes += rec.name_len;
-                group.note_bytes += rec.note_len;
                 let name = intern(job, slots, rec.hash);
                 let cursor = group.logs.get_unchecked_mut(name >> 16);
                 if *cursor as usize % SEGMENT == 0 {
@@ -395,10 +376,10 @@ fn parse_chunk(job: &Job, first: usize, stop: usize, groups: &mut [Group]) {
                 return;
             }
             let left = filled - whole * 5;
-            for i in 0..left {
-                marks[i] = marks[whole * 5 + i];
-                counts[i] = counts[whole * 5 + i];
-            }
+            marks.copy_within(whole * 5..filled, 0);
+            // The mark after the last one found may already have pairs waiting for it.
+            pairs.copy_within(whole * 5..=filled, 0);
+            pairs[left + 1..=filled].fill(0);
             filled = left;
         }
     }
@@ -544,28 +525,27 @@ fn main() {
         let mut total = EMPTY;
         for thread in 0..threads {
             let from = unsafe { &*job.groups.add(thread * COUNTRIES + country) };
-            total.count += from.count;
-            total.id_sum += from.id_sum;
-            total.amount_sum += from.amount_sum;
+            for (sum, add) in total.sums.iter_mut().zip(from.sums) {
+                *sum = sum.wrapping_add(add);
+            }
             total.amount_min = total.amount_min.min(from.amount_min);
             total.amount_max = total.amount_max.max(from.amount_max);
-            total.name_bytes += from.name_bytes;
-            total.note_bytes += from.note_bytes;
         }
-        if total.count == 0 {
+        let [id_sum, amount_sum, counted, note_bytes] = total.sums;
+        if counted == 0 {
             continue;
         }
         out.extend_from_slice(key);
         let line = format!(
             " {} {} {} {} {} {} {} {}\n",
-            total.count,
-            total.id_sum,
-            money(total.amount_sum),
+            counted >> 32,
+            id_sum,
+            money(amount_sum as i64),
             money(total.amount_min as i64),
             money(total.amount_max as i64),
             job.distinct[country].load(Relaxed),
-            total.name_bytes,
-            total.note_bytes
+            counted as u32,
+            note_bytes
         );
         out.extend_from_slice(line.as_bytes());
     }
