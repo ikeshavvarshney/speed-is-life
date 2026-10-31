@@ -8,6 +8,6 @@ cd "$(dirname "$0")/.."
 track="$(cygpath -w "$PWD/track-$1" 2>/dev/null || echo "$PWD/track-$1")"
 docker run --rm --network=none -v "$track:/src:ro" --entrypoint sh speeddemon/static-tools:2026-10-28 -c '
   cp -r /src /tmp/t && cd /tmp/t
-  find . -name "*.rs" -exec rustfmt --edition 2024 {} +
+  find . -name "*.rs" -exec rustfmt --edition 2024 {} + ; find . -name "*.cpp" -exec clang-format --style=LLVM -i {} +
   rm -f README.md PERF.md Cargo.toml Cargo.lock .speed-demon.toml; rm -rf .cargo
-  scc --no-cocomo --no-complexity . | grep -E "^(Rust|Dockerfile|Total)"'
+  scc --no-cocomo --no-complexity . | grep -E "^(Rust|C++|Dockerfile|Total)"'
