@@ -200,12 +200,8 @@ static Graph finish_graph(Slots slots, vector<Loose> loose) {
 static std::mutex pool_lock;
 static vector<std::pair<Slot *, size_t>> label_pool;
 
-// Mapped rather than allocated, so that untouched pages stay free however large
-// the table. Calloc would clear the whole table once earlier frees had raised
-// its threshold for mapping.
 static Slot *zeroed_labels(size_t len) {
-  return (Slot *)mmap(0, len * sizeof(Slot), PROT_READ | PROT_WRITE,
-                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  return (Slot *)calloc(len, sizeof(Slot));
 }
 
 // Maps nodes to their forward and backward distances in one table, so a
@@ -247,7 +243,9 @@ struct Labels {
 
   [[gnu::cold]] void grow() {
     size_t old_size = mask + 1, size = old_size * 2;
+    // Sized exactly: growing it by doubling would hold two copies at the peak.
     vector<Slot> live;
+    live.reserve(used);
     for (size_t i = 0; i < old_size; i++)
       if (slots[i].side[0])
         live.push_back(slots[i]);
@@ -264,7 +262,7 @@ struct Labels {
           label_pool.pop_back();
         }
       } else {
-        munmap(slots, capacity * sizeof(Slot));
+        free(slots);
         slots = zeroed_labels(size);
         capacity = size;
       }
@@ -492,21 +490,12 @@ int main() {
   vector<std::thread> pool;
   for (auto &reader : readers)
     pool.emplace_back(read_edges, &reader);
-  for (auto &thread : pool)
-    thread.join();
-  // Each reader's list is freed once copied, so the edges exist only twice at
-  // worst for one reader, which keeps the peak down.
   vector<Loose> loose[2];
-  for (int side = 0; side < 2; side++) {
-    size_t total = 0;
-    for (auto &reader : readers)
-      total += reader.loose[side].size();
-    loose[side].reserve(total);
-    for (auto &reader : readers) {
-      auto &from = reader.loose[side];
-      loose[side].insert(loose[side].end(), from.begin(), from.end());
-      vector<Loose>().swap(from);
-    }
+  for (int t = 0; t < threads; t++) {
+    pool[t].join();
+    for (int side = 0; side < 2; side++)
+      loose[side].insert(loose[side].end(), readers[t].loose[side].begin(),
+                         readers[t].loose[side].end());
   }
   Graph graphs[2];
   std::thread finisher([&] {
