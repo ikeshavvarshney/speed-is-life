@@ -5,4 +5,4 @@ Every step from the reference to your final version, each with the live-board ru
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 14.44 | 367 | 0 |
-| 1 | | | | | |
+| 1 | Rust rewrite: in-place parsing, shared name table with per-country bitsets, prefetch pipeline, huge pages | run-00ffb948bcd6 | 0.050 | 10 | 72.3 |

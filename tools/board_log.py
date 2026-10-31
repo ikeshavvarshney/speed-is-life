@@ -26,9 +26,16 @@ def git(*args):
 
 
 def fetch():
-    request = urllib.request.Request(f"{FEED}?t={int(time.time())}", headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return json.load(response)
+    # The feed is republished every few seconds, so a read can come back truncated.
+    for attempt in range(10):
+        try:
+            request = urllib.request.Request(f"{FEED}?t={int(time.time())}", headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.load(response)
+        except (OSError, ValueError):
+            if attempt == 9:
+                raise
+            time.sleep(3)
 
 
 def our_team(board):
