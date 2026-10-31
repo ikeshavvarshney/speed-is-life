@@ -436,7 +436,12 @@ static void fill_lane_orders() {
   }
 }
 
-struct Worker {
+// One thread's buffers, used by every step, so pages are only touched once. One
+// document can hold at most half its bytes as tokens, and a list at most all
+// documents, so these never need to grow. Only the pages used take memory.
+struct Scratch {
+  u64 *tokens;
+  u32 *ids, *high_ids, *low_ids;
   vector<Hit> hits;
 };
 
@@ -455,18 +460,13 @@ static u16 *claim_log_page(size_t partition, u32 group) {
 }
 
 static void parse_docs(const Table &table, const Plan &plan, u64 *bits,
-                       size_t words, Worker &out, Counter &next) {
+                       size_t words, Scratch &out, Counter &next) {
   const u32 high = plan.high, low = plan.low;
   const size_t partitions = plan.low / PARTITION_TERMS + 1;
   vector<u16 *> heads(partitions, nullptr);
   vector<Hit> &hits = out.hits;
-  // One document can hold at most half its bytes as tokens, so these never need
-  // to grow. Only the pages used take memory.
-  const size_t most = input_size / 2 + PREFETCH_AHEAD + 16;
-  auto tokens = (u64 *)reserve(most * 8);
-  auto ids = (u32 *)reserve(most * 4);
-  auto high_ids = (u32 *)reserve(most * 4);
-  auto low_ids = (u32 *)reserve(most * 4);
+  u64 *tokens = out.tokens;
+  u32 *ids = out.ids, *high_ids = out.high_ids, *low_ids = out.low_ids;
   auto lines = (u64 *)aligned_alloc(64, (plan.high + 1) * LINE_WORDS * 8);
   memset(lines, 0, (plan.high + 1) * LINE_WORDS * 8);
   u32 group = NO_GROUP;
@@ -576,6 +576,7 @@ static void parse_docs(const Table &table, const Plan &plan, u64 *bits,
   for (u16 *head : heads)
     if (head)
       *head = LOG_END;
+  free(lines);
 }
 
 struct Lists {
@@ -607,13 +608,8 @@ struct Lists {
 struct ListBuilder {
   u32 *marks;
   size_t terms, blocks, groups;
-  vector<u32> runs, order, group_starts;
   u16 *image;
-
-  ListBuilder(u32 *marks, size_t terms, size_t blocks, size_t groups)
-      : marks(marks), terms(terms), blocks(blocks), groups(groups) {
-    image = (u16 *)reserve(log_span);
-  }
+  vector<u32> runs, order, group_starts;
 
   void build(size_t p) {
     auto log = (u16 *)(log_regions + p * log_span);
@@ -675,6 +671,8 @@ struct ListBuilder {
     while (block < blocks)
       mark(++block);
     memcpy(log, image, sum * 2);
+    size_t kept = (sum * 2 + LOG_PAGE - 1) & -LOG_PAGE;
+    madvise((u8 *)log + kept, pages * LOG_PAGE - kept, MADV_DONTNEED);
   }
 };
 
@@ -788,17 +786,10 @@ static size_t probe(const u32 *a, size_t na, const u32 *b, size_t nb, u32 *out) 
 // the smallest list goes first and NOT comes last, which leaves little to compare.
 struct Evaluator {
   const Index &index;
-  size_t n = 0;
-  bool dense = false;
   u32 *r, *tmp, *l;
   u64 *bits;
-
-  explicit Evaluator(const Index &index, size_t docs) : index(index) {
-    r = (u32 *)malloc((docs + 8) * 4);
-    tmp = (u32 *)malloc((docs + 8) * 4);
-    l = (u32 *)malloc((docs + 8) * 4);
-    bits = (u64 *)malloc(index.words * 8);
-  }
+  size_t n = 0;
+  bool dense = false;
 
   u64 term_size(u32 id) const {
     return id < index.high ? UINT32_MAX : index.lists.size(id - index.high);
@@ -936,11 +927,12 @@ static Plan plan;
 static Draft *draft;
 static Table table;
 static u64 *bits;
-static vector<Worker> workers;
+static vector<Scratch> scratches;
 static Index index_all;
 static vector<u32> matched, phrase_docs;
 static vector<std::string> outputs;
 static Counter next_query, next_chunk, next_unmap, next_partition, next_answer;
+static Counter next_release;
 
 // Runs once on one thread each time all threads have arrived at the barrier.
 static void between_steps() noexcept {
@@ -962,17 +954,19 @@ static void between_steps() noexcept {
     // sort each phrase's few documents.
     size_t phrase_count = plan.phrases.starts.size() - 1, total = 0;
     matched.resize(phrase_count + 1);
-    for (auto &worker : workers)
-      for (const Hit &hit : worker.hits)
+    for (auto &scratch : scratches)
+      for (const Hit &hit : scratch.hits)
         matched[hit.phrase + 1]++, total++;
     for (size_t i = 1; i <= phrase_count; i++)
       matched[i] += matched[i - 1];
     phrase_docs.resize(total);
     vector<u32> cursors(matched);
-    for (auto &worker : workers)
-      for (const Hit &hit : worker.hits)
+    for (auto &scratch : scratches)
+      for (const Hit &hit : scratch.hits)
         phrase_docs[cursors[hit.phrase]++] = hit.doc;
+    plan.phrases = {};
   } else if (step == 2) {
+  } else if (step == 3) {
   } else {
     int fd = open("/out/results.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     for (auto &out : outputs)
@@ -985,8 +979,9 @@ static void between_steps() noexcept {
 
 static std::barrier<void (*)() noexcept> *sync_all;
 
-static void answer_queries() {
-  Evaluator evaluator(index_all, docs);
+static void answer_queries(Scratch &scratch) {
+  Evaluator evaluator{index_all, scratch.ids, scratch.high_ids, scratch.low_ids,
+                      scratch.tokens};
   u64 terms[64];
   for (size_t c; (c = next_answer.take()) < chunks;) {
     std::string &out = outputs[c];
@@ -1023,25 +1018,42 @@ static void answer_queries() {
 }
 
 static void work(int t) {
+  Scratch &scratch = scratches[t];
+  size_t most = input_size / 2 + (1 << 16);
+  scratch.tokens = (u64 *)reserve(most * 8);
+  scratch.ids = (u32 *)reserve(most * 4);
+  scratch.high_ids = (u32 *)reserve(most * 4);
+  scratch.low_ids = (u32 *)reserve(most * 4);
   for (size_t c; (c = next_query.take()) < chunks;)
     phrase_chunks[c] = read_chunk(text, bounds[c], bounds[c + 1], *draft);
   sync_all->arrive_and_wait();
-  parse_docs(table, plan, bits, words, workers[t], next_chunk);
+  parse_docs(table, plan, bits, words, scratch, next_chunk);
   // Exit would otherwise clear the input's page tables page by page on one
   // thread, with the clock still running.
   for (size_t off; (off = next_unmap.take(UNMAP_STEP)) < input_size;)
     madvise((void *)(input + off), std::min(UNMAP_STEP, input_size - off),
             MADV_DONTNEED);
   sync_all->arrive_and_wait();
+  const size_t partitions = plan.low / PARTITION_TERMS + 1;
   {
-    const size_t partitions = plan.low / PARTITION_TERMS + 1;
-    ListBuilder builder(list_marks, plan.low, (docs >> BLOCK_BITS) + 1, docs / GROUP_DOCS + 1);
+    ListBuilder builder{list_marks, plan.low, (docs >> BLOCK_BITS) + 1,
+                        docs / GROUP_DOCS + 1, (u16 *)scratch.tokens};
     for (size_t p; (p = next_partition.take()) < partitions;)
       builder.build(p);
-    madvise(builder.image, log_span, MADV_DONTNEED);
+    // Bitsets take over these pages while answering.
+    madvise(scratch.tokens, most * 8, MADV_DONTNEED);
   }
   sync_all->arrive_and_wait();
-  answer_queries();
+  answer_queries(scratch);
+  sync_all->arrive_and_wait();
+  // Nothing but the answers is needed now. Giving it all back here, on all threads,
+  // lowers the peak as the output grows, and leaves exit almost nothing to do.
+  for (size_t p; (p = next_release.take()) <= partitions;)
+    if (p == partitions)
+      madvise(bits, plan.high * words * 8, MADV_DONTNEED);
+    else
+      madvise(log_regions + p * log_span,
+              next_log_page[p].value.load(relaxed) * LOG_PAGE, MADV_DONTNEED);
   sync_all->arrive_and_wait();
 }
 
@@ -1069,7 +1081,7 @@ int main() {
     docs = parse_id(last) + 1;
   }
   words = (docs / 64 | (LINE_WORDS - 1)) + 1;
-  workers.resize(threads);
+  scratches.resize(threads);
   std::barrier<void (*)() noexcept> barrier(threads, between_steps);
   sync_all = &barrier;
   vector<std::thread> pool;
