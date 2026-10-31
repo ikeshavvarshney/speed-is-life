@@ -58,6 +58,7 @@ const u32 GROUP_DOCS = 1 << GROUP_BITS, NO_GROUP = UINT32_MAX;
 const size_t PARTITION_TERMS = 1 << PARTITION_BITS, LOG_BLOCK = 1 << 9;
 const size_t PAGE = 1 << 12;
 const u16 MARKER = 1 << 15, LOG_END = UINT16_MAX;
+const size_t LOG_UNIT = 16;
 
 // Document ids in lists are stored as 16 bits within a block of 65,536 documents.
 const int BLOCK_BITS = 16, GROUPS_PER_BLOCK_BITS = BLOCK_BITS - GROUP_BITS;
@@ -197,7 +198,7 @@ struct Draft {
   size_t mask, len;
 
   explicit Draft(size_t query_bytes) {
-    size_t size = std::max<size_t>(std::bit_ceil(query_bytes / 16 + 16), 1 << 10);
+    size_t size = std::max<size_t>(std::bit_ceil(query_bytes / 8 + 16), 1 << 10);
     len = size + TABLE_PADDING;
     hashes = (atomic<u64> *)calloc(len, 8);
     mask = size - 1;
@@ -466,18 +467,24 @@ static u8 *log_regions;
 static size_t log_span;
 static Counter *next_log_block;
 
-static u16 *claim_log_block(size_t partition, u32 group) {
-  auto block = (u16 *)(log_regions + partition * log_span +
-                       next_log_block[partition].take() * LOG_BLOCK);
-  *block = MARKER | group;
-  return block + 1;
+static v4 *claim_log_block(size_t partition) {
+  return (v4 *)(log_regions + partition * log_span +
+                next_log_block[partition].take() * LOG_BLOCK);
 }
 
 static void parse_docs(const Table &table, const Plan &plan, u64 *bits,
                        size_t words, Scratch &out, Counter &next) {
   const u32 high = plan.high, low = plan.low;
   const size_t partitions = plan.low / PARTITION_TERMS + 1;
-  vector<u16 *> heads(partitions, nullptr);
+  // Each partition's next hits wait in a small buffer, all of them in a few cache
+  // lines on one page, and go to the log 32 bytes at a time. Writing directly would
+  // touch one page and one cache line per partition, far more than the first-level
+  // TLB holds.
+  vector<v4 *> heads(partitions);
+  auto waiting = (u16(*)[LOG_UNIT])aligned_alloc(64, partitions * LOG_UNIT * 2);
+  vector<u32> filled(partitions);
+  for (size_t partition = 0; partition < partitions; partition++)
+    heads[partition] = claim_log_block(partition);
   vector<Hit> &hits = out.hits;
   u64 *tokens = out.tokens;
   u32 *ids = out.ids, *high_ids = out.high_ids, *low_ids = out.low_ids;
@@ -522,19 +529,25 @@ static void parse_docs(const Table &table, const Plan &plan, u64 *bits,
       if (p - 1 >= stop && doc % LINE_DOCS == 0)
         break;
       auto push = [&](size_t partition, u16 entry) {
-        u16 *head = heads[partition];
-        *head++ = entry;
-        if (!((size_t)head & (LOG_BLOCK - 1)))
-          head = claim_log_block(partition, group);
-        heads[partition] = head;
+        u32 k = filled[partition];
+        waiting[partition][k++] = entry;
+        if (k == LOG_UNIT) {
+          k = 0;
+          v4 *head = heads[partition];
+          _mm256_store_si256(head++, _mm256_load_si256((const v4 *)waiting[partition]));
+          // Every block starts with a marker.
+          if (!((size_t)head & (LOG_BLOCK - 1))) {
+            head = claim_log_block(partition);
+            waiting[partition][k++] = MARKER | group;
+          }
+          heads[partition] = head;
+        }
+        filled[partition] = k;
       };
       if (doc >> GROUP_BITS != group) {
         group = doc >> GROUP_BITS;
         for (size_t partition = 0; partition < partitions; partition++)
-          if (heads[partition])
-            push(partition, MARKER | group);
-          else
-            heads[partition] = claim_log_block(partition, group);
+          push(partition, MARKER | group);
       }
       u32 position = doc & (GROUP_DOCS - 1);
       u64 bit = 1ull << position;
@@ -596,10 +609,12 @@ static void parse_docs(const Table &table, const Plan &plan, u64 *bits,
         flush(doc);
     }
   }
-  for (u16 *head : heads)
-    if (head)
-      *head = LOG_END;
+  for (size_t partition = 0; partition < partitions; partition++) {
+    waiting[partition][filled[partition]] = LOG_END;
+    _mm256_store_si256(heads[partition], _mm256_load_si256((const v4 *)waiting[partition]));
+  }
   free(lines);
+  free(waiting);
 }
 
 struct Lists {
