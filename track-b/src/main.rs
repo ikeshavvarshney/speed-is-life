@@ -272,6 +272,7 @@ struct Index {
     bits: Vec<u64>,
     words: usize,
     docs: Vec<u32>,
+    frequency: Vec<u32>,
     input: &'static [u8],
 }
 
@@ -448,23 +449,30 @@ fn push_int(out: &mut Vec<u8>, mut value: u64) {
 
 // Positions are not stored: phrases contain a rare term nearly always, so few candidates remain
 // after intersecting, and re-reading those few documents costs less than indexing every position.
-fn contains_phrase(index: &Index, doc: u32, phrase: &[u32], tokens: &mut Vec<u32>) -> bool {
+// Tokens are compared only with the phrase's own terms, which avoids the hash table entirely.
+fn contains_phrase(index: &Index, doc: u32, keys: &[Key], tokens: &mut Vec<u8>, wanted: &[u8]) -> bool {
     tokens.clear();
     let start = unsafe { index.input.as_ptr().add(index.docs[doc as usize] as usize) };
-    scan_tokens(start, |key| tokens.push(index.terms.find(key)));
-    tokens.windows(phrase.len()).any(|window| window == phrase)
+    scan_tokens(start, |key| {
+        let position = keys.iter().position(|k| k == key);
+        tokens.push(position.map_or(u8::MAX, |p| wanted[p]));
+    });
+    tokens.windows(wanted.len()).any(|window| window == wanted)
 }
 
-fn run_phrase(index: &Index, phrase: &[u32], tokens: &mut Vec<u32>) -> Set {
-    let mut terms: Vec<Term> = phrase.iter().map(|&id| index.term(id)).collect();
-    terms.sort_by_key(Term::len);
-    let mut candidates = to_set(terms[0]);
-    for &term in &terms[1..] {
+fn run_phrase(index: &Index, phrase: &[u32], tokens: &mut Vec<u8>) -> Set {
+    let mut terms: Vec<(u32, Term)> = phrase.iter().map(|&id| (index.frequency[id as usize], index.term(id))).collect();
+    terms.sort_by_key(|term| term.0);
+    let mut candidates = to_set(terms[0].1);
+    for &(_, term) in &terms[1..] {
         candidates = apply(candidates, b'A', term);
     }
+    // A repeated term maps to its first position, so the small ids of a window identify terms.
+    let keys: Vec<Key> = phrase.iter().map(|&id| index.terms.keys[id as usize]).collect();
+    let wanted: Vec<u8> = keys.iter().map(|key| keys.iter().position(|k| k == key).unwrap() as u8).collect();
     let mut found = Vec::new();
     for_each_id(&candidates, |doc| {
-        if contains_phrase(index, doc, phrase, tokens) {
+        if contains_phrase(index, doc, &keys, tokens, &wanted) {
             found.push(doc);
         }
     });
@@ -692,7 +700,7 @@ fn main() {
     unsafe { mallopt(M_MMAP_THRESHOLD, 1 << 16) };
     let threads = std::thread::available_parallelism().map_or(1, |c| c.get());
     let text = std::fs::read("/data/queries.txt").unwrap();
-    let mut terms = Terms::with_capacity(text.len() / 8 + 16);
+    let mut terms = Terms::with_capacity(text.len() / 16 + 16);
     let queries = parse_queries(&text, &mut terms);
     drop(text);
 
@@ -706,7 +714,8 @@ fn main() {
     let mut docs = vec![0u32; count];
     let parsed = parse_docs(input, &terms, &routes, &mut bits, words, &mut docs, threads);
     let (offsets, ids) = build_postings(parsed, terms.keys.len(), threads);
-    let index = Index { terms, routes, offsets, ids, bits, words, docs, input };
+    let mut index = Index { terms, routes, offsets, ids, bits, words, docs, frequency: Vec::new(), input };
+    index.frequency = (0..index.terms.keys.len() as u32).map(|id| index.term(id).len() as u32).collect();
 
     let batches = queries.len() / QUERY_BATCH + 1;
     let outputs: Vec<Mutex<Vec<u8>>> = (0..batches).map(|_| Mutex::new(Vec::new())).collect();
