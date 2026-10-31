@@ -106,66 +106,50 @@ fn place(slots: &[AtomicU32], node: u32, head: u32, weight: u32, loose: &mut Vec
     loose.push(Loose { node, head, weight });
 }
 
+#[inline(always)]
+fn place_edge(graphs: [&[AtomicU32]; 2], (tail, head, weight): (u32, u32, u32), loose: &mut [Vec<Loose>; 2]) {
+    place(graphs[0], tail, head, weight, &mut loose[0]);
+    place(graphs[1], head, tail, weight, &mut loose[1]);
+}
+
 // Places edges directly as they are parsed, with no log. Each placement is prefetched and made
 // some edges later, so that the cache misses of these random writes overlap.
-fn read_edges(input: &[u8], start: usize, graphs: [&[AtomicU32]; 2], threads: usize) -> [Vec<Loose>; 2] {
-    let next = AtomicUsize::new(start);
-    let results = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..threads)
-            .map(|_| {
-                let next = &next;
-                scope.spawn(move || {
-                    let mut loose = [Vec::new(), Vec::new()];
-                    let mut ring = [(u32::MAX, 0, 0); PLACE_AHEAD];
-                    let mut at = 0;
-                    let base = input.as_ptr();
-                    loop {
-                        let off = next.fetch_add(CHUNK, Relaxed);
-                        if off >= input.len() {
-                            for &(tail, head, weight) in ring.iter().filter(|edge| edge.0 != u32::MAX) {
-                                place(graphs[0], tail, head, weight, &mut loose[0]);
-                                place(graphs[1], head, tail, weight, &mut loose[1]);
-                            }
-                            return loose;
-                        }
-                        let mut i = off;
-                        if off != start {
-                            i += input[off - 1..].iter().position(|&b| b == b'\n').unwrap();
-                        }
-                        let stop = (off + CHUNK).min(input.len());
-                        while i < stop {
-                            unsafe {
-                                let (tail, p) = parse_digits(base.add(i));
-                                let (head, p) = parse_digits(p.add(1));
-                                let (weight, p) = parse_digits(p.add(1));
-                                i = p.offset_from(base) as usize + 1;
-                                let (tail, head, weight) = (tail as u32, head as u32, weight as u32);
-                                // A self-loop never shortens a path.
-                                if tail == head {
-                                    continue;
-                                }
-                                _mm_prefetch::<_MM_HINT_ET0>(graphs[0].as_ptr().add(tail as usize * SLOTS).cast());
-                                _mm_prefetch::<_MM_HINT_ET0>(graphs[1].as_ptr().add(head as usize * SLOTS).cast());
-                                let old = std::mem::replace(ring.get_unchecked_mut(at), (tail, head, weight));
-                                at = (at + 1) % PLACE_AHEAD;
-                                if old.0 != u32::MAX {
-                                    place(graphs[0], old.0, old.1, old.2, &mut loose[0]);
-                                    place(graphs[1], old.1, old.0, old.2, &mut loose[1]);
-                                }
-                            }
-                        }
-                    }
-                })
-            })
-            .collect();
-        handles.into_iter().map(|handle| handle.join().unwrap()).collect::<Vec<_>>()
-    });
-    let mut merged = [Vec::new(), Vec::new()];
-    for [forward, backward] in results {
-        merged[0].extend(forward);
-        merged[1].extend(backward);
+fn read_edges(input: &[u8], start: usize, next: &AtomicUsize, graphs: [&[AtomicU32]; 2]) -> [Vec<Loose>; 2] {
+    let mut loose = [Vec::new(), Vec::new()];
+    let mut ring = [(u32::MAX, 0, 0); PLACE_AHEAD];
+    let mut at = 0;
+    let base = input.as_ptr();
+    loop {
+        let off = next.fetch_add(CHUNK, Relaxed);
+        if off >= input.len() {
+            ring.iter().filter(|edge| edge.0 != u32::MAX).for_each(|&edge| place_edge(graphs, edge, &mut loose));
+            return loose;
+        }
+        let mut i = off;
+        if off != start {
+            i += input[off - 1..].iter().position(|&b| b == b'\n').unwrap();
+        }
+        let stop = (off + CHUNK).min(input.len());
+        while i < stop {
+            unsafe {
+                let (tail, p) = parse_digits(base.add(i));
+                let (head, p) = parse_digits(p.add(1));
+                let (weight, p) = parse_digits(p.add(1));
+                i = p.offset_from(base) as usize + 1;
+                // A self-loop never shortens a path.
+                if tail == head {
+                    continue;
+                }
+                _mm_prefetch::<_MM_HINT_ET0>(graphs[0].as_ptr().add(tail as usize * SLOTS).cast());
+                _mm_prefetch::<_MM_HINT_ET0>(graphs[1].as_ptr().add(head as usize * SLOTS).cast());
+                let old = std::mem::replace(ring.get_unchecked_mut(at), (tail as u32, head as u32, weight as u32));
+                at = (at + 1) % PLACE_AHEAD;
+                if old.0 != u32::MAX {
+                    place_edge(graphs, old, &mut loose);
+                }
+            }
+        }
     }
-    merged
 }
 
 struct Graph {
@@ -516,8 +500,16 @@ fn main() {
     }
 
     let (forward, backward) = (zeroed_slots(n * SLOTS), zeroed_slots(n * SLOTS));
-    let [loose_forward, loose_backward] = read_edges(input, start, [forward, backward], threads);
+    let next = AtomicUsize::new(start);
     let graphs = std::thread::scope(|scope| {
+        let read = || read_edges(input, start, &next, [forward, backward]);
+        let readers: Vec<_> = (0..threads).map(|_| scope.spawn(read)).collect();
+        let [mut loose_forward, mut loose_backward] = [Vec::new(), Vec::new()];
+        for reader in readers {
+            let [one, other] = reader.join().unwrap();
+            loose_forward.extend(one);
+            loose_backward.extend(other);
+        }
         let handle = scope.spawn(|| finish_graph(backward, loose_backward));
         [finish_graph(forward, loose_forward), handle.join().unwrap()]
     });
