@@ -309,7 +309,7 @@ fn hour_label(hour: usize) -> [u8; 21] {
     let (month, day) = [(b'0', 30), (b'0', 31), (b'1', 1), (b'1', 2)][total / 24];
     let hh = total % 24;
     let mut label = *b"2026-1X-DDTHH:00:00Z ";
-    label[6] = if month == b'0' { b'0' } else { b'1' };
+    label[6] = month;
     label[8] = b'0' + day / 10;
     label[9] = b'0' + day % 10;
     label[11] = b'0' + (hh / 10) as u8;
