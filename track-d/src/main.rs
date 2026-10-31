@@ -2,6 +2,7 @@ use std::arch::x86_64::*;
 use std::ffi::c_void;
 use std::fs::File;
 use std::os::fd::AsRawFd;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering::Relaxed};
 
 const CHUNK: usize = 1 << 18;
@@ -23,7 +24,8 @@ const DIST_BITS: u32 = 64 - NODE_BITS;
 const NO_DIST: u64 = (1 << DIST_BITS) - 1;
 const KEY_MASK: u64 = !NO_DIST;
 const LABELS_START: usize = 1 << 12;
-const LABELS_KEEP: usize = 1 << 16;
+const LABELS_LOCAL: usize = 1 << 14;
+const LABELS_SHARED: usize = 1 << 19;
 
 unsafe extern "C" {
     #[link_name = "_exit"]
@@ -197,24 +199,30 @@ fn finish_graph(slots: &'static [AtomicU32], mut loose: Vec<Loose>) -> Graph {
 
 // Maps nodes to their forward and backward distances in one table, so a relaxation that looks at
 // both directions touches one slot. Node ids are random, so their low bits index it directly.
-struct Labels {
+// Each thread owns a small table. The few searches that outgrow it borrow a large one from a
+// shared pool, so memory follows how many large searches overlap rather than the thread count,
+// and no search pays to map or unmap memory. Everything past `mask` is always zero.
+struct Labels<'a> {
     slots: Vec<[u64; 2]>,
     mask: usize,
     used: usize,
+    local: Vec<[u64; 2]>,
+    pool: &'a Mutex<Vec<Vec<[u64; 2]>>>,
 }
 
-impl Labels {
-    fn new() -> Self {
-        Self { slots: vec![[0; 2]; LABELS_START], mask: LABELS_START - 1, used: 0 }
+impl<'a> Labels<'a> {
+    fn new(pool: &'a Mutex<Vec<Vec<[u64; 2]>>>) -> Self {
+        Self { slots: vec![[0; 2]; LABELS_LOCAL], mask: LABELS_START - 1, used: 0, local: Vec::new(), pool }
     }
 
     fn reset(&mut self) {
-        if self.slots.len() > LABELS_KEEP {
-            *self = Self::new();
-        } else {
-            self.slots[..=self.mask].fill([0; 2]);
-            self.mask = LABELS_START - 1;
-            self.used = 0;
+        self.slots[..=self.mask].fill([0; 2]);
+        self.mask = LABELS_START - 1;
+        self.used = 0;
+        if self.slots.len() > LABELS_LOCAL {
+            let local = std::mem::take(&mut self.local);
+            let shared = std::mem::replace(&mut self.slots, local);
+            self.pool.lock().unwrap().push(shared);
         }
     }
 
@@ -241,11 +249,15 @@ impl Labels {
     fn grow(&mut self) {
         let old_size = self.mask + 1;
         let live: Vec<[u64; 2]> = self.slots[..old_size].iter().copied().filter(|slot| slot[0] != 0).collect();
-        let size = old_size * 4;
+        self.slots[..old_size].fill([0; 2]);
+        let size = old_size * 2;
         if size > self.slots.len() {
-            self.slots = vec![[0; 2]; size];
-        } else {
-            self.slots[..size].fill([0; 2]);
+            if self.slots.len() == LABELS_LOCAL {
+                let shared = self.pool.lock().unwrap().pop().unwrap_or_else(|| vec![[0; 2]; LABELS_SHARED]);
+                self.local = std::mem::replace(&mut self.slots, shared);
+            } else {
+                self.slots = vec![[0; 2]; size];
+            }
         }
         self.mask = size - 1;
         for slot in live {
@@ -402,8 +414,8 @@ impl Queue {
     }
 }
 
-struct Search {
-    labels: Labels,
+struct Search<'a> {
+    labels: Labels<'a>,
     queues: [Queue; 2],
 }
 
@@ -419,7 +431,7 @@ fn relax(search: &mut Search, side: usize, graph: &Graph, head: u32, next: u64, 
             }
             search.queues[side].push(next, head);
             unsafe { _mm_prefetch::<_MM_HINT_T0>(graph.slots.as_ptr().add(head as usize * SLOTS).cast()) };
-            if search.labels.used * 2 > search.labels.mask {
+            if search.labels.used * 8 > search.labels.mask * 7 {
                 search.labels.grow();
             }
         }
@@ -511,11 +523,12 @@ fn main() {
     });
 
     let answers: Vec<AtomicI64> = queries.iter().map(|_| AtomicI64::new(0)).collect();
+    let pool = Mutex::new(Vec::new());
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| {
-                let mut search = Search { labels: Labels::new(), queues: [Queue::new(), Queue::new()] };
+                let mut search = Search { labels: Labels::new(&pool), queues: [Queue::new(), Queue::new()] };
                 loop {
                     let q = next.fetch_add(1, Relaxed);
                     let Some(&(s, t)) = queries.get(q) else { return };
