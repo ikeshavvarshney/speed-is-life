@@ -924,11 +924,9 @@ static void between_steps() noexcept {
   static int step = 0;
   if (step == 0)
     after_queries();
-  else if (step == 1)
+  if (step == 1)
     after_parsing();
-  else if (step == 2)
-  else if (step == 3)
-  else
+  if (step == 4)
     write_output();
   step++;
 }
