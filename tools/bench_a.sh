@@ -9,7 +9,7 @@ image=speeddemon-local/track-a
 docker build -q --network=none -t "$image" track-a >/dev/null
 
 run() {
-  docker run --rm --network=none --read-only --tmpfs /tmp:rw,size=1g,exec \
+  docker run --rm ${CPUS:+--cpuset-cpus=$CPUS} --network=none --read-only --tmpfs /tmp:rw,size=1g,exec \
     --tmpfs /out:rw,size=64m,mode=1777 --memory=8g --memory-swap=8g --pids-limit=512 \
     --cap-drop=ALL --security-opt=no-new-privileges --user 65534:65534 -e TRACK=a \
     --mount "type=volume,src=sd-data,dst=/data,volume-subpath=a/$1,readonly" \
@@ -22,7 +22,7 @@ run() {
       echo "'"$1"' $ok ${t}s peak=$(( $(cat /sys/fs/cgroup/memory.peak) / 1000000 ))MB"'
 }
 
-for name in tiny-seed1 sample-seed1 full-seed1 sample-seed2 full-seed2 tiny-seed3 sample-seed3; do
+for name in worked edge tiny-seed1 sample-seed1 full-seed1 sample-seed2 full-seed2 tiny-seed3 sample-seed3; do
   run "$name"
 done
 echo "--- timed"
