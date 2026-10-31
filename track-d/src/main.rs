@@ -16,10 +16,9 @@ const WEIGHT_BITS: u32 = 11;
 const ESCAPE: u32 = (1 << WEIGHT_BITS) - 1;
 const LIST_END: u32 = u32::MAX;
 
-// Heap items and labels pack a distance above a 21-bit node. The generated graphs stay far below
-// the 2^43 this allows for distances.
+// Labels pack a distance below a 21-bit node. The generated graphs stay far below the 2^43 this
+// allows for distances.
 const NODE_BITS: u32 = 21;
-const NODE_MASK: u64 = (1 << NODE_BITS) - 1;
 const DIST_BITS: u32 = 64 - NODE_BITS;
 const NO_DIST: u64 = (1 << DIST_BITS) - 1;
 const KEY_MASK: u64 = !NO_DIST;
@@ -264,67 +263,148 @@ fn set_dist(slot: &mut [u64; 2], side: usize, dist: u64) {
     slot[side] = slot[side] & KEY_MASK | dist;
 }
 
-// Four children per node: shallower than a binary heap, and siblings mostly share a cache line.
-#[derive(Default)]
-struct Heap {
-    items: Vec<u64>,
+// Dial's bucket queue: one bucket per distance, in a window that a single edge cannot jump past,
+// with a bitmap to find the next used bucket. Pushing and popping take constant time and no
+// comparisons, as Dijkstra only ever pushes distances at or above the last one popped. The few
+// heavier edges wait in a side list until the window reaches them.
+const WINDOW: usize = 1 << 12;
+const WINDOW_MASK: u64 = WINDOW as u64 - 1;
+
+struct Queue {
+    heads: Vec<u32>,
+    used: [u64; WINDOW / 64],
+    pool: Vec<(u32, u32)>,
+    free: u32,
+    base: u64,
+    len: usize,
+    far: Vec<(u64, u32)>,
 }
 
-impl Heap {
+impl Queue {
+    fn new() -> Self {
+        Self { heads: vec![0; WINDOW], used: [0; WINDOW / 64], pool: vec![(0, 0)], free: 0, base: 0, len: 0, far: Vec::new() }
+    }
+
+    fn reset(&mut self) {
+        self.used = [0; WINDOW / 64];
+        self.pool.truncate(1);
+        self.far.clear();
+        self.free = 0;
+        self.base = 0;
+        self.len = 0;
+    }
+
     #[inline(always)]
-    fn push(&mut self, item: u64) {
-        let mut i = self.items.len();
-        self.items.push(item);
+    fn insert(&mut self, dist: u64, node: u32) {
+        let bucket = (dist & WINDOW_MASK) as usize;
+        let (word, bit) = (bucket / 64, 1u64 << (bucket % 64));
         unsafe {
-            while i > 0 {
-                let parent = (i - 1) / 4;
-                let above = *self.items.get_unchecked(parent);
-                if above <= item {
-                    break;
-                }
-                *self.items.get_unchecked_mut(i) = above;
-                i = parent;
-            }
-            *self.items.get_unchecked_mut(i) = item;
+            let head = if *self.used.get_unchecked(word) & bit != 0 { *self.heads.get_unchecked(bucket) } else { 0 };
+            *self.used.get_unchecked_mut(word) |= bit;
+            let index = if self.free != 0 {
+                let index = self.free;
+                self.free = self.pool.get_unchecked(index as usize).0;
+                *self.pool.get_unchecked_mut(index as usize) = (head, node);
+                index
+            } else {
+                self.pool.push((head, node));
+                self.pool.len() as u32 - 1
+            };
+            *self.heads.get_unchecked_mut(bucket) = index;
         }
     }
 
     #[inline(always)]
-    fn pop(&mut self) -> u64 {
-        let top = self.items[0];
-        let last = self.items.pop().unwrap();
-        let n = self.items.len();
-        if n > 0 {
-            let mut i = 0;
-            unsafe {
-                loop {
-                    let first = 4 * i + 1;
-                    if first >= n {
-                        break;
-                    }
-                    let mut best = first;
-                    for child in first + 1..(first + 4).min(n) {
-                        if *self.items.get_unchecked(child) < *self.items.get_unchecked(best) {
-                            best = child;
-                        }
-                    }
-                    let smallest = *self.items.get_unchecked(best);
-                    if smallest >= last {
-                        break;
-                    }
-                    *self.items.get_unchecked_mut(i) = smallest;
-                    i = best;
-                }
-                *self.items.get_unchecked_mut(i) = last;
+    fn push(&mut self, dist: u64, node: u32) {
+        self.len += 1;
+        if dist - self.base < WINDOW as u64 {
+            self.insert(dist, node);
+        } else {
+            self.far.push((dist, node));
+        }
+    }
+
+    // The smallest distance held. Call this only when the queue is not empty, and not between a
+    // pop and the pushes that follow it, as pushes must not fall below `base`.
+    #[inline(always)]
+    fn top(&mut self) -> u64 {
+        let bucket = (self.base & WINDOW_MASK) as usize;
+        if self.used[bucket / 64] >> (bucket % 64) & 1 == 0 || !self.far.is_empty() {
+            self.advance();
+        }
+        self.base
+    }
+
+    #[inline(always)]
+    fn next_used(&self) -> Option<u64> {
+        let bucket = (self.base & WINDOW_MASK) as usize;
+        let (word, shift) = (bucket / 64, bucket % 64);
+        let rest = self.used[word] >> shift;
+        if rest != 0 {
+            return Some(self.base + rest.trailing_zeros() as u64);
+        }
+        let mut offset = 64 - shift as u64;
+        for i in 1..=WINDOW / 64 {
+            let bits = self.used[(word + i) % (WINDOW / 64)];
+            if bits != 0 {
+                return Some(self.base + offset + bits.trailing_zeros() as u64);
+            }
+            offset += 64;
+        }
+        None
+    }
+
+    // The node most likely to come next. A later push may overtake it, which costs nothing.
+    #[inline(always)]
+    fn peek(&self) -> Option<u32> {
+        let dist = self.next_used()?;
+        let index = unsafe { *self.heads.get_unchecked((dist & WINDOW_MASK) as usize) };
+        Some(unsafe { self.pool.get_unchecked(index as usize).1 })
+    }
+
+    #[cold]
+    fn advance(&mut self) {
+        let near = self.next_used();
+        let far = self.far.iter().map(|item| item.0).min();
+        self.base = match (near, far) {
+            (Some(near), Some(far)) => near.min(far),
+            (Some(near), None) => near,
+            (None, Some(far)) => far,
+            (None, None) => return,
+        };
+        let mut i = 0;
+        while i < self.far.len() {
+            if self.far[i].0 - self.base < WINDOW as u64 {
+                let (dist, node) = self.far.swap_remove(i);
+                self.insert(dist, node);
+            } else {
+                i += 1;
             }
         }
-        top
+    }
+
+    // Removes a node at distance `base`, which `top` has just found.
+    #[inline(always)]
+    fn pop(&mut self) -> u32 {
+        let bucket = (self.base & WINDOW_MASK) as usize;
+        unsafe {
+            let index = *self.heads.get_unchecked(bucket);
+            let (next, node) = *self.pool.get_unchecked(index as usize);
+            *self.heads.get_unchecked_mut(bucket) = next;
+            if next == 0 {
+                *self.used.get_unchecked_mut(bucket / 64) &= !(1u64 << (bucket % 64));
+            }
+            self.pool.get_unchecked_mut(index as usize).0 = self.free;
+            self.free = index;
+            self.len -= 1;
+            node
+        }
     }
 }
 
 struct Search {
     labels: Labels,
-    heaps: [Heap; 2],
+    queues: [Queue; 2],
 }
 
 #[inline(always)]
@@ -337,7 +417,7 @@ fn relax(search: &mut Search, side: usize, graph: &Graph, head: u32, next: u64, 
             if across != NO_DIST {
                 *best = (*best).min(next + across);
             }
-            search.heaps[side].push(next << NODE_BITS | head as u64);
+            search.queues[side].push(next, head);
             unsafe { _mm_prefetch::<_MM_HINT_T0>(graph.slots.as_ptr().add(head as usize * SLOTS).cast()) };
             if search.labels.used * 2 > search.labels.mask {
                 search.labels.grow();
@@ -355,26 +435,33 @@ fn shortest_path(graphs: &[Graph; 2], s: u32, t: u32, search: &mut Search) -> i6
     search.labels.reset();
     for (side, start) in [s, t].into_iter().enumerate() {
         set_dist(unsafe { &mut *search.labels.entry(start) }, side, 0);
-        search.heaps[side].items.clear();
-        search.heaps[side].push(start as u64);
+        search.queues[side].reset();
+        search.queues[side].push(0, start);
     }
     let mut best = u64::MAX;
     loop {
-        let (Some(&top0), Some(&top1)) = (search.heaps[0].items.first(), search.heaps[1].items.first()) else {
+        if search.queues[0].len == 0 || search.queues[1].len == 0 {
             break;
-        };
-        let (dist0, dist1) = (top0 >> NODE_BITS, top1 >> NODE_BITS);
+        }
+        let (dist0, dist1) = (search.queues[0].top(), search.queues[1].top());
         if dist0 + dist1 >= best {
             break;
         }
-        let side = (search.heaps[0].items.len() > search.heaps[1].items.len()) as usize;
-        let far_top = if side == 0 { dist1 } else { dist0 };
-        let item = search.heaps[side].pop();
-        let (dist, node) = (item >> NODE_BITS, (item & NODE_MASK) as u32);
-        if dist > unsafe { (*search.labels.entry(node))[side] } & NO_DIST {
-            continue;
-        }
+        let side = (search.queues[0].len > search.queues[1].len) as usize;
+        let (dist, far_top) = if side == 0 { (dist0, dist1) } else { (dist1, dist0) };
+        // A stale entry needs no check: all its relaxations simply fail.
+        let node = search.queues[side].pop();
         let graph = &graphs[side];
+        // Labels of unseen neighbours are the main cost, as node ids are random. Each node's edges
+        // were prefetched when it was pushed, so the labels of the next node's neighbours can be
+        // prefetched now, in time for when it is processed.
+        if let Some(coming) = search.queues[side].peek() {
+            let at = coming as usize * SLOTS;
+            for slot in unsafe { graph.slots.get_unchecked(at..at + SLOTS) } {
+                let label = (slot.load(Relaxed) >> WEIGHT_BITS).wrapping_sub(1) as usize & search.labels.mask;
+                unsafe { _mm_prefetch::<_MM_HINT_T0>(search.labels.slots.as_ptr().add(label).cast()) };
+            }
+        }
         for slot in unsafe { graph.slots.get_unchecked(node as usize * SLOTS..(node as usize + 1) * SLOTS) } {
             let entry = slot.load(Relaxed);
             if entry == 0 {
@@ -428,7 +515,7 @@ fn main() {
     std::thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| {
-                let mut search = Search { labels: Labels::new(), heaps: [Heap::default(), Heap::default()] };
+                let mut search = Search { labels: Labels::new(), queues: [Queue::new(), Queue::new()] };
                 loop {
                     let q = next.fetch_add(1, Relaxed);
                     let Some(&(s, t)) = queries.get(q) else { return };
