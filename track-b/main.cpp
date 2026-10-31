@@ -53,6 +53,7 @@ const int BLOCK_BITS = 16, GROUPS_PER_BLOCK_BITS = BLOCK_BITS - GROUP_BITS;
 const u64 HASH_0 = 0x2D358DCCAA6C78A5, HASH_1 = 0x8BB84B93962EACC9;
 const u64 HASH_2 = 0x4B33A62ED433D4A3, HASH_3 = 0xC2B2AE3D27D4EB4F;
 const int PAIR_BITS = 20;
+const size_t PROBE_RATIO = 6;
 
 struct Hit {
   u32 phrase, doc;
@@ -169,20 +170,23 @@ INLINE u32 parse_id(const u8 *&p) {
   return id;
 }
 
-// Runs `work` on all threads, which claim numbers below `count` until none are
-// left.
-template <class F> static void on_all_threads(size_t count, F &&work) {
-  atomic<size_t> next{0};
-  auto run = [&] {
-    for (size_t i; (i = next.fetch_add(1, relaxed)) < count;)
-      work(i);
-  };
+template <class F> static void on_threads(F &&run) {
   vector<std::thread> pool;
   for (int t = 1; t < threads; t++)
     pool.emplace_back(run);
   run();
   for (auto &thread : pool)
     thread.join();
+}
+
+// Runs `work` on all threads, which claim numbers below `count` until none are
+// left.
+template <class F> static void on_all_threads(size_t count, F &&work) {
+  atomic<size_t> next{0};
+  on_threads([&] {
+    for (size_t i; (i = next.fetch_add(1, relaxed)) < count;)
+      work(i);
+  });
 }
 
 // The one lookup table, about 1 MB, with everything in an 8-byte slot. A slot is
@@ -528,14 +532,20 @@ struct Lists {
   u32 *marks;
   size_t blocks;
 
-  void decode(size_t term, vector<u32> &out) const {
-    out.clear();
+  size_t size(size_t term) const {
+    const u32 *m = marks + term * (blocks + 1);
+    return m[blocks] - m[0];
+  }
+
+  size_t decode(size_t term, u32 *out) const {
+    const u32 *m = marks + term * (blocks + 1);
+    size_t n = 0;
     for (size_t block = 0; block < blocks; block++) {
-      size_t at = term * (blocks + 1) + block;
       u32 top = (u32)block << BLOCK_BITS;
-      for (u32 i = marks[at]; i < marks[at + 1]; i++)
-        out.push_back(top | ids[i]);
+      for (u32 i = m[block]; i < m[block + 1]; i++)
+        out[n++] = top | ids[i];
     }
+    return n;
   }
 };
 
@@ -637,169 +647,246 @@ struct Index {
   Lists lists;
 };
 
-INLINE bool has_bit(const u64 *bits, u32 id) {
-  return (bits[id / 64] >> (id % 64)) & 1;
-}
-
-static void intersect(const vector<u32> &a, const vector<u32> &b,
-                      vector<u32> &out) {
-  out.clear();
-  auto &small = a.size() <= b.size() ? a : b;
-  auto &large = a.size() <= b.size() ? b : a;
-  if (large.size() > small.size() * 16) {
-    auto rest = large.begin();
-    for (u32 id : small) {
-      rest = std::lower_bound(rest, large.end(), id);
-      if (rest != large.end() && *rest == id)
-        out.push_back(id);
-    }
-  } else {
-    for (size_t i = 0, j = 0; i < a.size() && j < b.size();) {
-      u32 x = a[i], y = b[j];
-      if (x == y)
-        out.push_back(x);
-      i += x <= y;
-      j += y <= x;
-    }
-  }
-}
-
-static void merge_union(const vector<u32> &a, const vector<u32> &b,
-                        vector<u32> &out) {
-  out.clear();
-  size_t i = 0, j = 0;
-  while (i < a.size() && j < b.size()) {
-    u32 x = a[i], y = b[j];
-    out.push_back(std::min(x, y));
-    i += x <= y;
-    j += y <= x;
-  }
-  out.insert(out.end(), a.begin() + i, a.end());
-  out.insert(out.end(), b.begin() + j, b.end());
-}
-
-static void difference(const vector<u32> &a, const vector<u32> &b,
-                       vector<u32> &out) {
-  out.clear();
-  auto rest = b.begin();
-  for (u32 id : a) {
-    rest = std::lower_bound(rest, b.end(), id);
-    if (rest == b.end() || *rest != id)
-      out.push_back(id);
-  }
-}
-
 static void push_int(std::string &out, u64 value) {
   char digits[20];
   out.append(digits, std::to_chars(digits, digits + 20, value).ptr);
 }
 
-// The sum of a word's set bit positions is a sum of six masked population counts.
-static void write_bits(std::string &out, const vector<u64> &bits) {
-  static const u64 POSITION_BITS[6] = {
-      0xAAAAAAAAAAAAAAAA, 0xCCCCCCCCCCCCCCCC, 0xF0F0F0F0F0F0F0F0,
-      0xFF00FF00FF00FF00, 0xFFFF0000FFFF0000, 0xFFFFFFFF00000000};
-  u64 count = 0, sum = 0;
-  for (size_t i = 0; i < bits.size(); i++) {
-    u64 ones = __builtin_popcountll(bits[i]);
-    count += ones;
-    sum += ones * (i * 64);
-    for (int k = 0; k < 6; k++)
-      sum += (u64)__builtin_popcountll(bits[i] & POSITION_BITS[k]) << k;
-  }
+static void write_line(std::string &out, u64 count, u64 sum, const u32 *first) {
   push_int(out, count);
   out += ' ';
   push_int(out, sum);
-  int left = 10;
-  for (size_t i = 0; i < bits.size() && left; i++)
-    for (u64 rest = bits[i]; rest && left; rest &= rest - 1, left--) {
-      out += ' ';
-      push_int(out, i * 64 + __builtin_ctzll(rest));
-    }
-  out += '\n';
-}
-
-// Writes the count, the sum and the ten smallest of `n` ascending ids.
-template <class F> static void write_ids(std::string &out, size_t n, F &&id_at) {
-  u64 sum = 0;
-  for (size_t i = 0; i < n; i++)
-    sum += id_at(i);
-  push_int(out, n);
-  out += ' ';
-  push_int(out, sum);
-  for (size_t i = 0; i < std::min<size_t>(n, 10); i++) {
+  for (u64 i = 0; i < std::min<u64>(count, 10); i++) {
     out += ' ';
-    push_int(out, id_at(i));
+    push_int(out, first[i]);
   }
   out += '\n';
 }
 
-struct Evaluator {
-  bool as_bits = false;
-  vector<u32> ids, term, merged;
-  vector<u64> bits;
+// Counts a bitset's set bits and sums their positions. Nibble lookups give each
+// byte's count and the sum of positions inside it, and byte and word weights
+// turn those into positions in the whole set: about 5 micro-ops per word, against
+// 20 for six masked population counts. `n` is a multiple of 4 words.
+static void count_bits(const u64 *words, size_t n, u64 &count, u64 &sum) {
+  const v4 pops = _mm256_setr_epi8(0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, //
+                                   0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4);
+  const v4 sums = _mm256_setr_epi8(0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5, 6, 6, //
+                                   0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5, 6, 6);
+  const v4 weights = _mm256_set1_epi64x(0x3830282018100800);
+  const v4 nibble = _mm256_set1_epi8(0x0F), ones = _mm256_set1_epi16(1);
+  const v4 zero = _mm256_setzero_si256();
+  v4 running = zero, weighted = zero, inside = zero;
+  for (size_t i = 0; i < n; i += 4) {
+    v4 x = _mm256_loadu_si256((const v4 *)(words + i));
+    v4 lo = _mm256_and_si256(x, nibble);
+    v4 hi = _mm256_and_si256(_mm256_srli_epi16(x, 4), nibble);
+    v4 pop_hi = _mm256_shuffle_epi8(pops, hi);
+    v4 pop = _mm256_add_epi8(_mm256_shuffle_epi8(pops, lo), pop_hi);
+    v4 pos = _mm256_add_epi8(
+        _mm256_add_epi8(_mm256_shuffle_epi8(sums, lo),
+                        _mm256_shuffle_epi8(sums, hi)),
+        _mm256_slli_epi16(pop_hi, 2));
+    inside = _mm256_add_epi64(inside, _mm256_sad_epu8(pos, zero));
+    inside = _mm256_add_epi32(
+        inside, _mm256_madd_epi16(_mm256_maddubs_epi16(weights, pop), ones));
+    running = _mm256_add_epi64(running, _mm256_sad_epu8(pop, zero));
+    weighted = _mm256_add_epi64(weighted, running);
+  }
+  alignas(32) u64 per_lane[4], later[4], rest[4];
+  _mm256_store_si256((v4 *)per_lane, running);
+  _mm256_store_si256((v4 *)later, weighted);
+  _mm256_store_si256((v4 *)rest, inside);
+  count = sum = 0;
+  // `weighted` adds each vector's counts once per vector from it to the end.
+  for (u64 lane = 0; lane < 4; lane++) {
+    u64 before = n / 4 * per_lane[lane] - later[lane];
+    count += per_lane[lane];
+    sum += (rest[lane] & UINT32_MAX) + (rest[lane] >> 32) +
+           64 * (4 * before + lane * per_lane[lane]);
+  }
+}
 
-  void start(const Index &index, size_t id) {
-    as_bits = id < index.high;
-    if (as_bits)
-      bits.assign(index.bits + id * index.words,
-                  index.bits + (id + 1) * index.words);
-    else
-      index.lists.decode(id - index.high, ids);
+// Merges two ascending lists without branching on their contents, as those
+// comparisons are unpredictable.
+template <u8 OP>
+static size_t merge(const u32 *a, size_t na, const u32 *b, size_t nb, u32 *out) {
+  size_t i = 0, j = 0, n = 0;
+  while (i < na && j < nb) {
+    u32 x = a[i], y = b[j];
+    out[n] = std::min(x, y);
+    n += OP == 'O' || (OP == 'A' ? x == y : x < y);
+    i += x <= y;
+    j += y <= x;
+  }
+  if (OP != 'A')
+    while (i < na)
+      out[n++] = a[i++];
+  if (OP == 'O')
+    while (j < nb)
+      out[n++] = b[j++];
+  return n;
+}
+
+// For lists of very different sizes. Each id of the short list skips ahead in the
+// long one by whole vectors and compares 8 at once. `b` is followed by 8 ids above
+// any document.
+template <bool KEEP>
+static size_t probe(const u32 *a, size_t na, const u32 *b, size_t nb, u32 *out) {
+  size_t j = 0, n = 0;
+  for (size_t i = 0; i < na; i++) {
+    u32 x = a[i];
+    while (j + 64 < nb && b[j + 63] < x)
+      j += 64;
+    while (b[j + 7] < x)
+      j += 8;
+    v4 equal = _mm256_cmpeq_epi32(_mm256_loadu_si256((const v4 *)(b + j)),
+                                  _mm256_set1_epi32(x));
+    out[n] = x;
+    n += (_mm256_movemask_epi8(equal) != 0) == KEEP;
+  }
+  return n;
+}
+
+// Answers one boolean query. Filters between two ORs commute, so within such a run
+// the smallest list goes first and NOT comes last, which leaves little to compare.
+struct Evaluator {
+  const Index &index;
+  size_t n = 0;
+  bool dense = false;
+  u32 *r, *tmp, *l;
+  u64 *bits;
+
+  explicit Evaluator(const Index &index, size_t docs) : index(index) {
+    r = (u32 *)malloc((docs + 8) * 4);
+    tmp = (u32 *)malloc((docs + 8) * 4);
+    l = (u32 *)malloc((docs + 8) * 4);
+    bits = (u64 *)malloc(index.words * 8);
   }
 
-  // Applies one operator, strictly left to right. `op` is its word's first byte.
-  void apply(const Index &index, u8 op, size_t id) {
-    if (!as_bits && ids.empty() && op != 'O')
+  u64 term_size(u32 id) const {
+    return id < index.high ? UINT32_MAX : index.lists.size(id - index.high);
+  }
+
+  void to_dense(const u64 *start) {
+    if (start)
+      memcpy(bits, start, index.words * 8);
+    else
+      memset(bits, 0, index.words * 8);
+    for (size_t i = 0; i < n; i++)
+      bits[r[i] / 64] |= 1ull << (r[i] % 64);
+    dense = true;
+  }
+
+  void start(u32 id) {
+    n = 0;
+    dense = false;
+    if (id < index.high)
+      to_dense(index.bits + id * index.words);
+    else
+      n = index.lists.decode(id - index.high, r);
+  }
+
+  void filter_bits(const u64 *row, bool keep) {
+    size_t kept = 0;
+    for (size_t i = 0; i < n; i++) {
+      r[kept] = r[i];
+      kept += ((row[r[i] / 64] >> (r[i] % 64)) & 1) == keep;
+    }
+    n = kept;
+  }
+
+  // Applies one operator. `op` is its word's first byte.
+  void apply(u8 op, u32 id) {
+    if (!dense && !n && op != 'O')
       return;
     if (id < index.high) {
-      const u64 *other = index.bits + id * index.words;
-      if (as_bits) {
-        for (size_t i = 0; i < bits.size(); i++)
-          bits[i] = op == 'A'   ? bits[i] & other[i]
-                    : op == 'O' ? bits[i] | other[i]
-                                : bits[i] & ~other[i];
+      const u64 *row = index.bits + id * index.words;
+      if (dense) {
+        for (size_t i = 0; i < index.words; i += 4) {
+          v4 x = _mm256_loadu_si256((const v4 *)(bits + i));
+          v4 y = _mm256_loadu_si256((const v4 *)(row + i));
+          _mm256_storeu_si256((v4 *)(bits + i),
+                              op == 'A'   ? _mm256_and_si256(x, y)
+                              : op == 'O' ? _mm256_or_si256(x, y)
+                                          : _mm256_andnot_si256(y, x));
+        }
       } else if (op == 'O') {
-        bits.assign(other, other + index.words);
-        for (u32 doc : ids)
-          bits[doc / 64] |= 1ull << (doc % 64);
-        as_bits = true;
+        to_dense(row);
       } else {
-        bool keep = op == 'A';
-        std::erase_if(ids, [&](u32 doc) { return has_bit(other, doc) != keep; });
+        filter_bits(row, op == 'A');
       }
       return;
     }
-    index.lists.decode(id - index.high, term);
-    if (as_bits) {
+    size_t nl = index.lists.decode(id - index.high, l);
+    if (dense) {
       if (op == 'A') {
-        ids.clear();
-        for (u32 doc : term)
-          if (has_bit(bits.data(), doc))
-            ids.push_back(doc);
-        as_bits = false;
+        std::swap(r, l);
+        n = nl;
+        filter_bits(bits, true);
+        dense = false;
       } else {
-        for (u32 doc : term) {
-          u64 bit = 1ull << (doc % 64);
-          bits[doc / 64] = op == 'O' ? bits[doc / 64] | bit : bits[doc / 64] & ~bit;
+        for (size_t i = 0; i < nl; i++) {
+          u64 bit = 1ull << (l[i] % 64);
+          u64 &word = bits[l[i] / 64];
+          word = op == 'O' ? word | bit : word & ~bit;
         }
       }
-    } else {
-      if (op == 'A')
-        intersect(ids, term, merged);
-      else if (op == 'O')
-        merge_union(ids, term, merged);
-      else
-        difference(ids, term, merged);
-      ids.swap(merged);
+      return;
     }
+    if (op == 'O') {
+      // A long list of ids takes more room than a bitset.
+      if (n + nl > index.words * 2) {
+        to_dense(nullptr);
+        apply(op, id);
+        return;
+      }
+      n = merge<'O'>(r, n, l, nl, tmp);
+    } else {
+      for (int i = 0; i < 8; i++)
+        l[nl + i] = r[n + i] = UINT32_MAX;
+      if (n * PROBE_RATIO < nl)
+        n = op == 'A' ? probe<true>(r, n, l, nl, tmp)
+                      : probe<false>(r, n, l, nl, tmp);
+      else if (op == 'A' && nl * PROBE_RATIO < n)
+        n = probe<true>(l, nl, r, n, tmp);
+      else
+        n = op == 'A' ? merge<'A'>(r, n, l, nl, tmp)
+                      : merge<'N'>(r, n, l, nl, tmp);
+    }
+    std::swap(r, tmp);
   }
 
-  void write(std::string &out) const {
-    if (as_bits)
-      write_bits(out, bits);
-    else
-      write_ids(out, ids.size(), [&](size_t i) { return ids[i]; });
+  // `terms` holds each term's id above its operator's first byte, with 'A' for the
+  // first term.
+  void answer(u64 *terms, size_t count, std::string &out) {
+    auto key = [&](u64 term) {
+      return term_size(term >> 8) | (u64)((u8)term == 'N') << 32;
+    };
+    for (size_t i = 0; i < count;) {
+      size_t end = i + 1;
+      while (end < count && (u8)terms[end] != 'O')
+        end++;
+      std::sort(terms + i + (i > 0), terms + end,
+                [&](u64 a, u64 b) { return key(a) < key(b); });
+      i = end;
+    }
+    start(terms[0] >> 8);
+    for (size_t i = 1; i < count; i++)
+      apply((u8)terms[i], terms[i] >> 8);
+    u32 first[10];
+    u64 total = n, sum = 0;
+    if (dense) {
+      count_bits(bits, index.words, total, sum);
+      u32 m = 0;
+      for (size_t w = 0; w < index.words && m < 10; w++)
+        for (u64 rest = bits[w]; rest && m < 10; rest &= rest - 1)
+          first[m++] = w * 64 + __builtin_ctzll(rest);
+    } else {
+      for (size_t i = 0; i < n; i++)
+        sum += r[i];
+      std::copy_n(r, std::min<size_t>(n, 10), first);
+    }
+    write_line(out, total, sum, first);
   }
 };
 
@@ -830,7 +917,7 @@ int main() {
       last--;
     docs = parse_id(last) + 1;
   }
-  size_t words = docs / 64 + 1;
+  size_t words = (docs / 64 | 3) + 1;
   Plan plan;
   {
     vector<u16> seen = sample_counts(input, table, docs);
@@ -864,31 +951,41 @@ int main() {
     matched[i] += matched[i - 1];
 
   vector<std::string> outputs(chunks);
-  on_all_threads(chunks, [&](size_t c) {
-    std::string &out = outputs[c];
-    out.reserve(bounds[c + 1] - bounds[c]);
-    Evaluator evaluator;
-    size_t phrase = plan.phrase_bases[c];
-    for (const u8 *p = text + bounds[c]; p < text + bounds[c + 1];) {
-      if (*p == 'B') {
-        size_t position = 0;
-        u8 op = 0;
-        p = scan_line(p, [&](const u8 *word, u64 hash) {
-          if (position % 2 == 0)
-            op = *word;
-          else if (position == 1)
-            evaluator.start(index, table.find(hash) & ID_MASK);
-          else
-            evaluator.apply(index, op, table.find(hash) & ID_MASK);
-          position++;
-        });
-        evaluator.write(out);
-      } else {
-        const Hit *found = hits.data() + matched[phrase];
-        write_ids(out, matched[phrase + 1] - matched[phrase],
-                  [&](size_t i) { return found[i].doc; });
-        phrase++;
-        p = (const u8 *)memchr(p, '\n', text + length - p) + 1;
+  atomic<size_t> next_answer{0};
+  on_threads([&] {
+    Evaluator evaluator(index, docs);
+    u64 terms[64];
+    for (size_t c; (c = next_answer.fetch_add(1, relaxed)) < chunks;) {
+      std::string &out = outputs[c];
+      out.reserve(bounds[c + 1] - bounds[c]);
+      size_t phrase = plan.phrase_bases[c];
+      for (const u8 *p = text + bounds[c]; p < text + bounds[c + 1];) {
+        if (*p == 'B') {
+          size_t position = 0, count = 0;
+          u8 op = 'A';
+          p = scan_line(p, [&](const u8 *word, u64 hash) {
+            if (position % 2 == 0) {
+              if (position)
+                op = *word;
+            } else {
+              terms[count++] = (table.find(hash) & ID_MASK) << 8 | op;
+            }
+            position++;
+          });
+          evaluator.answer(terms, count, out);
+        } else {
+          const Hit *found = hits.data() + matched[phrase];
+          u32 total = matched[phrase + 1] - matched[phrase], first[10];
+          u64 sum = 0;
+          for (u32 i = 0; i < total; i++) {
+            sum += found[i].doc;
+            if (i < 10)
+              first[i] = found[i].doc;
+          }
+          write_line(out, total, sum, first);
+          phrase++;
+          p = (const u8 *)memchr(p, '\n', text + length - p) + 1;
+        }
       }
     }
   });
