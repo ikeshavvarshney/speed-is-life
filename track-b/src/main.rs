@@ -268,13 +268,12 @@ impl Table {
                 let slots = self.slots.as_ptr().add(at);
                 let group = _mm256_loadu_si256(slots.cast());
                 let equal = _mm256_cmpeq_epi64(_mm256_and_si256(group, tag_mask), tags);
-                let hits = _mm256_movemask_pd(_mm256_castsi256_pd(equal));
-                if hits != 0 {
-                    return *slots.add(hits.trailing_zeros() as usize);
-                }
+                let hits = _mm256_movemask_pd(_mm256_castsi256_pd(equal)) as u32;
                 let empty = _mm256_cmpeq_epi64(group, _mm256_setzero_si256());
-                if _mm256_movemask_pd(_mm256_castsi256_pd(empty)) != 0 {
-                    return ID_MASK;
+                if hits | _mm256_movemask_pd(_mm256_castsi256_pd(empty)) as u32 != 0 {
+                    // Tokens missing from the table are unpredictable, so no branch decides this.
+                    let found = ((hits != 0) as u64).wrapping_neg();
+                    return *slots.add((hits | 16).trailing_zeros() as usize) & found | ID_MASK & !found;
                 }
                 at += 4;
             }
@@ -492,6 +491,46 @@ fn plan_index(parsed: ParsedText, seen: &[u32], sample: usize) -> Plan {
     Plan { table, phrases, queries, high, low }
 }
 
+// A growable log written through raw pointers, so a write costs one store and one compare.
+struct Bucket {
+    log: Vec<u16>,
+    head: *mut u16,
+    end: *mut u16,
+}
+
+impl Bucket {
+    fn new(capacity: usize) -> Self {
+        let mut log = Vec::with_capacity(capacity);
+        let head = log.as_mut_ptr();
+        Self { log, head, end: head.wrapping_add(capacity) }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, entry: u16) {
+        unsafe {
+            *self.head = entry;
+            self.head = self.head.add(1);
+        }
+        if self.head == self.end {
+            self.grow();
+        }
+    }
+
+    #[cold]
+    fn grow(&mut self) {
+        let len = self.finish();
+        self.log.reserve(len);
+        self.head = unsafe { self.log.as_mut_ptr().add(len) };
+        self.end = unsafe { self.log.as_mut_ptr().add(self.log.capacity()) };
+    }
+
+    fn finish(&mut self) -> usize {
+        let len = unsafe { self.head.offset_from(self.log.as_ptr()) } as usize;
+        unsafe { self.log.set_len(len) };
+        len
+    }
+}
+
 struct Worker {
     buckets: Vec<Vec<u16>>,
     hits: Vec<(u32, u32)>,
@@ -502,18 +541,21 @@ fn parse_docs(input: &'static [u8], plan: &Plan, bits: &mut [u64], words: usize,
     let bits_ptr = Shared(bits.as_mut_ptr());
     let (high, low) = (plan.high as u64, plan.low as u64);
     let partitions = plan.low / PARTITION_TERMS + 1;
+    let (high_index, sink) = (plan.high, partitions);
     std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|_| {
                 let (next, bits_ptr) = (&next, &bits_ptr);
                 scope.spawn(move || {
-                    let mut buckets: Vec<Vec<u16>> = (0..partitions).map(|_| Vec::with_capacity(BUCKET_START)).collect();
+                    // One extra bucket takes the writes of tokens that need no list. It is never
+                    // read and costs only one page, as its head is reset often.
+                    let mut buckets: Vec<Bucket> = (0..=partitions).map(|_| Bucket::new(BUCKET_START)).collect();
                     let mut hits = Vec::new();
                     // Common terms set one bit per token, so 64 documents are gathered locally.
-                    let mut columns = vec![0u64; plan.high];
+                    let mut columns = vec![0u64; plan.high + 1];
                     let mut group = NO_GROUP;
                     let flush = |columns: &mut [u64], group: u32| {
-                        for (row, column) in columns.iter_mut().enumerate() {
+                        for (row, column) in columns[..high_index].iter_mut().enumerate() {
                             if *column != 0 {
                                 unsafe {
                                     let word = bits_ptr.0.add(row * words + group as usize);
@@ -530,6 +572,11 @@ fn parse_docs(input: &'static [u8], plan: &Plan, bits: &mut [u64], words: usize,
                             if group != NO_GROUP {
                                 flush(&mut columns, group);
                             }
+                            buckets.iter_mut().for_each(|bucket| {
+                                bucket.finish();
+                            });
+                            buckets.pop();
+                            let buckets = buckets.into_iter().map(|bucket| bucket.log).collect();
                             return Worker { buckets, hits };
                         }
                         let mut i = if off == 0 {
@@ -546,8 +593,10 @@ fn parse_docs(input: &'static [u8], plan: &Plan, bits: &mut [u64], words: usize,
                                 }
                                 group = doc >> GROUP_BITS;
                                 buckets.iter_mut().for_each(|bucket| bucket.push(MARKER | group as u16));
+                                buckets[sink].head = buckets[sink].log.as_mut_ptr();
                             }
                             let position = doc & (GROUP_DOCS - 1);
+                            let bit = 1u64 << position;
                             let prepare = |hash| plan.table.prefetch(hash);
                             let end = scan_document(text, prepare, |start, len, hash| unsafe {
                                 let slot = plan.table.find(hash);
@@ -555,13 +604,13 @@ fn parse_docs(input: &'static [u8], plan: &Plan, bits: &mut [u64], words: usize,
                                 if slot & ANCHOR_FLAG != 0 {
                                     plan.phrases.check(id as usize, start, len, doc, &mut hits);
                                 }
-                                if id < high {
-                                    *columns.get_unchecked_mut(id as usize) |= 1u64 << position;
-                                } else if id - high < low {
-                                    let term = (id - high) as usize;
-                                    let entry = ((term & (PARTITION_TERMS - 1)) as u16) << GROUP_BITS | position as u16;
-                                    buckets.get_unchecked_mut(term >> PARTITION_BITS).push(entry);
-                                }
+                                // A token's kind is unpredictable, so every token does both writes,
+                                // and tokens of the other kinds land in a slot nothing reads.
+                                *columns.get_unchecked_mut(id.min(high) as usize) |= bit;
+                                let term = id.wrapping_sub(high);
+                                let target = if term < low { (term >> PARTITION_BITS) as usize } else { sink };
+                                let entry = ((term as usize & (PARTITION_TERMS - 1)) as u16) << GROUP_BITS | position as u16;
+                                buckets.get_unchecked_mut(target).push(entry);
                             });
                             i = unsafe { end.offset_from(base) } as usize;
                         }
