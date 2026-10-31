@@ -51,10 +51,12 @@ const u32 LINE_DOCS = 512, LINE_WORDS = 8;
 
 // A logged hit is 16 bits: a term within its partition, and a document within
 // its group of 64. A worker writes a marker naming the group when it starts one.
+// Workers claim whole pages of a partition's region, so all hits of a partition
+// lie together, with no copying as a log grows.
 const int GROUP_BITS = 6, PARTITION_BITS = 9;
 const u32 GROUP_DOCS = 1 << GROUP_BITS, NO_GROUP = UINT32_MAX;
-const size_t PARTITION_TERMS = 1 << PARTITION_BITS, BUCKET_START = 1 << 15;
-const u16 MARKER = 1 << 15;
+const size_t PARTITION_TERMS = 1 << PARTITION_BITS, LOG_PAGE = 1 << 12;
+const u16 MARKER = 1 << 15, LOG_END = UINT16_MAX;
 
 // Document ids in lists are stored as 16 bits within a block of 65,536 documents.
 const int BLOCK_BITS = 16, GROUPS_PER_BLOCK_BITS = BLOCK_BITS - GROUP_BITS;
@@ -68,11 +70,6 @@ struct Hit {
   u32 phrase, doc;
   auto operator<=>(const Hit &) const = default;
 };
-struct Log {
-  u16 *data;
-  size_t len;
-};
-
 static int threads;
 alignas(64) static u8 low_bytes[64];
 
@@ -88,6 +85,12 @@ static const u8 *map_input(const char *path, size_t &size) {
   if (size)
     mmap(base, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
   return (const u8 *)base;
+}
+
+// Address space only: pages cost memory once touched, and never need growing.
+static u8 *reserve(size_t bytes) {
+  return (u8 *)mmap(0, bytes, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
 }
 
 INLINE u64 mum(u64 a, u64 b) {
@@ -190,26 +193,22 @@ struct alignas(64) Counter {
 // Terms as they are found in the queries, by all threads at once.
 struct Draft {
   atomic<u64> *hashes;
-  atomic<u32> *counts;
   size_t mask, len;
 
   explicit Draft(size_t query_bytes) {
     size_t size = std::max<size_t>(std::bit_ceil(query_bytes / 16 + 16), 1 << 10);
     len = size + TABLE_PADDING;
     hashes = (atomic<u64> *)calloc(len, 8);
-    counts = (atomic<u32> *)calloc(len, 4);
     mask = size - 1;
   }
 
-  u32 intern(u64 hash, u32 kind) {
+  u32 intern(u64 hash) {
     for (size_t at = hash & mask;; at++) {
       u64 value = hashes[at].load(relaxed);
       if (value == hash ||
           (!value && (hashes[at].compare_exchange_strong(value, hash, relaxed) ||
-                      value == hash))) {
-        counts[at].fetch_add(kind, relaxed);
+                      value == hash)))
         return at;
-      }
     }
   }
 };
@@ -289,7 +288,7 @@ struct Phrases {
 };
 
 struct ChunkPhrases {
-  vector<u32> lengths, slots;
+  vector<u32> lengths, slots, bool_slots;
   vector<u64> hashes;
 };
 
@@ -316,9 +315,9 @@ static ChunkPhrases read_chunk(const u8 *text, size_t from, size_t to,
     p = scan_line(p, [&](const u8 *, u64 hash) {
       if (is_bool) {
         if (index % 2)
-          table.intern(hash, IN_BOOL);
+          chunk.bool_slots.push_back(table.intern(hash));
       } else if (index) {
-        chunk.slots.push_back(table.intern(hash, 1));
+        chunk.slots.push_back(table.intern(hash));
         chunk.hashes.push_back(hash);
       }
       index++;
@@ -341,30 +340,34 @@ struct Plan {
 static Plan plan_index(const Draft &draft, const vector<ChunkPhrases> &chunks,
                        Table &table) {
   Plan plan;
-  auto seen = [&](size_t at) {
-    u32 count = draft.counts[at].load(relaxed);
-    return (count & 0xFFFF) + (count >> 16);
-  };
-  auto in_bool = [&](size_t at) {
-    return draft.counts[at].load(relaxed) >= IN_BOOL;
-  };
-  for (size_t at = 0; at < draft.len; at++)
-    if (in_bool(at))
-      (seen(at) > HIGH_COUNT ? plan.high : plan.low)++;
-  vector<u32> ids(draft.len, ID_MASK);
-  size_t next_high = 0, next_low = plan.high;
-  for (size_t at = 0; at < draft.len; at++)
-    if (in_bool(at))
-      ids[at] = seen(at) > HIGH_COUNT ? next_high++ : next_low++;
-  size_t next_other = next_low;
-
-  Phrases &phrases = plan.phrases;
+  vector<u16> phrase_seen(draft.len), bool_seen(draft.len);
   size_t phrase_count = 0, term_count = 0;
   for (auto &chunk : chunks) {
+    for (u32 at : chunk.slots)
+      phrase_seen[at]++;
+    for (u32 at : chunk.bool_slots)
+      bool_seen[at]++;
     plan.phrase_bases.push_back(phrase_count);
     phrase_count += chunk.lengths.size();
     term_count += chunk.hashes.size();
   }
+  auto seen = [&](size_t at) { return (u32)phrase_seen[at] + bool_seen[at]; };
+  vector<u32> ids(draft.len, ID_MASK), hot, cold;
+  for (size_t at = 0; at < draft.len; at++)
+    if (bool_seen[at]) {
+      bool is_high = seen(at) > HIGH_COUNT;
+      (is_high ? plan.high : plan.low)++;
+      ids[at] = is_high;
+    }
+  size_t next_high = 0, next_low = plan.high;
+  for (size_t at = 0; at < draft.len; at++)
+    if (bool_seen[at]) {
+      ids[at] = ids[at] ? next_high++ : next_low++;
+      (seen(at) >= HOT_COUNT ? hot : cold).push_back(at);
+    }
+  size_t next_other = next_low;
+
+  Phrases &phrases = plan.phrases;
   phrases.starts.reserve(phrase_count + 1);
   phrases.terms.reserve(term_count);
   phrases.starts.push_back(0);
@@ -383,8 +386,10 @@ static Plan plan_index(const Draft &draft, const vector<ChunkPhrases> &chunks,
           std::min_element(list, list + length,
                            [&](u32 a, u32 b) { return seen(a) < seen(b); }) -
           list;
-      if (ids[list[at]] == ID_MASK)
+      if (ids[list[at]] == ID_MASK) {
         ids[list[at]] = next_other++;
+        cold.push_back(list[at]);
+      }
       is_anchor[list[at]] = true;
       anchors.push_back({ids[list[at]], (u32)at});
       size_t one = at + 1 < length ? at : at - 1;
@@ -406,18 +411,11 @@ static Plan plan_index(const Draft &draft, const vector<ChunkPhrases> &chunks,
 
   table.slots = (u64 *)calloc(draft.len, 8);
   table.mask = draft.mask;
-  for (int hot = 1; hot >= 0; hot--)
-    for (size_t at = 0; at < draft.len; at++)
-      if (ids[at] != ID_MASK && (seen(at) >= HOT_COUNT) == hot)
-        table.insert(draft.hashes[at].load(relaxed),
-                     ids[at] | (is_anchor[at] ? ANCHOR_FLAG : 0));
+  for (auto *terms : {&hot, &cold})
+    for (u32 at : *terms)
+      table.insert(draft.hashes[at].load(relaxed),
+                   ids[at] | (is_anchor[at] ? ANCHOR_FLAG : 0));
   return plan;
-}
-
-// Address space only: pages cost memory once touched, and never need growing.
-static u8 *reserve(size_t bytes) {
-  return (u8 *)mmap(0, bytes, PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
 }
 
 alignas(64) static u64 lane_orders[256];
@@ -438,45 +436,29 @@ static void fill_lane_orders() {
   }
 }
 
-// A growable log written through raw pointers, so a write costs one store and one
-// compare.
-struct Bucket {
-  u16 *log, *head, *end;
-
-  explicit Bucket(size_t capacity) {
-    head = log = (u16 *)malloc(capacity * 2);
-    end = log + capacity;
-  }
-
-  INLINE void push(u16 entry) {
-    *head++ = entry;
-    if (head == end)
-      grow();
-  }
-
-  [[gnu::cold]] void grow() {
-    size_t len = head - log;
-    log = (u16 *)realloc(log, len * 4);
-    head = log + len;
-    end = log + len * 2;
-  }
-};
-
 struct Worker {
-  vector<Log> buckets;
   vector<Hit> hits;
 };
 
 static const u8 *input;
 static size_t input_size;
 
+static u8 *log_regions;
+static size_t log_span;
+static Counter *next_log_page;
+
+static u16 *claim_log_page(size_t partition, u32 group) {
+  auto page = (u16 *)(log_regions + partition * log_span +
+                      next_log_page[partition].take() * LOG_PAGE);
+  *page = MARKER | group;
+  return page + 1;
+}
+
 static void parse_docs(const Table &table, const Plan &plan, u64 *bits,
                        size_t words, Worker &out, Counter &next) {
   const u32 high = plan.high, low = plan.low;
   const size_t partitions = plan.low / PARTITION_TERMS + 1;
-  vector<Bucket> buckets(partitions, Bucket(0));
-  for (auto &bucket : buckets)
-    bucket = Bucket(BUCKET_START);
+  vector<u16 *> heads(partitions, nullptr);
   vector<Hit> &hits = out.hits;
   // One document can hold at most half its bytes as tokens, so these never need
   // to grow. Only the pages used take memory.
@@ -516,10 +498,20 @@ static void parse_docs(const Table &table, const Plan &plan, u64 *bits,
       u32 doc = parse_id(p);
       if (p - 1 >= stop && doc % LINE_DOCS == 0)
         break;
+      auto push = [&](size_t partition, u16 entry) {
+        u16 *head = heads[partition];
+        *head++ = entry;
+        if (!((size_t)head & (LOG_PAGE - 1)))
+          head = claim_log_page(partition, group);
+        heads[partition] = head;
+      };
       if (doc >> GROUP_BITS != group) {
         group = doc >> GROUP_BITS;
-        for (auto &bucket : buckets)
-          bucket.push(MARKER | group);
+        for (size_t partition = 0; partition < partitions; partition++)
+          if (heads[partition])
+            push(partition, MARKER | group);
+          else
+            heads[partition] = claim_log_page(partition, group);
       }
       u32 position = doc & (GROUP_DOCS - 1);
       u64 bit = 1ull << position;
@@ -571,8 +563,8 @@ static void parse_docs(const Table &table, const Plan &plan, u64 *bits,
         line[high_ids[i] * LINE_WORDS] |= bit;
       for (size_t i = 0; i < lows; i++) {
         u32 term = low_ids[i] - high;
-        buckets[term >> PARTITION_BITS].push(
-            (term & (PARTITION_TERMS - 1)) << GROUP_BITS | position);
+        push(term >> PARTITION_BITS,
+             (term & (PARTITION_TERMS - 1)) << GROUP_BITS | position);
       }
       p = end;
       if (doc % LINE_DOCS == LINE_DOCS - 1)
@@ -581,13 +573,13 @@ static void parse_docs(const Table &table, const Plan &plan, u64 *bits,
         flush(doc);
     }
   }
-  for (auto &bucket : buckets)
-    out.buckets.push_back({bucket.log, (size_t)(bucket.head - bucket.log)});
+  for (u16 *head : heads)
+    if (head)
+      *head = LOG_END;
 }
 
 struct Lists {
-  u16 *ids;
-  u32 *marks;
+  const u32 *marks;
   size_t blocks;
 
   size_t size(size_t term) const {
@@ -597,6 +589,7 @@ struct Lists {
 
   size_t decode(size_t term, u32 *out) const {
     const u32 *m = marks + term * (blocks + 1);
+    auto ids = (const u16 *)(log_regions + (term >> PARTITION_BITS) * log_span);
     size_t n = 0;
     for (size_t block = 0; block < blocks; block++) {
       u32 top = (u32)block << BLOCK_BITS;
@@ -607,61 +600,47 @@ struct Lists {
   }
 };
 
-struct Segment {
-  u32 group, bucket, start, end;
-};
+// One thread turns each partition's log into its lists. Runs of hits are visited
+// by group, so every list comes out sorted without sorting. The lists are written
+// to a private image, then copied over the log they came from, so log and lists
+// never both take memory.
+struct ListBuilder {
+  u32 *marks;
+  size_t terms, blocks, groups;
+  vector<u32> runs, order, group_starts;
+  u16 *image;
 
-// One thread builds each partition of terms inside its cache, and frees its logs
-// as it goes. Runs of hits are visited by group, so every list comes out sorted
-// without sorting.
-static Lists prepare_lists(const vector<Worker> &workers, size_t terms,
-                           size_t docs, vector<size_t> &bases) {
-  const size_t partitions = terms / PARTITION_TERMS + 1;
-  bases.resize(partitions + 1);
-  for (size_t p = 0; p < partitions; p++) {
-    bases[p + 1] = bases[p];
-    for (auto &worker : workers)
-      bases[p + 1] += worker.buckets[p].len;
+  ListBuilder(u32 *marks, size_t terms, size_t blocks, size_t groups)
+      : marks(marks), terms(terms), blocks(blocks), groups(groups) {
+    image = (u16 *)reserve(log_span);
   }
-  const size_t blocks = (docs >> BLOCK_BITS) + 1;
-  return {(u16 *)calloc(bases[partitions] + 1, 2),
-          (u32 *)calloc((terms + 1) * (blocks + 1), 4), blocks};
-}
 
-static void build_partition(const vector<Worker> &workers, size_t terms,
-                            const vector<size_t> &bases, const Lists &lists,
-                            size_t p) {
-  u16 *ids = lists.ids;
-  u32 *marks = lists.marks;
-  const size_t blocks = lists.blocks;
-  {
-    vector<Segment> segments;
+  void build(size_t p) {
+    auto log = (u16 *)(log_regions + p * log_span);
+    size_t pages = next_log_page[p].value.load(relaxed);
     u32 counts[PARTITION_TERMS] = {};
-    for (size_t b = 0; b < workers.size(); b++) {
-      const Log log = workers[b].buckets[p];
-      u32 start = 0, group = 0;
-      bool open = false;
-      auto close = [&](size_t end) {
-        if (open && start != end)
-          segments.push_back({group, (u32)b, start, (u32)end});
-      };
-      for (size_t i = 0; i < log.len; i++) {
-        u16 entry = log.data[i];
-        if (entry & MARKER) {
-          close(i);
-          open = true;
-          group = entry & ~MARKER;
-          start = i + 1;
-        } else {
-          counts[entry >> GROUP_BITS]++;
-        }
+    runs.clear();
+    group_starts.assign(groups + 2, 0);
+    for (size_t i = 0; i < pages * (LOG_PAGE / 2);) {
+      u16 entry = log[i];
+      if (entry < MARKER) {
+        counts[entry >> GROUP_BITS]++;
+      } else if (entry == LOG_END) {
+        i = (i | (LOG_PAGE / 2 - 1)) + 1;
+        continue;
+      } else {
+        runs.push_back(i);
+        group_starts[(entry & ~MARKER) + 2]++;
       }
-      close(log.len);
+      i++;
     }
-    std::sort(segments.begin(), segments.end(),
-              [](auto &a, auto &b) { return a.group < b.group; });
+    for (size_t g = 2; g < groups + 2; g++)
+      group_starts[g] += group_starts[g - 1];
+    order.resize(runs.size());
+    for (u32 run : runs)
+      order[group_starts[(log[run] & ~MARKER) + 1]++] = run;
 
-    u32 cursors[PARTITION_TERMS], sum = bases[p];
+    u32 cursors[PARTITION_TERMS], sum = 0;
     for (size_t term = 0; term < PARTITION_TERMS; term++) {
       cursors[term] = sum;
       sum += counts[term];
@@ -676,31 +655,28 @@ static void build_partition(const vector<Worker> &workers, size_t terms,
     size_t block = 0;
     u32 last[PARTITION_TERMS];
     memset(last, 255, sizeof last);
-    for (const Segment &segment : segments) {
-      size_t segment_block = segment.group >> GROUPS_PER_BLOCK_BITS;
-      while (block < segment_block) {
+    for (u32 run : order) {
+      u32 group = log[run] & ~MARKER;
+      size_t run_block = group >> GROUPS_PER_BLOCK_BITS;
+      while (block < run_block) {
         mark(++block);
         memset(last, 255, sizeof last);
       }
-      u32 group_low = (segment.group & ((1 << GROUPS_PER_BLOCK_BITS) - 1))
-                      << GROUP_BITS;
-      const u16 *log = workers[segment.bucket].buckets[p].data;
-      for (u32 i = segment.start; i < segment.end; i++) {
+      u32 group_low = (group & ((1 << GROUPS_PER_BLOCK_BITS) - 1)) << GROUP_BITS;
+      for (u32 i = run + 1; log[i] < MARKER; i++) {
         size_t term = log[i] >> GROUP_BITS;
         u32 low = group_low | (log[i] & (GROUP_DOCS - 1));
         // A term repeated within a document appears once per token.
-        if (last[term] != low) {
-          last[term] = low;
-          ids[cursors[term]++] = low;
-        }
+        image[cursors[term]] = low;
+        cursors[term] += last[term] != low;
+        last[term] = low;
       }
     }
     while (block < blocks)
       mark(++block);
-    for (auto &worker : workers)
-      free(worker.buckets[p].data);
+    memcpy(log, image, sum * 2);
   }
-}
+};
 
 struct Index {
   size_t high, words;
@@ -953,7 +929,8 @@ struct Evaluator {
 
 static const u8 *text;
 static size_t text_size, docs, words, chunks;
-static vector<size_t> bounds, list_bases;
+static vector<size_t> bounds;
+static u32 *list_marks;
 static vector<ChunkPhrases> phrase_chunks;
 static Plan plan;
 static Draft *draft;
@@ -970,10 +947,17 @@ static void between_steps() noexcept {
   static int step = 0;
   if (step == 0) {
     plan = plan_index(*draft, phrase_chunks, table);
+    free(draft->hashes);
+    phrase_chunks = {};
     bits = (u64 *)reserve(plan.high * words * 8 + 64);
+    size_t partitions = plan.low / PARTITION_TERMS + 1;
+    // Each token takes at least 2 bytes of input and 2 bytes here.
+    log_span = (input_size + (1 << 24)) & ~(LOG_PAGE - 1);
+    log_regions = reserve(partitions * log_span);
+    next_log_page = new Counter[partitions];
+    list_marks = (u32 *)calloc((plan.low + 1) * ((docs >> BLOCK_BITS) + 2), 4);
   } else if (step == 1) {
-    index_all = {plan.high, words, bits,
-                 prepare_lists(workers, plan.low, docs, list_bases)};
+    index_all = {plan.high, words, bits, {list_marks, (docs >> BLOCK_BITS) + 1}};
     // A document can match a phrase more than once, but it counts once. Answers
     // sort each phrase's few documents.
     size_t phrase_count = plan.phrases.starts.size() - 1, total = 0;
@@ -1049,9 +1033,13 @@ static void work(int t) {
     madvise((void *)(input + off), std::min(UNMAP_STEP, input_size - off),
             MADV_DONTNEED);
   sync_all->arrive_and_wait();
-  const size_t partitions = plan.low / PARTITION_TERMS + 1;
-  for (size_t p; (p = next_partition.take()) < partitions;)
-    build_partition(workers, plan.low, list_bases, index_all.lists, p);
+  {
+    const size_t partitions = plan.low / PARTITION_TERMS + 1;
+    ListBuilder builder(list_marks, plan.low, (docs >> BLOCK_BITS) + 1, docs / GROUP_DOCS + 1);
+    for (size_t p; (p = next_partition.take()) < partitions;)
+      builder.build(p);
+    madvise(builder.image, log_span, MADV_DONTNEED);
+  }
   sync_all->arrive_and_wait();
   answer_queries();
   sync_all->arrive_and_wait();
