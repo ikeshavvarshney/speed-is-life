@@ -21,28 +21,27 @@ struct Block {
 
 #[derive(Default)]
 struct Bucket {
-    full: Vec<Box<MaybeUninit<Block>>>,
-    last: usize,
+    blocks: Vec<Box<MaybeUninit<Block>>>,
+    used: usize,
 }
 
 impl Bucket {
-    #[inline]
+    #[inline(always)]
     fn push(&mut self, latency: u32, id: u16) {
-        if self.last == BLOCK || self.full.is_empty() {
-            self.full.push(Box::new_uninit());
-            self.last = 0;
+        if self.used == 0 {
+            self.blocks.push(Box::new_uninit());
         }
         unsafe {
-            let block = self.full.last_mut().unwrap_unchecked().as_mut_ptr();
-            (*block).latency[self.last].write(latency);
-            (*block).id[self.last].write(id);
+            let block = self.blocks.last_mut().unwrap_unchecked().as_mut_ptr();
+            (*block).latency.as_mut_ptr().add(self.used).cast::<u32>().write(latency);
+            (*block).id.as_mut_ptr().add(self.used).cast::<u16>().write(id);
         }
-        self.last += 1;
+        self.used = (self.used + 1) % BLOCK;
     }
 
     fn drain(&self, mut visit: impl FnMut(&[u32], &[u16])) {
-        for (i, block) in self.full.iter().enumerate() {
-            let n = if i + 1 == self.full.len() { self.last } else { BLOCK };
+        for (i, block) in self.blocks.iter().enumerate() {
+            let n = if i + 1 == self.blocks.len() && self.used != 0 { self.used } else { BLOCK };
             unsafe {
                 let block = block.as_ptr();
                 let latency = std::slice::from_raw_parts((*block).latency.as_ptr().cast(), n);
@@ -76,7 +75,8 @@ impl Interner {
             }
             let (h, off, len) = unsafe { *self.entries.get_unchecked(id - 1) };
             if h == hash
-                && unsafe { self.bytes.get_unchecked(off as usize..(off + len) as usize) } == key
+                && len as usize == key.len()
+                && same_bytes(unsafe { self.bytes.as_ptr().add(off as usize) }, key.as_ptr(), key.len())
             {
                 return id as u16 - 1;
             }
@@ -88,6 +88,8 @@ impl Interner {
     fn insert(&mut self, slot: usize, hash: u64, key: &[u8]) -> u16 {
         self.entries.push((hash, self.bytes.len() as u32, key.len() as u32));
         self.bytes.extend_from_slice(key);
+        // same_bytes loads whole vectors, so keep readable bytes after the final key.
+        self.bytes.extend_from_slice(&[0; 32]);
         self.slots[slot] = self.entries.len() as u16;
         assert!(self.entries.len() * 2 <= self.slots.len());
         self.entries.len() as u16 - 1
@@ -99,21 +101,44 @@ impl Interner {
     }
 }
 
+// Endpoints are short, so an inline vector compare beats a call to memcmp. Both sides have at
+// least 32 readable bytes past the key.
+#[inline(always)]
+fn same_bytes(a: *const u8, b: *const u8, len: usize) -> bool {
+    let mut i = 0;
+    unsafe {
+        while i < len {
+            let x = _mm256_loadu_si256(a.add(i).cast());
+            let y = _mm256_loadu_si256(b.add(i).cast());
+            let equal = _mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y)) as u32;
+            let left = len - i;
+            let need = if left >= 32 { u32::MAX } else { (1u32 << left) - 1 };
+            if equal & need != need {
+                return false;
+            }
+            i += 32;
+        }
+    }
+    true
+}
+
 #[inline]
 fn load64(p: *const u8) -> u64 {
     unsafe { p.cast::<u64>().read_unaligned() }
 }
 
-// Mixes length with the first and last eight bytes; templates mostly differ at one of the ends.
+// Mixes the length with three eight-byte samples of the key instead of walking all of it.
 #[inline]
 fn hash(key: &[u8]) -> u64 {
     let len = key.len();
-    let (head, tail) = if len >= 8 {
-        (load64(key.as_ptr()), load64(unsafe { key.as_ptr().add(len - 8) }))
+    let (head, middle, tail) = if len >= 8 {
+        let p = key.as_ptr();
+        unsafe { (load64(p), load64(p.add((len - 8) / 2)), load64(p.add(len - 8))) }
     } else {
-        (load64(key.as_ptr()) & ((1u64 << (len * 8)) - 1), 0)
+        (load64(key.as_ptr()) & ((1u64 << (len * 8)) - 1), 0, 0)
     };
     let mixed = (head ^ (len as u64) << 56).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ middle.rotate_left(23).wrapping_mul(0xD6E8_FEB8_6659_FD93)
         ^ tail.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
     mixed ^ mixed >> 29
 }
