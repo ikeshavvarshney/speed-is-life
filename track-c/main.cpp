@@ -91,8 +91,7 @@ static atomic<u8> seen_codes[26 * 26 * 26];
 static std::mutex codes_lock;
 static std::vector<std::string> codes;
 static atomic<u32> distinct_names[COUNTRIES];
-static Counter next_region, next_chunk, next_segment, next_country, next_unmap,
-    used_names;
+static Counter next_region, next_chunk, next_segment, next_country, next_unmap;
 
 // Claims pieces of regions.csv. by_id holds 1 + the country's index, and 0 for
 // anything unknown. Its last entry stays 0 and stands for every id above the
@@ -196,7 +195,7 @@ INLINE u64 hash_name(const u8 *p, size_t len) {
 // thread that sees a free way has not missed its hash further along, and losing
 // the race for a way only means looking at the winner's hash.
 INLINE size_t intern(u64 hash) {
-  size_t bucket = hash >> (67 - NAME_BITS);
+  size_t bucket = hash >> (67 - NAME_BITS), probes = 0;
   v4 want = _mm256_set1_epi64x(hash);
   auto mask = [](v4 x, v4 y) -> u32 {
     return _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(x, y)));
@@ -211,18 +210,15 @@ INLINE size_t intern(u64 hash) {
     v4 zero = _mm256_setzero_si256();
     u32 free = mask(low, zero) | mask(high, zero) << 4;
     if (!free) {
+      // The generator's pool is a constant: this only guards against hanging.
+      if (++probes >> (NAME_BITS - 3))
+        abort();
       bucket = (bucket + 1) & ((1 << (NAME_BITS - 3)) - 1);
       continue;
     }
     int way = __builtin_ctz(free);
     u64 actual = 0;
-    if (at[way].compare_exchange_strong(actual, hash, relaxed)) {
-      // The generator's pool is a constant: this only guards against hanging.
-      if (used_names.take(1) >= (1 << NAME_BITS) / 8 * 7)
-        abort();
-      return bucket * 8 + way;
-    }
-    if (actual == hash)
+    if (at[way].compare_exchange_strong(actual, hash, relaxed) || actual == hash)
       return bucket * 8 + way;
   }
 }
@@ -265,9 +261,13 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
       u64 found_pairs = quotes & running & (closers << 1 | closed);
       closed = closers >> 63;
       seps &= ~running;
-      for (; found_pairs; found_pairs &= found_pairs - 1) {
-        u64 below = (found_pairs & -found_pairs) - 1;
-        pairs[filled + __builtin_popcountll(seps & below)]++;
+      // A quarter of blocks hold pairs, which a branch would keep mispredicting,
+      // and under 2% hold more than two. So two are counted unconditionally: with
+      // no pair left, the bit is 0 and the add does nothing.
+      for (int i = 0; i < 2 || found_pairs; i++) {
+        u64 bit = found_pairs & -found_pairs;
+        pairs[filled + __builtin_popcountll(seps & (bit - 1))] += bit != 0;
+        found_pairs ^= bit;
       }
       size_t k = filled;
       filled += __builtin_popcountll(seps);
