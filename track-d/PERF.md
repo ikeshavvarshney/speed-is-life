@@ -6,6 +6,7 @@ Every step from the reference to your final version, each with the live-board ru
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 72.69 | 893 | 0 |
 | 1 | Rust rewrite: parallel parse, bucketed graph build, bidirectional Dijkstra with small hash tables. Tried first and rejected locally: forward-only search, depth-first renumbering, identity hash | run-89b55425b612 | 0.342 | 138 | 58.3 |
+| 2 | Redesign: fixed 4-slot adjacency placed during parsing, bucket queue, two-stage prefetch, one label table, shared pool of large tables. Details below | run-dcf64c4d623d | 0.189 | 92 | 66.0 |
 
 Experiments measured locally, not pushed on their own (full seed 1, 4 threads on a laptop):
 
@@ -17,7 +18,7 @@ Experiments measured locally, not pushed on their own (full seed 1, 4 threads on
 
 Unchanged code has scored from 0.332 s to 0.410 s on the board (run-3ef6e7cc130a, run-3e28bed889bd), so single runs on this track need care.
 
-Redesign measured locally until the next board run (full seed 1, laptop, 1 core and 4 threads):
+Redesign, measured locally before step 2 (full seed 1, laptop, 1 core and 4 threads):
 
 | Change | 1 core | 4 threads | Memory, 4 threads | Note |
 |---|---|---|---|---|
