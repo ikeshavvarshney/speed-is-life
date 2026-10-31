@@ -30,3 +30,17 @@ How step 3 was built, measured locally on a laptop (full seed 1, 1 core, then 4 
 Other experiments: prefetch distances 4, 12 and 24 were within noise. The same hot loop in C++ with gcc 16 took 0.76 to 0.81 s against 0.60 to 0.79 s in Rust, with identical checksums, so no language switch.
 
 Wrong guesses worth recording: buffering common-term bit writes gave nothing, and removing per-token phrase bookkeeping gave far less than a simple test had suggested. Removing one layer at a time showed the real cost was a mispredicted branch on a load still missing cache.
+
+## Port to C++
+
+The first port looked level with Rust on the 2-core laptop, but was slower on the 12-thread box. Three build-level fixes followed, the same on all tracks: writable globals moved off shared cache lines, `u64` given a different type from `size_t` so writes to it do not force sizes and masks to be reloaded, and `-mtune=alderlake` to match the box's P-cores. Tuning for the core appeared to be the largest of these, in the one push that changed it across all tracks. `prefetchw` was tried on tracks C and D and removed in the same push as the first two fixes, so its own cost was not isolated.
+
+| Step | Run ID | T (s) | M (MB) | S | K | Points |
+|---|---|---|---|---|---|---|
+| Last Rust best | run-9d8f92934f66 | 0.1568 | 58.4 | 1119 | 26.88 | 71.47 |
+| First port | run-07048df0c209 | 0.1719 | 65.0 | 786 | 26.50 | 71.17 |
+| Globals separated, distinct type | run-233b7b50ca6f | 0.1648 | 61.9 | 786 | 27.34 | 71.84 |
+| Tuned for the core | run-566f7abf2f2c | 0.1542 | 57.2 | 786 | 28.70 | 72.90 |
+| Same code, later run | run-e98d6aa93cac | 0.1576 | 62.6 | 786 | 27.89 | 72.27 |
+
+Queries are now mapped rather than read, and output chunks are written one by one rather than joined first. An earlier hot-loop test above found no C++ gain in time. That still holds: the gain here is the 30% fewer lines.

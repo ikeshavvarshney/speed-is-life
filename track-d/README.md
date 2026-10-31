@@ -4,7 +4,7 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-Rust, standard library only, one thread per available CPU.
+C++20 with gcc 16, standard library only, one thread per available CPU. The first versions were Rust; the same algorithms moved to C++ for 22% fewer scored lines at about the same K.
 
 The graph has four 4-byte slots per node at a computed address, one array per direction. Over 98% of nodes have at most four edges, so finding a node's edges needs no lookup, and they can be prefetched from the node id alone. A slot holds the head above 11 bits of weight, as only 0.07% of weights need more. Edges that do not fit go to a small side list that the node's last slot points to.
 

@@ -38,3 +38,17 @@ Experiments that did not pay on the board:
 | Change | Run ID | T (s) | M (MB) | S | K | Result |
 |---|---|---|---|---|---|---|
 | Inline key compare, simpler bucket push, faster number output, sort for small groups | run-83a72f8bdff1 | 0.0405 | 29.9 | 538 | 30.06 | 6% faster but 82 more scored lines, so K fell from 30.16. Time alone is the wrong measure |
+
+## Port to C++
+
+The first port looked level with Rust on the 2-core laptop, but was slower on the 12-thread box. Three build-level fixes followed, the same on all tracks: writable globals moved off shared cache lines, `u64` given a different type from `size_t` so writes to it do not force sizes and masks to be reloaded, and `-mtune=alderlake` to match the box's P-cores. Tuning for the core appeared to be the largest of these, in the one push that changed it across all tracks. `prefetchw` was tried on tracks C and D and removed in the same push as the first two fixes, so its own cost was not isolated.
+
+| Step | Run ID | T (s) | M (MB) | S | K | Points |
+|---|---|---|---|---|---|---|
+| Last Rust best | run-bac4a108f903 | 0.0176 | 23.1 | 600 | 47.29 | 83.74 |
+| First port | run-98b8e52b93fd | 0.0231 | 23.5 | 474 | 42.57 | 81.46 |
+| Globals separated, distinct type | run-cbf55bf8bb63 | 0.0225 | 23.5 | 475 | 43.08 | 81.72 |
+| Tuned for the core | run-06a97ad2fd18 | 0.0196 | 23.8 | 475 | 46.12 | 83.19 |
+| Same code, later run | run-a2b887667b80 | 0.0193 | 23.0 | 475 | 46.84 | 83.53 |
+
+Rust scored K 45.4 to 47.3 over recent runs, so C++ is level on K rather than ahead. T is about 10% worse than the best Rust run, and 21% fewer lines make up for it. The cause of the remaining time difference was not found.

@@ -37,3 +37,18 @@ Experiments that failed:
 - Pruning nodes the far side has settled: slightly slower.
 - Peeking two or three nodes ahead: no gain over one.
 - A plain vector per bucket: 14% slower on 4 threads.
+
+## Port to C++
+
+The first port looked level with Rust on the 2-core laptop, but was slower on the 12-thread box. Three build-level fixes followed, the same on all tracks: writable globals moved off shared cache lines, `u64` given a different type from `size_t` so writes to it do not force sizes and masks to be reloaded, and `-mtune=alderlake` to match the box's P-cores. Tuning for the core appeared to be the largest of these, in the one push that changed it across all tracks. `prefetchw` was tried on tracks C and D and removed in the same push as the first two fixes, so its own cost was not isolated.
+
+| Step | Run ID | T (s) | M (MB) | S | K | Points |
+|---|---|---|---|---|---|---|
+| Last Rust best | run-68fc0ccbbb86 | 0.1827 | 92.6 | 584 | 21.22 | 66.34 |
+| First port, with prefetchw | run-c35aabfc65fd | 0.2342 | 104.6 | 455 | 18.99 | 63.93 |
+| Globals separated, distinct type, no prefetchw | run-f5af21ff8c7b | 0.2000 | 104.6 | 455 | 20.55 | 65.64 |
+| Tuned for the core | run-70420ed269bc | 0.1967 | 102.7 | 462 | 20.75 | 65.85 |
+| Label tables mapped directly | run-a5d65991e14d | 0.1996 | 101.9 | 463 | 20.63 | 65.72 |
+| Regrow copy sized exactly | run-950a97e36a10 | 0.1971 | 97.2 | 456 | 21.00 | 66.11 |
+
+Rust scored K 20.6 to 21.2 over recent runs, so C++ is level on K. Two memory guesses failed. Freeing edge lists while merging did nothing, as there are only about 59,000 loose edges, 0.7 MB. Mapping label tables directly did nothing either. Measuring the cgroup peak after each phase then showed the peak falls during search, where a temporary copy made while a label table grows was held twice by doubling. Sizing it exactly cut the peak from 102 to 97 MB. Both failed changes were reverted.

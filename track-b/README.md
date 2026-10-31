@@ -4,7 +4,7 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-Rust, standard library only, one thread per available CPU.
+C++20 with gcc 16, standard library only, one thread per available CPU. The first versions were Rust; the same algorithms moved to C++ for 30% fewer scored lines and a better K.
 
 Queries are read first, on all threads, and only the terms they use are indexed, which the spec allows. Terms go into one table of 8-byte slots holding part of the term's hash, its id and an anchor flag, about 1 MB in all. The hash stands in for the bytes: with about 600,000 distinct tokens and 76,000 terms, the chance of any collision is about 1 in 10 million.
 

@@ -4,7 +4,7 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-Rust, standard library only, statically linked, one thread per available CPU. Threads are started once and do both parsing and output.
+C++20 with gcc 16, standard library only, statically linked, one thread per available CPU. Threads are started once and do both parsing and output. The first versions were Rust; the same algorithms moved to C++ for 21% fewer scored lines at about the same K.
 
 **Parsing.** The input is mapped with `mmap` and workers claim 256 KB ranges from an atomic counter. A line belongs to the range its first byte falls in, so no line is parsed twice or skipped. Nearly every line has the hour of the one before it, so the hour is only worked out when eight bytes of the timestamp change. Two AVX2 loads give a mask of the spaces in the next 64 bytes, which finds the method and the endpoint with no branch on their length. The latency is decoded with SWAR, so there is no branch per digit either.
 

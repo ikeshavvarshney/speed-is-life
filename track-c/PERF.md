@@ -26,3 +26,18 @@ Every step from the reference to the final version, each with the live-board run
 - Step 3 was tested too early. Its 39 MB is probably threads racing to fault the same huge page, each charged 2 MB until the race resolves. Step 4's fix removed it, but the cause was not measured directly.
 - The cost of bitset writes was never isolated on the box. Step 14 shows only that the logs did not beat them.
 - By a hand count of micro-ops, parsing should now take less time than the board shows, so part of the remaining time is unexplained.
+
+## Trim and build flags
+
+The first port looked level with Rust on the 2-core laptop, but was slower on the 12-thread box. Three build-level fixes followed, the same on all tracks: writable globals moved off shared cache lines, `u64` given a different type from `size_t` so writes to it do not force sizes and masks to be reloaded, and `-mtune=alderlake` to match the box's P-cores. Tuning for the core appeared to be the largest of these, in the one push that changed it across all tracks. `prefetchw` was tried on tracks C and D and removed in the same push as the first two fixes, so its own cost was not isolated.
+
+| Step | Run ID | T (s) | M (MB) | S | K | Points |
+|---|---|---|---|---|---|---|
+| Before | run-bdcf951e9670 | 0.0243 | 9.6 | 394 | 41.59 | 80.95 |
+| With prefetchw, mask table in writable memory | run-f3c50fedccfc | 0.0263 | 10.5 | 390 | 39.35 | 79.74 |
+| Table on its own lines, no prefetchw | run-cfa65c3d21bb | 0.0248 | 9.9 | 390 | 41.03 | 80.65 |
+| Tuned for the core | run-cdbde97725e8 | 0.0246 | 9.9 | 390 | 41.21 | 80.75 |
+| Same code, later run (best so far) | run-3e3bdb5d3832 | 0.0238 | 9.3 | 390 | 42.33 | 81.33 |
+| Same code, later run | run-b8a1c133b819 | 0.0245 | 10.2 | 390 | 41.02 | 80.65 |
+
+The last rows show run-to-run noise of about 3% in K on unchanged code.
