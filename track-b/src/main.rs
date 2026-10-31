@@ -74,57 +74,68 @@ fn key_of(term: &[u8]) -> Key {
     std::array::from_fn(|i| u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap()))
 }
 
+// Holds everything a token needs in one 16-byte entry, so a lookup is one cache miss. The 64-bit
+// hash stands in for the term's bytes: with about 600,000 distinct tokens and 76,000 terms, the
+// chance that any token collides with a term is about 2 in a billion.
+#[derive(Clone, Copy, Default)]
+struct Slot {
+    tag: u64,
+    id: u32,
+    route: u32,
+}
+
 #[derive(Default)]
 struct Terms {
-    slots: Vec<u64>,
-    keys: Vec<Key>,
+    slots: Vec<Slot>,
+    count: usize,
     mask: usize,
 }
 
 impl Terms {
     fn with_capacity(capacity: usize) -> Self {
         let size = (capacity * 2).next_power_of_two().max(1 << 10);
-        Self { slots: vec![0; size], keys: Vec::with_capacity(capacity), mask: size - 1 }
+        Self { slots: vec![Slot::default(); size], count: 0, mask: size - 1 }
     }
 
     fn intern(&mut self, key: Key) -> u32 {
         let hash = hash_key(&key);
-        let mut slot = hash as usize & self.mask;
+        let tag = hash | 1;
+        let mut at = (hash >> 32) as usize & self.mask;
         loop {
-            let entry = self.slots[slot];
-            if entry == 0 {
-                self.keys.push(key);
-                let id = self.keys.len() as u32 - 1;
-                self.slots[slot] = (hash & 0xFFFF_FFFF_0000_0000) | (id + 1) as u64;
-                return id;
+            let slot = &mut self.slots[at];
+            if slot.tag == 0 {
+                *slot = Slot { tag, id: self.count as u32, route: 0 };
+                self.count += 1;
+                return slot.id;
             }
-            if self.keys[(entry as u32 - 1) as usize] == key {
-                return entry as u32 - 1;
+            if slot.tag == tag {
+                return slot.id;
             }
-            slot = (slot + 1) & self.mask;
+            at = (at + 1) & self.mask;
         }
     }
 
-    // The tag in each slot's high bits rejects most tokens without touching the key array.
+    fn set_routes(&mut self, routes: &[u32]) {
+        for slot in self.slots.iter_mut().filter(|slot| slot.tag != 0) {
+            slot.route = routes[slot.id as usize];
+        }
+    }
+
     #[inline(always)]
-    fn find(&self, key: &Key) -> u32 {
+    fn find(&self, key: &Key) -> Slot {
         let hash = hash_key(key);
-        let tag = hash >> 32;
-        let mut slot = hash as usize & self.mask;
+        let tag = hash | 1;
+        let mut at = (hash >> 32) as usize & self.mask;
         unsafe {
             loop {
-                let entry = *self.slots.get_unchecked(slot);
-                if entry == 0 {
-                    return NO_TERM;
+                let slot = *self.slots.get_unchecked(at);
+                if slot.tag == tag {
+                    return slot;
                 }
-                if entry >> 32 == tag {
-                    let id = (entry as u32) - 1;
-                    let k = self.keys.get_unchecked(id as usize);
-                    if (k[0] ^ key[0]) | (k[1] ^ key[1]) | (k[2] ^ key[2]) | (k[3] ^ key[3]) == 0 {
-                        return id;
-                    }
+                if slot.tag == 0 {
+                    return Slot { tag: 0, id: NO_TERM, route: PHRASE_ONLY };
                 }
-                slot = (slot + 1) & self.mask;
+                at = (at + 1) & self.mask;
             }
         }
     }
@@ -261,9 +272,9 @@ enum Term<'a> {
 }
 
 struct Index {
-    terms: Terms,
     routes: Vec<u32>,
     offsets: Vec<u32>,
+    ends: Vec<u32>,
     ids: Vec<u32>,
     bits: Vec<u64>,
     words: usize,
@@ -276,7 +287,7 @@ impl Index {
             let at = (route & INDEX_MASK) as usize * self.words;
             Term::Bits(&self.bits[at..at + self.words])
         } else {
-            let (a, b) = (self.offsets[id as usize] as usize, self.offsets[id as usize + 1] as usize);
+            let (a, b) = (self.offsets[id as usize] as usize, self.ends[id as usize] as usize);
             Term::Ids(&self.ids[a..b])
         }
     }
@@ -581,13 +592,13 @@ fn parse_queries(text: &[u8], terms: &mut Terms, phrases: &mut Phrases, in_bool:
 fn choose_routes(input: &[u8], terms: &Terms, in_bool: &[bool], doc_count: usize, phrases: &mut Phrases) -> (Vec<u32>, usize) {
     let sample = doc_count / SAMPLE_SHARE;
     let threshold = (sample / HIGH_SHARE).max(1);
-    let mut seen = vec![0u32; terms.keys.len()];
-    let mut last = vec![u32::MAX; terms.keys.len()];
+    let mut seen = vec![0u32; terms.count];
+    let mut last = vec![u32::MAX; terms.count];
     let mut pos = input.as_ptr();
     for _ in 0..sample {
         let (doc, text) = parse_id(pos);
         pos = scan_tokens(text, |key| {
-            let term = terms.find(key);
+            let term = terms.find(key).id;
             if term != NO_TERM && last[term as usize] != doc {
                 last[term as usize] = doc;
                 seen[term as usize] += 1;
@@ -624,7 +635,6 @@ fn doc_count(input: &[u8]) -> usize {
 fn parse_docs(
     input: &'static [u8],
     terms: &Terms,
-    routes: &[u32],
     bits: &mut [u64],
     words: usize,
     high: usize,
@@ -633,14 +643,13 @@ fn parse_docs(
 ) -> (Vec<Vec<Bucket>>, Vec<(u32, u32)>) {
     let next = AtomicUsize::new(0);
     let bits_ptr = Shared(bits.as_mut_ptr());
-    let partition_shift = (usize::BITS - terms.keys.len().max(1).leading_zeros()).saturating_sub(PARTITIONS.trailing_zeros());
+    let partition_shift = (usize::BITS - terms.count.max(1).leading_zeros()).saturating_sub(PARTITIONS.trailing_zeros());
     std::thread::scope(|scope| {
         let workers: Vec<_> = (0..threads)
             .map(|_| {
                 let (next, bits_ptr) = (&next, &bits_ptr);
                 scope.spawn(move || {
                     let mut buckets: Vec<Bucket> = (0..PARTITIONS).map(|_| Bucket::default()).collect();
-                    let mut last = vec![u32::MAX; terms.keys.len()];
                     let mut columns = vec![0u64; high];
                     let mut group = usize::MAX;
                     let mut hits = Vec::new();
@@ -684,14 +693,9 @@ fn parse_docs(
                                 group = doc as usize / 64;
                             }
                             let end = scan_tokens(text, |key| {
-                                let term = terms.find(key);
+                                let Slot { id: term, route, .. } = terms.find(key);
                                 matcher.count += 1;
                                 matcher.ring[matcher.count as usize % RING] = term;
-                                let route = if term == NO_TERM {
-                                    PHRASE_ONLY
-                                } else {
-                                    unsafe { *routes.get_unchecked(term as usize) }
-                                };
                                 if route & ANCHOR_BIT != 0 {
                                     matcher.add_anchor(phrases, term);
                                 }
@@ -705,12 +709,8 @@ fn parse_docs(
                                     let at = (route & INDEX_MASK) as usize;
                                     unsafe { *columns.get_unchecked_mut(at) |= 1u64 << (doc % 64) };
                                 } else {
-                                    let seen = unsafe { last.get_unchecked_mut(term as usize) };
-                                    if *seen != doc {
-                                        *seen = doc;
-                                        let partition = (term >> partition_shift) as usize;
-                                        buckets[partition].push(Hit { term, doc });
-                                    }
+                                    let partition = (term >> partition_shift) as usize;
+                                    unsafe { buckets.get_unchecked_mut(partition) }.push(Hit { term, doc });
                                 }
                             });
                             i = unsafe { end.offset_from(base) } as usize;
@@ -730,7 +730,7 @@ fn parse_docs(
     })
 }
 
-fn build_postings(parsed: Vec<Vec<Bucket>>, term_count: usize, threads: usize) -> (Vec<u32>, Vec<u32>) {
+fn build_postings(parsed: Vec<Vec<Bucket>>, term_count: usize, threads: usize) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
     let mut partitions: Vec<Vec<Bucket>> = (0..PARTITIONS).map(|_| Vec::with_capacity(threads)).collect();
     for buckets in parsed {
         for (p, bucket) in buckets.into_iter().enumerate() {
@@ -744,13 +744,15 @@ fn build_postings(parsed: Vec<Vec<Bucket>>, term_count: usize, threads: usize) -
     }
     let tasks: Vec<Mutex<Vec<Bucket>>> = partitions.into_iter().map(Mutex::new).collect();
     let mut offsets = vec![0u32; term_count + 1];
+    let mut ends = vec![0u32; term_count + 1];
+    let ends_ptr = Shared(ends.as_mut_ptr());
     let mut ids = vec![0u32; bases[PARTITIONS]];
     let offsets_ptr = Shared(offsets.as_mut_ptr());
     let ids_ptr = Shared(ids.as_mut_ptr());
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         for _ in 0..threads {
-            let (next, tasks, bases, offsets_ptr, ids_ptr) = (&next, &tasks, &bases, &offsets_ptr, &ids_ptr);
+            let (next, tasks, bases, offsets_ptr, ids_ptr, ends_ptr) = (&next, &tasks, &bases, &offsets_ptr, &ids_ptr, &ends_ptr);
             scope.spawn(move || {
                 let mut cursors = vec![0u32; 1 << shift];
                 loop {
@@ -790,19 +792,27 @@ fn build_postings(parsed: Vec<Vec<Bucket>>, term_count: usize, threads: usize) -
                             }
                         }
                     }
-                    // Hits arrive in runs per chunk, so each list is nearly sorted already.
-                    for pair in starts.windows(2) {
+                    // Hits arrive in runs per chunk, so each list is nearly sorted already. A term
+                    // repeated in a document appears once per token, and is reduced to one here.
+                    for (term, pair) in (first..).zip(starts.windows(2)) {
                         let list = unsafe {
                             std::slice::from_raw_parts_mut(ids_ptr.0.add(pair[0] as usize), (pair[1] - pair[0]) as usize)
                         };
                         list.sort_unstable();
+                        let mut kept = 0;
+                        for i in 0..list.len() {
+                            if i == 0 || list[i] != list[kept - 1] {
+                                list[kept] = list[i];
+                                kept += 1;
+                            }
+                        }
+                        unsafe { *ends_ptr.0.add(term) = pair[0] + kept as u32 };
                     }
                 }
             });
         }
     });
-    offsets[term_count] = bases[PARTITIONS] as u32;
-    (offsets, ids)
+    (offsets, ends, ids)
 }
 
 fn main() {
@@ -821,10 +831,11 @@ fn main() {
     let count = doc_count(input);
     let words = count / 64 + 1;
     let (routes, high) = choose_routes(input, &terms, &in_bool, count, &mut phrases);
+    terms.set_routes(&routes);
     let mut bits = vec![0u64; high * words];
-    let (parsed, mut hits) = parse_docs(input, &terms, &routes, &mut bits, words, high, &phrases, threads);
-    let (offsets, ids) = build_postings(parsed, terms.keys.len(), threads);
-    let index = Index { terms, routes, offsets, ids, bits, words };
+    let (parsed, mut hits) = parse_docs(input, &terms, &mut bits, words, high, &phrases, threads);
+    let (offsets, ends, ids) = build_postings(parsed, terms.count, threads);
+    let index = Index { routes, offsets, ends, ids, bits, words };
 
     // A document can match a phrase more than once, but it counts once.
     hits.sort_unstable();
