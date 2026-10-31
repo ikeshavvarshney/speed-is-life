@@ -2,14 +2,18 @@ use std::arch::x86_64::*;
 use std::ffi::c_void;
 use std::fs::File;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Barrier, Mutex};
 
-const CHUNK: usize = 1 << 18;
+const CHUNK: usize = 1 << 16;
+// Room around a chunk in its buffer: number loads reach before it, and a record starting in it may
+// end after it. Blocks read ahead of the last record never leave the buffer, and whatever stale
+// bytes they find are not used, because parsing stops at the first record past the chunk.
+const BEFORE: usize = 64;
+const AFTER: usize = 8192;
 const REGION_CHUNK: usize = 1 << 16;
-const UNMAP_STEP: usize = 1 << 23;
 const COUNTRIES: usize = 256;
-const MADV_DONTNEED: i32 = 4;
 const MADV_HUGEPAGE: i32 = 14;
 const MADV_NOHUGEPAGE: i32 = 15;
 const BOM_FIRST: u8 = 0xEF;
@@ -192,7 +196,7 @@ fn parse_id(text: &[u8]) -> (usize, usize) {
 }
 
 struct Job {
-    input: *const u8,
+    records: File,
     size: usize,
     regions: &'static [u8],
     by_id: *mut u8,
@@ -209,8 +213,7 @@ struct Job {
     next_chunk: Counter<AtomicUsize>,
     next_segment: Counter<AtomicU32>,
     next_country: Counter<AtomicUsize>,
-    next_unmap: Counter<AtomicUsize>,
-    used: Counter<AtomicUsize>,
+        used: Counter<AtomicUsize>,
 }
 unsafe impl Sync for Job {}
 
@@ -307,8 +310,7 @@ fn intern(job: &Job, slots: *const AtomicU64, hash: u64) -> usize {
     }
 }
 
-fn parse_chunk(job: &Job, first: usize, stop: usize, groups: &mut [Group]) {
-    let base = job.input;
+fn parse_chunk(job: &Job, base: *const u8, first: usize, stop: usize, groups: &mut [Group]) {
     let (by_id, last_region, slots, log) = (job.by_id as *const u8, job.last_region, job.names, job.log);
     let mut marks = [0u32; MAX_MARKS];
     let mut counts = [0u32; MAX_MARKS];
@@ -318,8 +320,6 @@ fn parse_chunk(job: &Job, first: usize, stop: usize, groups: &mut [Group]) {
     loop {
         unsafe {
             for _ in 0..BLOCKS {
-                // Hardware prefetchers stop at page boundaries; this one crosses them.
-                _mm_prefetch::<_MM_HINT_T0>(base.add(block + 1024).cast());
                 let (quotes, mut seps) = block_masks(base.add(block), &mut inside);
                 let found = seps.count_ones() as usize;
                 let mut k = filled;
@@ -408,45 +408,35 @@ fn parse_chunk(job: &Job, first: usize, stop: usize, groups: &mut [Group]) {
 
 // Past a chunk's start, the next record starts after an LF followed by a digit or BOM. Newlines
 // inside notes are always followed by a lowercase word or a quote (spec section 2.2).
-fn first_record(input: &[u8], off: usize) -> usize {
-    let mut i = off - 1;
-    while i + 1 < input.len() {
-        if input[i] == b'\n' && (input[i + 1].is_ascii_digit() || input[i + 1] == BOM_FIRST) {
-            return i + 1;
-        }
-        i += 1;
-    }
-    input.len()
+fn first_record(bytes: &[u8]) -> usize {
+    let after = bytes.windows(2).position(|w| w[0] == b'\n' && (w[1].is_ascii_digit() || w[1] == BOM_FIRST));
+    after.map_or(bytes.len(), |i| i + 1)
 }
 
 fn worker(job: &Job, index: usize) {
     load_regions(job);
     job.barrier.wait();
-    let input = unsafe { std::slice::from_raw_parts(job.input, job.size) };
     let groups = unsafe { std::slice::from_raw_parts_mut(job.groups.add(index * COUNTRIES), COUNTRIES) };
     groups.fill(EMPTY);
+    // Chunks are copied rather than mapped: nothing to fault in or unmap, and only this buffer's
+    // few cache lines to pull through the caches.
+    let mut buffer = vec![0u8; BEFORE + 1 + CHUNK + AFTER + BLOCKS * 64 * 2];
     loop {
         let off = job.next_chunk.0.fetch_add(CHUNK, Relaxed);
         if off >= job.size {
             break;
         }
-        let first = if off == 0 { input.iter().position(|&b| b == b'\n').unwrap() + 1 } else { first_record(input, off) };
-        let stop = (off + CHUNK).min(job.size);
+        let from = off.saturating_sub(1);
+        let len = (off + CHUNK + AFTER).min(job.size) - from;
+        job.records.read_exact_at(&mut buffer[BEFORE..BEFORE + len], from as u64).unwrap();
+        let text = &buffer[BEFORE..BEFORE + len];
+        let first = BEFORE + if off == 0 { text.iter().position(|&b| b == b'\n').unwrap() + 1 } else { first_record(text) };
+        let stop = BEFORE + (off + CHUNK).min(job.size) - from;
         if first < stop {
-            parse_chunk(job, first, stop, groups);
+            parse_chunk(job, buffer.as_ptr(), first, stop, groups);
         }
     }
     job.barrier.wait();
-
-    // Process exit would otherwise unmap every page of the input on one thread, while the clock
-    // runs. Clearing the page tables in pieces now, on all threads, removes most of that cost.
-    loop {
-        let off = job.next_unmap.0.fetch_add(UNMAP_STEP, Relaxed);
-        if off >= job.size {
-            break;
-        }
-        unsafe { madvise(job.input.add(off) as *mut c_void, UNMAP_STEP.min(job.size - off), MADV_DONTNEED) };
-    }
 
     // Nothing writes the logs now. Each country goes to one worker, whose bitset fits in L1.
     let mut seen = [0u64; 1 << 10];
@@ -491,7 +481,7 @@ fn money(cents: i64) -> String {
 fn main() {
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     let (region_file, region_size) = open_input("/data/regions.csv");
-    let (file, size) = open_input("/data/records.csv");
+    let (records, size) = open_input("/data/records.csv");
     let regions = unsafe { std::slice::from_raw_parts(map_input(&region_file, region_size), region_size) };
     let last_line = regions[..region_size - 1].iter().rposition(|&b| b == b'\n').unwrap() + 1;
     let last_region = parse_id(&regions[last_line..]).0 + 1;
@@ -505,7 +495,7 @@ fn main() {
         unsafe { tables.add(page).write(0) };
     }
     let job = Job {
-        input: map_input(&file, size),
+        records,
         size,
         regions,
         by_id: tables,
@@ -526,7 +516,6 @@ fn main() {
         next_chunk: Counter(AtomicUsize::new(0)),
         next_segment: Counter(AtomicU32::new(1)),
         next_country: Counter(AtomicUsize::new(0)),
-        next_unmap: Counter(AtomicUsize::new(0)),
         used: Counter(AtomicUsize::new(0)),
     };
     std::thread::scope(|scope| {
