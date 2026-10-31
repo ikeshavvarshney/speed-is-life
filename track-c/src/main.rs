@@ -43,19 +43,27 @@ fn load64(p: *const u8) -> u64 {
     unsafe { p.cast::<u64>().read_unaligned() }
 }
 
+// The bytes of up to eight digits ending just before `end`, with leading positions zeroed. Field
+// lengths are known from the structural masks, so nothing branches on the number of digits.
 #[inline(always)]
-fn swar(word: u64) -> u64 {
-    let digits = word & 0x0F0F_0F0F_0F0F_0F0F;
-    let pairs = digits.wrapping_mul(2561) >> 8;
-    let quads = (pairs & 0x00FF_00FF_00FF_00FF).wrapping_mul(6553601) >> 16;
-    (quads & 0x0000_FFFF_0000_FFFF).wrapping_mul(42949672960001) >> 32
+fn digit_word(end: *const u8, len: usize) -> u64 {
+    load64(unsafe { end.sub(8) }) & (u64::MAX << ((8 - len) * 8))
 }
 
-// Decodes up to eight digits that end just before `end`. Field lengths are known from the
-// structural masks, so there is no scan and no branch on the number of digits.
+// Converts three words of eight digits together. Each step merges pairs: digits to 2-digit
+// values, then 4, then 8. Three scalar conversions would queue on the one multiply port.
 #[inline(always)]
-fn digits_before(end: *const u8, len: usize) -> u64 {
-    swar(load64(unsafe { end.sub(8) }) & (u64::MAX << ((8 - len) * 8)))
+unsafe fn decode(a: u64, b: u64, c: u64) -> (u32, u32, u32) {
+    unsafe {
+        let digits = _mm256_and_si256(_mm256_set_epi64x(0, c as i64, b as i64, a as i64), _mm256_set1_epi8(15));
+        let pairs = _mm256_maddubs_epi16(digits, _mm256_set1_epi16(0x010A));
+        let quads = _mm256_madd_epi16(pairs, _mm256_set1_epi32(0x0001_0064));
+        let packed = _mm256_packus_epi32(quads, quads);
+        let eights = _mm256_madd_epi16(packed, _mm256_set1_epi32(0x0001_2710));
+        let low = _mm256_castsi256_si128(eights);
+        let high = _mm256_extracti128_si256::<1>(eights);
+        (_mm_cvtsi128_si32(low) as u32, _mm_extract_epi32::<1>(low) as u32, _mm_cvtsi128_si32(high) as u32)
+    }
 }
 
 #[inline(always)]
@@ -188,7 +196,7 @@ struct Job {
     size: usize,
     regions: &'static [u8],
     by_id: *mut u8,
-    last_region: u64,
+    last_region: u32,
     names: *const AtomicU64,
     log: *mut u16,
     groups: *mut Group,
@@ -263,26 +271,39 @@ fn new_segment(job: &Job, cursor: u32) -> u32 {
 // Lock-free table of 64-bit name hashes, whose slot number is the name's id. Comparing hashes
 // instead of bytes never touches the input again, which is what keeps this fast. With 100,000
 // names a collision has a chance of about 3e-10, and would only make one name count as another.
+// A bucket is one cache line of eight hashes compared at once, so a hit does not branch on where
+// the hash sits. A bucket fills in order, so a thread that sees a free way has not missed its hash
+// further along, and losing the race for a way only means looking at the winner's hash.
 #[inline(always)]
 fn intern(job: &Job, slots: *const AtomicU64, hash: u64) -> usize {
-    let mut slot = (hash >> (64 - NAME_BITS)) as usize;
-    loop {
-        let entry = unsafe { &*slots.add(slot) };
-        let mut seen = entry.load(Relaxed);
-        if seen == 0 {
-            match entry.compare_exchange(0, hash, Relaxed, Relaxed) {
+    let mut bucket = (hash >> (67 - NAME_BITS)) as usize;
+    unsafe {
+        let want = _mm256_set1_epi64x(hash as i64);
+        loop {
+            let at = slots.add(bucket * 8);
+            let (low, high) = (_mm256_load_si256(at.cast()), _mm256_load_si256(at.add(4).cast()));
+            let mask = |x, y| _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(x, y))) as u32;
+            let hit = mask(low, want) | mask(high, want) << 4;
+            if hit != 0 {
+                return bucket * 8 + hit.trailing_zeros() as usize;
+            }
+            let zero = _mm256_setzero_si256();
+            let free = mask(low, zero) | mask(high, zero) << 4;
+            if free == 0 {
+                bucket = (bucket + 1) & ((1 << (NAME_BITS - 3)) - 1);
+                continue;
+            }
+            let way = free.trailing_zeros() as usize;
+            match (*at.add(way)).compare_exchange(0, hash, Relaxed, Relaxed) {
                 Ok(_) => {
                     // The generator's pool is a constant, so this only guards against hanging.
                     assert!(job.used.0.fetch_add(1, Relaxed) < (1 << NAME_BITS) / 8 * 7, "too many names");
-                    return slot;
+                    return bucket * 8 + way;
                 }
-                Err(actual) => seen = actual,
+                Err(actual) if actual == hash => return bucket * 8 + way,
+                Err(_) => {}
             }
         }
-        if seen == hash {
-            return slot;
-        }
-        slot = (slot + 1) & ((1 << NAME_BITS) - 1);
     }
 }
 
@@ -329,22 +350,24 @@ fn parse_chunk(job: &Job, first: usize, stop: usize, groups: &mut [Group]) {
                 let (c1, c2, c3, c4, lf) =
                     (*m as usize, *m.add(1) as usize, *m.add(2) as usize, *m.add(3) as usize, *m.add(4) as usize);
                 let id_at = start + 3 * (*base.add(start) == BOM_FIRST) as usize;
-                let id = digits_before(base.add(c1), c1 - id_at);
                 let name_raw = (c2 - c1 - 1) as u32;
                 let note_raw = (c3 - c2 - 1) as u32;
                 let name_len = value_len(name_raw, *c.add(1) - *c);
                 let note_len = value_len(note_raw, *c.add(2) - *c.add(1));
-                let region = digits_before(base.add(c4), c4 - c3 - 1).min(last_region);
                 let end = lf - (*base.add(lf - 1) == b'\r') as usize;
                 let negative = *base.add(c4 + 1) == b'-';
                 let text = load64(base.add(end - 8)) & (u64::MAX << ((8 - (end - c4 - 1 - negative as usize)) * 8));
-                let cents = swar(text << 24) * 100 + ((text >> 48) & 15) * 10 + ((text >> 56) & 15);
-                let amount = if negative { -(cents as i32) } else { cents as i32 };
+                let (id, region, whole) =
+                    decode(digit_word(base.add(c1), c1 - id_at), digit_word(base.add(c4), c4 - c3 - 1), text << 24);
+                let region = region.min(last_region);
+                let cents = (whole * 100) as u64 + ((text >> 48) & 15) * 10 + ((text >> 56) & 15);
+                let sign = -(negative as i32);
+                let amount = (cents as i32 ^ sign) - sign;
                 let hash = hash_name(base.add(c1 + 2), name_raw.saturating_sub(2) as usize);
                 _mm_prefetch::<_MM_HINT_T0>(by_id.add(region as usize).cast());
-                _mm_prefetch::<_MM_HINT_T0>(slots.add((hash >> (64 - NAME_BITS)) as usize).cast());
+                _mm_prefetch::<_MM_HINT_T0>(slots.add((hash >> (67 - NAME_BITS)) as usize * 8).cast());
                 *recs.get_unchecked_mut(n) =
-                    Rec { id: id as u32, region: region as u32, amount, name_len, note_len, hash };
+                    Rec { id, region, amount, name_len, note_len, hash };
                 n += 1;
                 start = lf + 1;
             }
@@ -474,8 +497,7 @@ fn main() {
     // are touched before the workers start: threads racing to fault one huge page are each charged
     // 2 MB until the race resolves, which shows up in peak memory.
     let names_at = (last_region + 1).next_multiple_of(64);
-    let groups_at = names_at + (8 << NAME_BITS);
-    let tables_size = groups_at + threads * COUNTRIES * size_of::<Group>();
+    let tables_size = names_at + (8 << NAME_BITS);
     let tables = zeroed(tables_size, MADV_HUGEPAGE);
     for page in (0..tables_size).step_by(HUGE) {
         unsafe { tables.add(page).write(0) };
@@ -485,12 +507,13 @@ fn main() {
         size,
         regions,
         by_id: tables,
-        last_region: last_region as u64,
+        last_region: last_region as u32,
         names: unsafe { tables.add(names_at) }.cast(),
         // Worst case: 11-byte records, each with one u16, plus a segment per open log and the links.
         // Written in order and racing at its end, so small pages are best here.
         log: zeroed(size / 4 + threads * COUNTRIES * 4 * SEGMENT, MADV_NOHUGEPAGE).cast(),
-        groups: unsafe { tables.add(groups_at) }.cast(),
+        // Most of a huge page would stay unused here.
+        groups: zeroed(threads * COUNTRIES * size_of::<Group>(), MADV_NOHUGEPAGE).cast(),
         threads,
         seen: (0..26 * 26 * 26).map(|_| AtomicU8::new(0)).collect(),
         codes: Mutex::new(Vec::with_capacity(COUNTRIES)),
