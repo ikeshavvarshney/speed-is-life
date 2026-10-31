@@ -6,8 +6,9 @@ Every step from the reference to your final version, each with the live-board ru
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 32.05 | 228 | 0 |
 | 1 | Rust rewrite: per-hour logs with no atomics, SWAR and AVX2 parsing, selection for percentiles, mmap input | run-f84389cf2c3a | 0.043 | 29 | 74.0 |
+| 2 | Second rewrite: 64-byte space mask, shared tag table, 4-byte log entries, AVX2 selection, branch-free digits, logs given back after use, writing during render, static link, input page tables cleared in parallel. Details below | run-2f0cf497a665 | 0.0179 | 23 | 83.5 |
 
-Rewrite measured locally until the next board run (full seed 1, laptop, 2 cores and 4 threads, best of several alternating runs):
+The second rewrite, measured locally before step 2 (full seed 1, laptop, 2 cores and 4 threads, best of several alternating runs). The board beat the local estimate of 0.022 s, and memory came in above the local 21 MB at 12 threads:
 
 | Change | 1 core | 4 threads | Memory, 4 threads | Note |
 |---|---|---|---|---|
