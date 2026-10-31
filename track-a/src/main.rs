@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 const CHUNK: usize = 1 << 18;
 const HOURS: usize = 72;
 const TS_LEN: usize = 27;
+const SORT_LIMIT: usize = 32;
 const ERR_FLAG: u16 = 1 << 15;
 // Large enough that malloc serves each block with mmap, so freeing returns it to the kernel.
 const BLOCK: usize = 1 << 15;
@@ -265,19 +266,42 @@ fn parse_file(base: *const u8, size: usize, threads: usize) -> Vec<Worker> {
     })
 }
 
-#[inline]
-fn push_int(out: &mut Vec<u8>, mut value: u64) {
-    let mut digits = [0u8; 20];
-    let mut i = digits.len();
-    loop {
-        i -= 1;
-        digits[i] = b'0' + (value % 10) as u8;
-        value /= 10;
-        if value == 0 {
-            break;
-        }
+const PAIRS: [u8; 200] = {
+    let mut table = [0u8; 200];
+    let mut i = 0;
+    while i < 100 {
+        table[i * 2] = b'0' + (i / 10) as u8;
+        table[i * 2 + 1] = b'0' + (i % 10) as u8;
+        i += 1;
     }
-    out.extend_from_slice(&digits[i..]);
+    table
+};
+
+// Writes a space and the value at `out`, two digits per step. The caller reserved the room.
+#[inline(always)]
+unsafe fn write_field(out: *mut u8, mut value: u64) -> *mut u8 {
+    let mut digits = [0u8; 20];
+    let mut i = 20;
+    while value >= 100 {
+        i -= 2;
+        let pair = (value % 100) as usize * 2;
+        value /= 100;
+        digits[i] = PAIRS[pair];
+        digits[i + 1] = PAIRS[pair + 1];
+    }
+    if value >= 10 {
+        i -= 2;
+        digits[i] = PAIRS[value as usize * 2];
+        digits[i + 1] = PAIRS[value as usize * 2 + 1];
+    } else {
+        i -= 1;
+        digits[i] = b'0' + value as u8;
+    }
+    unsafe {
+        *out = b' ';
+        std::ptr::copy_nonoverlapping(digits.as_ptr().add(i), out.add(1), 20 - i);
+        out.add(21 - i)
+    }
 }
 
 fn hour_label(hour: usize) -> [u8; 21] {
@@ -333,8 +357,12 @@ fn render_hour(
         **bucket = Bucket::default();
     }
 
+    // Six numbers of at most ten digits with separators, plus the 21-byte label and a newline.
+    const LINE_EXTRA: usize = 6 * 11 + 21 + 1;
     let label = hour_label(hour);
-    let mut out = Vec::new();
+    let groups = counts.iter().fold((0, 0), |(last, n), &end| (end, n + (end != last) as usize)).1;
+    let mut out = Vec::with_capacity(groups * LINE_EXTRA + name_bytes(endpoints, counts));
+    let mut cursor = out.as_mut_ptr();
     let mut begin = 0;
     for rank in 0..endpoints.len() {
         let end = counts[rank] as usize;
@@ -346,26 +374,45 @@ fn render_hour(
         begin = end;
         let rank_of = |p: usize| (p * n + 99) / 100 - 1;
         let (r50, r95, r99) = (rank_of(50), rank_of(95), rank_of(99));
-        let (left, &mut p99, _) = values.select_nth_unstable(r99);
-        let (left, p95) = if r95 == r99 {
-            (left, p99)
+        // Small groups dominate, and one sort is cheaper for them than three selections.
+        let (p50, p95, p99) = if n <= SORT_LIMIT {
+            values.sort_unstable();
+            (values[r50], values[r95], values[r99])
         } else {
-            let (l, &mut v, _) = left.select_nth_unstable(r95);
-            (l, v)
+            let (left, &mut p99, _) = values.select_nth_unstable(r99);
+            let (left, &mut p95, _) = left.select_nth_unstable(r95);
+            (*left.select_nth_unstable(r50).1, p95, p99)
         };
-        let p50 = if r50 == r95 { p95 } else { *left.select_nth_unstable(r50).1 };
         let errs = errors[rank] as u64;
-        out.extend_from_slice(&label);
-        out.extend_from_slice(endpoints[rank]);
-        for value in [n as u64, p50 as u64, p95 as u64, p99 as u64, errs] {
-            out.push(b' ');
-            push_int(&mut out, value);
+        let name = endpoints[rank];
+        unsafe {
+            std::ptr::copy_nonoverlapping(label.as_ptr(), cursor, label.len());
+            cursor = cursor.add(label.len());
+            std::ptr::copy_nonoverlapping(name.as_ptr(), cursor, name.len());
+            cursor = cursor.add(name.len());
+            for value in [n as u64, p50 as u64, p95 as u64, p99 as u64, errs] {
+                cursor = write_field(cursor, value);
+            }
+            cursor = write_field(cursor, errs * 1_000_000 / n as u64);
+            *cursor = b'\n';
+            cursor = cursor.add(1);
         }
-        out.push(b' ');
-        push_int(&mut out, errs * 1_000_000 / n as u64);
-        out.push(b'\n');
     }
+    unsafe { out.set_len(cursor.offset_from(out.as_ptr()) as usize) };
     out
+}
+
+// Sums the names of endpoints present in this hour; `ends` holds each endpoint's end offset.
+fn name_bytes(endpoints: &[&[u8]], ends: &[u32]) -> usize {
+    let mut last = 0;
+    let mut total = 0;
+    for (name, &end) in endpoints.iter().zip(ends) {
+        if end != last {
+            total += name.len();
+        }
+        last = end;
+    }
+    total
 }
 
 struct HourState {
