@@ -1,20 +1,23 @@
 use std::arch::x86_64::*;
 use std::ffi::c_void;
 use std::fs::File;
+use std::ops::Range;
 use std::os::fd::AsRawFd;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 const CHUNK: usize = 1 << 18;
-const QUERY_BATCH: usize = 64;
+const QUERY_CHUNK: usize = 1 << 14;
 const PREFETCH_AHEAD: usize = 12;
 const SAMPLE_SHARE: usize = 512;
 // A term in more than 1/32 of documents is smaller as a bitset than in the temporary hit log.
 const HIGH_SHARE: usize = 32;
 
-// A table slot holds the high bits of the term's hash, an anchor flag and the term's id.
+// A table slot holds the high bits of the term's hash, an anchor flag and the term's id. While
+// queries are read, the lowest bit instead records that a boolean query uses the term.
 const ID_BITS: u32 = 18;
 const ID_MASK: u64 = (1 << ID_BITS) - 1;
+const IN_BOOL: u64 = 1;
 const ANCHOR_FLAG: u64 = 1 << ID_BITS;
 const TAG_ONE: u64 = ANCHOR_FLAG << 1;
 const TAG_MASK: u64 = !(TAG_ONE - 1);
@@ -33,12 +36,6 @@ const NO_GROUP: u32 = u32::MAX;
 // Document ids in lists are stored as 16 bits within a block of 65,536 documents.
 const BLOCK_BITS: u32 = 16;
 const GROUPS_PER_BLOCK_BITS: u32 = BLOCK_BITS - GROUP_BITS;
-
-const OP_SHIFT: u32 = 30;
-const OP_MASK: u32 = (1 << OP_SHIFT) - 1;
-const AND: u32 = 0;
-const OR: u32 = 1;
-const NOT: u32 = 2;
 
 const HASH_0: u64 = 0x2D35_8DCC_AA6C_78A5;
 const HASH_1: u64 = 0x8BB8_4B93_962E_ACC9;
@@ -86,7 +83,7 @@ fn mum(a: u64, b: u64) -> u64 {
 // Hashes a token where it lies. Token bytes are letters and digits, so OR-ing 0x20 lowercases
 // them, and masking removes whatever follows. Terms are at most 32 bytes, so a longer token
 // hashes to a value no term has. The hash stands in for the bytes: with about 600,000 distinct
-// tokens and 76,000 terms, the chance of any collision is about 1 in 100 million.
+// tokens and 76,000 terms, the chance of any collision is about 1 in 10 million.
 #[inline(always)]
 unsafe fn token_hash(start: *const u8, len: usize) -> u64 {
     unsafe {
@@ -129,16 +126,12 @@ unsafe fn token_mask(bytes: __m256i) -> u32 {
     }
 }
 
+// Calls `visit` with each token of the line at `p`, and returns what follows its newline. One
+// classification covers 64 bytes, and tokens then come straight from bit masks. A window restarts
+// at a token that runs past its end, so tokens never need joining up. Documents and query lines
+// are both read this way.
 #[inline(always)]
-fn is_token_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric()
-}
-
-// Calls `visit` with each token of the document text at `p`, and returns what follows its
-// newline. One classification covers 64 bytes, and tokens then come straight from bit masks. A
-// window restarts at a token that runs past its end, so tokens never need joining up.
-#[inline(always)]
-fn scan_document(mut p: *const u8, mut visit: impl FnMut(*const u8, u64)) -> *const u8 {
+fn scan_line(mut p: *const u8, mut visit: impl FnMut(*const u8, u64)) -> *const u8 {
     unsafe {
         let newline = _mm256_set1_epi8(b'\n' as i8);
         loop {
@@ -161,7 +154,7 @@ fn scan_document(mut p: *const u8, mut visit: impl FnMut(*const u8, u64)) -> *co
             }
             if starts == 1 {
                 p = p.add(64);
-                while is_token_byte(*p) {
+                while (*p).is_ascii_alphanumeric() {
                     p = p.add(1);
                 }
             } else {
@@ -183,57 +176,61 @@ fn parse_id(mut p: *const u8) -> (u32, *const u8) {
     }
 }
 
-// Temporary term numbering, used until sampling has decided how each term will be stored. A term
-// is numbered by its slot, and the slot holds the term's hash.
-struct Vocabulary {
-    slots: Vec<u64>,
-}
-
-impl Vocabulary {
-    fn new(length: usize) -> Self {
-        Self { slots: vec![0; (length / 8 + 16).next_power_of_two().max(1 << 10)] }
-    }
-
-    #[inline(always)]
-    fn find(&self, hash: u64) -> (usize, bool) {
-        let mask = self.slots.len() - 1;
-        let mut at = hash as usize & mask;
-        loop {
-            let slot = unsafe { *self.slots.get_unchecked(at) };
-            if slot == hash || slot == 0 {
-                return (at, slot == hash);
-            }
-            at = (at + 1) & mask;
+// Runs `work` for each chunk on all threads, and returns the results in chunk order.
+fn for_each_chunk<T: Send>(chunks: usize, threads: usize, work: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    let results: Vec<Mutex<Option<T>>> = (0..chunks).map(|_| Mutex::new(None)).collect();
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    let chunk = next.fetch_add(1, Relaxed);
+                    if chunk >= chunks {
+                        return;
+                    }
+                    *results[chunk].lock().unwrap() = Some(work(chunk));
+                }
+            });
         }
-    }
-
-    #[inline(always)]
-    fn intern(&mut self, hash: u64) -> u32 {
-        let (at, _) = self.find(hash);
-        self.slots[at] = hash;
-        at as u32
-    }
+    });
+    results.into_iter().map(|result| result.into_inner().unwrap().unwrap()).collect()
 }
 
-// The hot lookup table, about 1 MB, with everything in one 8-byte slot. The slot is found by the
-// hash's low bits and confirmed by its high bits. Four slots are compared at once.
+// The one lookup table, about 1 MB, with everything in an 8-byte slot. A slot is found by the
+// hash's low bits and confirmed by its high bits. Query reading fills it from all threads.
 struct Table {
-    slots: Vec<u64>,
+    slots: Vec<AtomicU64>,
     mask: usize,
 }
 
 impl Table {
-    fn new(terms: usize) -> Self {
-        let size = (terms * 3 / 2).next_power_of_two().max(1 << 8);
-        Self { slots: vec![0; size + TABLE_PADDING], mask: size - 1 }
+    fn new(query_bytes: usize) -> Self {
+        let size = (query_bytes / 16 + 16).next_power_of_two().max(1 << 10);
+        let mut zeros = std::mem::ManuallyDrop::new(vec![0u64; size + TABLE_PADDING]);
+        let slots = unsafe { Vec::from_raw_parts(zeros.as_mut_ptr().cast(), size + TABLE_PADDING, size + TABLE_PADDING) };
+        Self { slots, mask: size - 1 }
     }
 
-    fn insert(&mut self, hash: u64, id: u64, anchor: bool) {
+    fn intern(&self, hash: u64, flag: u64) -> u32 {
+        let tag = (hash | TAG_ONE) & TAG_MASK;
         let mut at = hash as usize & self.mask;
-        while self.slots[at] != 0 {
+        loop {
+            let slot = &self.slots[at];
+            let mut value = slot.load(Relaxed);
+            if value == 0 {
+                match slot.compare_exchange(0, tag | flag, Relaxed, Relaxed) {
+                    Ok(_) => return at as u32,
+                    Err(actual) => value = actual,
+                }
+            }
+            if value & TAG_MASK == tag {
+                if value & flag != flag {
+                    slot.fetch_or(flag, Relaxed);
+                }
+                return at as u32;
+            }
             at += 1;
         }
-        self.slots[at] = ((hash | TAG_ONE) & TAG_MASK) | if anchor { ANCHOR_FLAG } else { 0 } | id;
     }
 
     #[inline(always)]
@@ -242,6 +239,24 @@ impl Table {
     }
 
     #[inline(always)]
+    fn position(&self, hash: u64) -> Option<usize> {
+        let tag = (hash | TAG_ONE) & TAG_MASK;
+        let mut at = hash as usize & self.mask;
+        loop {
+            let value = self.slots[at].load(Relaxed);
+            if value & TAG_MASK == tag {
+                return Some(at);
+            }
+            if value == 0 {
+                return None;
+            }
+            at += 1;
+        }
+    }
+
+    // Compares four slots at once. Tokens missing from the table are unpredictable, so no branch
+    // decides the result, which is then an id that no list or bitset uses.
+    #[inline(always)]
     fn find(&self, hash: u64) -> u64 {
         let tag = (hash | TAG_ONE) & TAG_MASK;
         let mut at = hash as usize & self.mask;
@@ -249,13 +264,12 @@ impl Table {
             let tags = _mm256_set1_epi64x(tag as i64);
             let tag_mask = _mm256_set1_epi64x(TAG_MASK as i64);
             loop {
-                let slots = self.slots.as_ptr().add(at);
+                let slots = self.slots.as_ptr().add(at).cast::<u64>();
                 let group = _mm256_loadu_si256(slots.cast());
                 let equal = _mm256_cmpeq_epi64(_mm256_and_si256(group, tag_mask), tags);
                 let hits = _mm256_movemask_pd(_mm256_castsi256_pd(equal)) as u32;
                 let empty = _mm256_cmpeq_epi64(group, _mm256_setzero_si256());
                 if hits | _mm256_movemask_pd(_mm256_castsi256_pd(empty)) as u32 != 0 {
-                    // Tokens missing from the table are unpredictable, so no branch decides this.
                     let found = ((hits != 0) as u64).wrapping_neg();
                     return *slots.add((hits | 16).trailing_zeros() as usize) & found | ID_MASK & !found;
                 }
@@ -310,62 +324,53 @@ impl Phrases {
 struct Shared<T>(*mut T);
 unsafe impl<T> Sync for Shared<T> {}
 
-struct Queries {
-    terms: Vec<u32>,
-    ranges: Vec<(u32, u32)>,
+#[derive(Default)]
+struct ChunkPhrases {
+    lengths: Vec<u32>,
+    hashes: Vec<u64>,
+    slots: Vec<u32>,
 }
 
-struct ParsedText {
-    queries: Queries,
-    vocabulary: Vocabulary,
-    in_bool: Vec<bool>,
-    phrase_terms: Vec<u32>,
-    phrase_starts: Vec<u32>,
+fn query_chunks(text: &[u8]) -> Vec<usize> {
+    let mut bounds = vec![0];
+    let mut at = QUERY_CHUNK;
+    while at < text.len() {
+        at += text[at..].iter().position(|&b| b == b'\n').map_or(text.len() - at, |i| i + 1);
+        bounds.push(at);
+        at += QUERY_CHUNK;
+    }
+    if *bounds.last().unwrap() < text.len() {
+        bounds.push(text.len());
+    }
+    bounds
 }
 
-// A boolean query's terms carry the operator before them in their top bits. A phrase query is
-// recorded as a range of length 0 holding the phrase's number. Query lines are tokens too, so
-// the document scanner reads them.
-fn parse_queries(text: &[u8], length: usize) -> ParsedText {
-    let mut vocabulary = Vocabulary::new(length);
-    let mut in_bool = vec![false; vocabulary.slots.len()];
-    let (mut terms, mut ranges) = (Vec::with_capacity(length / 8), Vec::with_capacity(length / 32));
-    let (mut phrase_terms, mut phrase_starts) = (Vec::with_capacity(length / 16), vec![0]);
-    let mut pos = 0;
-    while pos < length {
+// Records every term in the table. Boolean queries need nothing else now, as they are read again
+// from the text when they are answered.
+fn read_chunk(text: &[u8], range: Range<usize>, table: &Table) -> ChunkPhrases {
+    let mut chunk = ChunkPhrases::default();
+    let mut pos = range.start;
+    while pos < range.end {
         let is_bool = text[pos] == b'B';
-        let start = terms.len();
-        let (mut index, mut op) = (0, AND);
-        let end = scan_document(
-            unsafe { text.as_ptr().add(pos) },
-            |word, hash| {
-                if index > 0 {
-                    if !is_bool {
-                        phrase_terms.push(vocabulary.intern(hash));
-                    } else if index % 2 == 0 {
-                        op = match unsafe { *word } {
-                            b'A' => AND,
-                            b'O' => OR,
-                            _ => NOT,
-                        };
-                    } else {
-                        let id = vocabulary.intern(hash);
-                        in_bool[id as usize] = true;
-                        terms.push(id | op << OP_SHIFT);
-                    }
+        let mut index = 0;
+        let before = chunk.hashes.len();
+        let end = scan_line(unsafe { text.as_ptr().add(pos) }, |_, hash| {
+            if is_bool {
+                if index % 2 == 1 {
+                    table.intern(hash, IN_BOOL);
                 }
-                index += 1;
-            },
-        );
-        if is_bool {
-            ranges.push((start as u32, (terms.len() - start) as u32));
-        } else {
-            ranges.push((phrase_starts.len() as u32 - 1, 0));
-            phrase_starts.push(phrase_terms.len() as u32);
+            } else if index > 0 {
+                chunk.slots.push(table.intern(hash, 0));
+                chunk.hashes.push(hash);
+            }
+            index += 1;
+        });
+        if !is_bool {
+            chunk.lengths.push((chunk.hashes.len() - before) as u32);
         }
         pos = unsafe { end.offset_from(text.as_ptr()) } as usize;
     }
-    ParsedText { queries: Queries { terms, ranges }, vocabulary, in_bool, phrase_terms, phrase_starts }
+    chunk
 }
 
 fn doc_count(input: &[u8]) -> usize {
@@ -377,14 +382,15 @@ fn doc_count(input: &[u8]) -> usize {
 }
 
 // Counts tokens rather than documents, which is close enough to decide how to store a term.
-fn sample_counts(input: &[u8], vocabulary: &Vocabulary, docs: usize) -> Vec<u16> {
-    let mut seen = vec![0u16; vocabulary.slots.len()];
+fn sample_counts(input: &[u8], table: &Table, docs: usize) -> Vec<u16> {
+    let mut seen = vec![0u16; table.slots.len()];
     let mut pos = input.as_ptr();
     for _ in 0..docs / SAMPLE_SHARE {
         let (_, text) = parse_id(pos);
-        pos = scan_document(text, |_, hash| {
-            let (at, found) = vocabulary.find(hash);
-            seen[at] = seen[at].saturating_add(found as u16);
+        pos = scan_line(text, |_, hash| {
+            if let Some(at) = table.position(hash) {
+                seen[at] = seen[at].saturating_add(1);
+            }
         });
     }
     seen
@@ -393,80 +399,85 @@ fn sample_counts(input: &[u8], vocabulary: &Vocabulary, docs: usize) -> Vec<u16>
 struct Plan {
     table: Table,
     phrases: Phrases,
-    queries: Queries,
+    phrase_bases: Vec<u32>,
     high: usize,
     low: usize,
 }
 
 // Final ids run through the common terms, then those with lists, then phrase-only terms, so an
 // id alone says how a token is handled.
-fn plan_index(parsed: ParsedText, seen: &[u16], sample: usize) -> Plan {
-    let ParsedText { mut queries, vocabulary, in_bool, phrase_terms, phrase_starts } = parsed;
+fn plan_index(mut table: Table, chunks: Vec<ChunkPhrases>, seen: &[u16], sample: usize) -> Plan {
     let threshold = (sample / HIGH_SHARE).max(1) as u16;
-    let hashes = &vocabulary.slots;
-    let (mut common, mut listed, mut phrase_only) = (Vec::new(), Vec::new(), Vec::new());
-    for (term, &hash) in hashes.iter().enumerate() {
-        if hash != 0 {
-            let group = if !in_bool[term] {
-                &mut phrase_only
-            } else if seen[term] > threshold {
-                &mut common
-            } else {
-                &mut listed
-            };
-            group.push(term as u32);
+    let slots = unsafe { &mut *(table.slots.as_mut_slice() as *mut [AtomicU64] as *mut [u64]) };
+    let (mut high, mut low, mut terms) = (0, 0, 0);
+    for (at, &value) in slots.iter().enumerate() {
+        if value != 0 {
+            terms += 1;
+            if value & IN_BOOL != 0 {
+                if seen[at] > threshold { high += 1 } else { low += 1 }
+            }
         }
     }
-    let (high, low) = (common.len(), listed.len());
-    let terms = high + low + phrase_only.len();
-    let mut final_id = vec![0u32; hashes.len()];
-    for (id, &term) in common.iter().chain(&listed).chain(&phrase_only).enumerate() {
-        final_id[term as usize] = id as u32;
+    let (mut next_high, mut next_low, mut next_other) = (0, high, high + low);
+    for (at, value) in slots.iter_mut().enumerate() {
+        if *value != 0 {
+            let next = if *value & IN_BOOL == 0 {
+                &mut next_other
+            } else if seen[at] > threshold {
+                &mut next_high
+            } else {
+                &mut next_low
+            };
+            *value = (*value & TAG_MASK) | *next as u64;
+            *next += 1;
+        }
     }
 
-    let mut is_anchor = vec![false; hashes.len()];
-    let mut phrases = Phrases {
-        terms: phrase_terms.iter().map(|&term| hashes[term as usize]).collect(),
-        anchor_starts: vec![0; terms + 2],
-        anchored: vec![(0, 0); phrase_starts.len() - 1],
-        pairs: vec![0; 1 << (PAIR_BITS - 6)],
-        starts: phrase_starts,
-    };
-    let anchor_of: Vec<u32> = phrases
-        .starts
-        .windows(2)
-        .map(|range| {
-            let list = &phrase_terms[range[0] as usize..range[1] as usize];
-            let at = (0..list.len()).min_by_key(|&i| seen[list[i] as usize]).unwrap();
-            is_anchor[list[at] as usize] = true;
-            phrases.anchor_starts[final_id[list[at] as usize] as usize + 2] += 1;
-            let (first, second) = if at + 1 < list.len() { (at, at + 1) } else { (at - 1, at) };
-            let bit = pair_bit(hashes[list[first] as usize], hashes[list[second] as usize]);
-            phrases.pairs[bit / 64] |= 1 << (bit % 64);
-            at as u32
+    let phrase_bases: Vec<u32> = chunks
+        .iter()
+        .scan(0, |base, chunk| {
+            let this = *base;
+            *base += chunk.lengths.len() as u32;
+            Some(this)
         })
         .collect();
+    let phrase_count: usize = chunks.iter().map(|chunk| chunk.lengths.len()).sum();
+    let mut phrases = Phrases {
+        starts: Vec::with_capacity(phrase_count + 1),
+        terms: Vec::with_capacity(chunks.iter().map(|chunk| chunk.hashes.len()).sum()),
+        anchor_starts: vec![0; terms + 2],
+        anchored: vec![(0, 0); phrase_count],
+        pairs: vec![0; 1 << (PAIR_BITS - 6)],
+    };
+    phrases.starts.push(0);
+    let mut anchors: Vec<(u32, u32)> = Vec::with_capacity(phrase_count);
+    for chunk in &chunks {
+        let mut first = 0;
+        for &length in &chunk.lengths {
+            let (list, hashes) = (&chunk.slots[first..first + length as usize], &chunk.hashes[first..first + length as usize]);
+            first += length as usize;
+            let at = (0..list.len()).min_by_key(|&i| seen[list[i] as usize]).unwrap();
+            let slot = &mut slots[list[at] as usize];
+            *slot |= ANCHOR_FLAG;
+            let id = *slot & ID_MASK;
+            phrases.anchor_starts[id as usize + 2] += 1;
+            anchors.push((id as u32, at as u32));
+            let (one, two) = if at + 1 < list.len() { (at, at + 1) } else { (at - 1, at) };
+            let bit = pair_bit(hashes[one], hashes[two]);
+            phrases.pairs[bit / 64] |= 1 << (bit % 64);
+            phrases.terms.extend_from_slice(hashes);
+            phrases.starts.push(phrases.terms.len() as u32);
+        }
+    }
     for i in 2..terms + 2 {
         phrases.anchor_starts[i] += phrases.anchor_starts[i - 1];
     }
-    for (phrase, range) in phrases.starts.windows(2).enumerate() {
-        let at = anchor_of[phrase];
-        let id = final_id[phrase_terms[range[0] as usize + at as usize] as usize] as usize;
-        let place = phrases.anchor_starts[id + 1];
-        phrases.anchored[place as usize] = (phrase as u32, at);
-        phrases.anchor_starts[id + 1] += 1;
+    for (phrase, &(id, at)) in anchors.iter().enumerate() {
+        let place = &mut phrases.anchor_starts[id as usize + 1];
+        phrases.anchored[*place as usize] = (phrase as u32, at);
+        *place += 1;
     }
-
-    let mut table = Table::new(terms);
-    for (term, &hash) in hashes.iter().enumerate() {
-        if hash != 0 {
-            table.insert(hash, final_id[term] as u64, is_anchor[term]);
-        }
-    }
-    for packed in &mut queries.terms {
-        *packed = final_id[(*packed & OP_MASK) as usize] | (*packed & !OP_MASK);
-    }
-    Plan { table, phrases, queries, high, low }
+    Plan { table, phrases, phrase_bases, high, low }
 }
 
 // A growable log written through raw pointers, so a write costs one store and one compare.
@@ -580,7 +591,7 @@ fn parse_docs(input: &'static [u8], plan: &Plan, bits: &mut [u64], words: usize,
                             // prefetched far enough ahead for memory to arrive in time.
                             tokens.clear();
                             tokens.push(0);
-                            let end = scan_document(text, |_, hash| tokens.push(hash));
+                            let end = scan_line(text, |_, hash| tokens.push(hash));
                             let count = tokens.len() - 1;
                             tokens.resize(count + 2 + PREFETCH_AHEAD, 0);
                             for at_token in 1..=count {
@@ -757,7 +768,8 @@ struct Index {
 }
 
 #[derive(Default)]
-struct Scratch {
+struct Evaluator {
+    as_bits: bool,
     ids: Vec<u32>,
     term: Vec<u32>,
     merged: Vec<u32>,
@@ -829,69 +841,104 @@ fn difference(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
     }
 }
 
-fn evaluate(index: &Index, terms: &[u32], s: &mut Scratch, out: &mut Vec<u8>) {
-    let mut as_bits = false;
-    for (i, &packed) in terms.iter().enumerate() {
-        let (op, id) = (packed >> OP_SHIFT, (packed & OP_MASK) as usize);
-        if i > 0 && !as_bits && s.ids.is_empty() && op != OR {
-            continue;
+impl Evaluator {
+    fn start(&mut self, index: &Index, id: usize) {
+        self.as_bits = id < index.high;
+        if self.as_bits {
+            self.bits.clear();
+            self.bits.extend_from_slice(&index.bits[id * index.words..(id + 1) * index.words]);
+        } else {
+            index.lists.decode(id - index.high, &mut self.ids);
+        }
+    }
+
+    // Applies one operator, strictly left to right. `op` is the first byte of its word.
+    fn apply(&mut self, index: &Index, op: u8, id: usize) {
+        if !self.as_bits && self.ids.is_empty() && op != b'O' {
+            return;
         }
         if id < index.high {
             let term = &index.bits[id * index.words..(id + 1) * index.words];
-            if i == 0 {
-                s.bits.clear();
-                s.bits.extend_from_slice(term);
-                as_bits = true;
-            } else if as_bits {
+            if self.as_bits {
                 match op {
-                    AND => s.bits.iter_mut().zip(term).for_each(|(x, y)| *x &= y),
-                    OR => s.bits.iter_mut().zip(term).for_each(|(x, y)| *x |= y),
-                    _ => s.bits.iter_mut().zip(term).for_each(|(x, y)| *x &= !y),
+                    b'A' => self.bits.iter_mut().zip(term).for_each(|(x, y)| *x &= y),
+                    b'O' => self.bits.iter_mut().zip(term).for_each(|(x, y)| *x |= y),
+                    _ => self.bits.iter_mut().zip(term).for_each(|(x, y)| *x &= !y),
                 }
             } else {
                 match op {
-                    AND => s.ids.retain(|&doc| has_bit(term, doc)),
-                    OR => {
-                        s.bits.clear();
-                        s.bits.extend_from_slice(term);
-                        s.ids.iter().for_each(|&doc| set_bit(&mut s.bits, doc));
-                        as_bits = true;
+                    b'A' => self.ids.retain(|&doc| has_bit(term, doc)),
+                    b'O' => {
+                        self.bits.clear();
+                        self.bits.extend_from_slice(term);
+                        self.ids.iter().for_each(|&doc| set_bit(&mut self.bits, doc));
+                        self.as_bits = true;
                     }
-                    _ => s.ids.retain(|&doc| !has_bit(term, doc)),
+                    _ => self.ids.retain(|&doc| !has_bit(term, doc)),
                 }
             }
         } else {
-            let list = id - index.high;
-            if i == 0 {
-                index.lists.decode(list, &mut s.ids);
-                continue;
-            }
-            index.lists.decode(list, &mut s.term);
-            if as_bits {
+            index.lists.decode(id - index.high, &mut self.term);
+            if self.as_bits {
                 match op {
-                    AND => {
-                        s.ids.clear();
-                        s.ids.extend(s.term.iter().filter(|&&doc| has_bit(&s.bits, doc)));
-                        as_bits = false;
+                    b'A' => {
+                        self.ids.clear();
+                        self.ids.extend(self.term.iter().filter(|&&doc| has_bit(&self.bits, doc)));
+                        self.as_bits = false;
                     }
-                    OR => s.term.iter().for_each(|&doc| set_bit(&mut s.bits, doc)),
-                    _ => s.term.iter().for_each(|&doc| clear_bit(&mut s.bits, doc)),
+                    b'O' => self.term.iter().for_each(|&doc| set_bit(&mut self.bits, doc)),
+                    _ => self.term.iter().for_each(|&doc| clear_bit(&mut self.bits, doc)),
                 }
             } else {
                 match op {
-                    AND => intersect(&s.ids, &s.term, &mut s.merged),
-                    OR => union(&s.ids, &s.term, &mut s.merged),
-                    _ => difference(&s.ids, &s.term, &mut s.merged),
+                    b'A' => intersect(&self.ids, &self.term, &mut self.merged),
+                    b'O' => union(&self.ids, &self.term, &mut self.merged),
+                    _ => difference(&self.ids, &self.term, &mut self.merged),
                 }
-                std::mem::swap(&mut s.ids, &mut s.merged);
+                std::mem::swap(&mut self.ids, &mut self.merged);
             }
         }
     }
-    if as_bits {
-        write_bits(out, &s.bits);
-    } else {
-        write_ids(out, s.ids.iter().copied());
+
+    fn write(&self, out: &mut Vec<u8>) {
+        if self.as_bits {
+            write_bits(out, &self.bits);
+        } else {
+            write_ids(out, self.ids.iter().copied());
+        }
     }
+}
+
+fn answer_chunk(text: &[u8], range: Range<usize>, mut phrase: usize, index: &Index, plan: &Plan, hits: &[(u32, u32)], matched: &[u32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(range.len());
+    let mut evaluator = Evaluator::default();
+    let mut pos = range.start;
+    while pos < range.end {
+        if text[pos] == b'B' {
+            let (mut position, mut op) = (0, 0);
+            let end = scan_line(unsafe { text.as_ptr().add(pos) }, |word, hash| {
+                if position % 2 == 0 {
+                    op = unsafe { *word };
+                } else {
+                    let id = (plan.table.find(hash) & ID_MASK) as usize;
+                    if position == 1 {
+                        evaluator.start(index, id);
+                    } else {
+                        evaluator.apply(index, op, id);
+                    }
+                }
+                position += 1;
+            });
+            evaluator.write(&mut out);
+            pos = unsafe { end.offset_from(text.as_ptr()) } as usize;
+        } else {
+            let found = matched[phrase] as usize..matched[phrase + 1] as usize;
+            write_ids(&mut out, hits[found].iter().map(|hit| hit.1));
+            phrase += 1;
+            pos += text[pos..].iter().position(|&b| b == b'\n').unwrap() + 1;
+        }
+    }
+    out
 }
 
 fn write_ids(out: &mut Vec<u8>, ids: impl ExactSizeIterator<Item = u32> + Clone) {
@@ -963,17 +1010,19 @@ fn main() {
     let threads = std::thread::available_parallelism().map_or(1, |c| c.get());
     let mut text = std::fs::read("/data/queries.txt").unwrap();
     let length = text.len();
+    let bounds = query_chunks(&text);
     text.resize(length + 64, 0);
-    let parsed = parse_queries(&text, length);
-    drop(text);
+    let chunks = bounds.len() - 1;
+    let table = Table::new(length);
+    let phrase_chunks = for_each_chunk(chunks, threads, |c| read_chunk(&text, bounds[c]..bounds[c + 1], &table));
 
     let file = File::open("/data/docs.txt").unwrap();
     let size = file.metadata().unwrap().len() as usize;
     let input = map_input(&file, size);
     let docs = doc_count(input);
     let words = docs / 64 + 1;
-    let seen = sample_counts(input, &parsed.vocabulary, docs);
-    let plan = plan_index(parsed, &seen, docs / SAMPLE_SHARE);
+    let seen = sample_counts(input, &table, docs);
+    let plan = plan_index(table, phrase_chunks, &seen, docs / SAMPLE_SHARE);
     drop(seen);
 
     let mut bits = vec![0u64; plan.high * words];
@@ -999,39 +1048,9 @@ fn main() {
         matched[i] += matched[i - 1];
     }
 
-    let queries = &plan.queries;
-    let batches = queries.ranges.len() / QUERY_BATCH + 1;
-    let outputs: Vec<Mutex<Vec<u8>>> = (0..batches).map(|_| Mutex::new(Vec::new())).collect();
-    let next = AtomicUsize::new(0);
-    std::thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| {
-                let mut scratch = Scratch::default();
-                loop {
-                    let batch = next.fetch_add(1, Relaxed);
-                    if batch >= batches {
-                        return;
-                    }
-                    let mut out = Vec::with_capacity(QUERY_BATCH * 32);
-                    let first = batch * QUERY_BATCH;
-                    for &(start, len) in &queries.ranges[first..(first + QUERY_BATCH).min(queries.ranges.len())] {
-                        if len == 0 {
-                            let range = matched[start as usize] as usize..matched[start as usize + 1] as usize;
-                            write_ids(&mut out, hits[range].iter().map(|hit| hit.1));
-                        } else {
-                            let terms = &queries.terms[start as usize..(start + len) as usize];
-                            evaluate(&index, terms, &mut scratch, &mut out);
-                        }
-                    }
-                    *outputs[batch].lock().unwrap() = out;
-                }
-            });
-        }
+    let outputs = for_each_chunk(chunks, threads, |c| {
+        answer_chunk(&text, bounds[c]..bounds[c + 1], plan.phrase_bases[c] as usize, &index, &plan, &hits, &matched)
     });
-    let mut all = Vec::new();
-    for output in &outputs {
-        all.extend_from_slice(&output.lock().unwrap());
-    }
-    std::fs::write("/out/results.txt", all).unwrap();
+    std::fs::write("/out/results.txt", outputs.concat()).unwrap();
     unsafe { exit(0) };
 }
