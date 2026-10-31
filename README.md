@@ -1,6 +1,19 @@
-# Speed Demon 2026 starter
+# Speed Demon 2026: team another ello
 
-A working entry for all four tracks of [Speed Demon 2026](https://speeddemon.dev). Each `track-*` folder holds the organisers' naive Python reference, packaged the way the live board builds and runs it. Use it to check your setup end to end, then replace the reference with your own code.
+Our entry for [Speed Demon 2026](https://speeddemon.dev), all four tracks in Rust with zero dependencies. Each `track-*` folder has a `README.md` describing the approach and a `PERF.md` logging each optimisation step with its board run ID.
+
+| Folder | Task | Key ideas |
+|---|---|---|
+| `track-a` | Aggregate log lines per hour and endpoint | Fixed-offset timestamp parsing, per-hour logs with no atomics, percentiles by selection |
+| `track-b` | Boolean and phrase search | Index only query terms, live phrase matching on rare anchor terms, bitsets for common terms |
+| `track-c` | Join a hostile CSV | Parse in place, shared name table with per-country bitsets, prefetch pipeline |
+| `track-d` | Shortest paths | Parallel bucketed graph build, bidirectional Dijkstra with small hash tables |
+
+`tools/` holds what we used while building, none of it scored: `bench_<track>.sh` checks a track against the reference on several datasets, and `board_log.py` records each push's board results.
+
+The rest of this file is the organisers' starter guide.
+
+---
 
 ## Start in five steps
 
