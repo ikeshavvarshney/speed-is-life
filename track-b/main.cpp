@@ -43,7 +43,7 @@ const u64 ID_MASK = (1 << ID_BITS) - 1, ANCHOR_FLAG = 1 << ID_BITS;
 const u64 DISPLACED = ANCHOR_FLAG << 1, FOUND_MASK = ID_MASK | ANCHOR_FLAG;
 const u64 TAG_MASK = ~0ull << TAG_SHIFT;
 const size_t TABLE_PADDING = 1 << 10;
-const u32 IN_BOOL = 1 << 16;
+const u32 OP_AND = 0, OP_OR = 1, OP_NOT = 2, OP_BITS = 2;
 
 // Common terms gather one cache line per term, 512 documents, before it is written
 // to the shared bitset. Each thread owns whole blocks of 512 documents.
@@ -51,11 +51,12 @@ const u32 LINE_DOCS = 512, LINE_WORDS = 8;
 
 // A logged hit is 16 bits: a term within its partition, and a document within
 // its group of 64. A worker writes a marker naming the group when it starts one.
-// Workers claim whole pages of a partition's region, so all hits of a partition
-// lie together, with no copying as a log grows.
+// Workers claim small blocks of a partition's region, so all hits of a partition
+// lie together with no copying as a log grows, and few pages stay partly used.
 const int GROUP_BITS = 6, PARTITION_BITS = 9;
 const u32 GROUP_DOCS = 1 << GROUP_BITS, NO_GROUP = UINT32_MAX;
-const size_t PARTITION_TERMS = 1 << PARTITION_BITS, LOG_PAGE = 1 << 12;
+const size_t PARTITION_TERMS = 1 << PARTITION_BITS, LOG_BLOCK = 1 << 9;
+const size_t PAGE = 1 << 12;
 const u16 MARKER = 1 << 15, LOG_END = UINT16_MAX;
 
 // Document ids in lists are stored as 16 bits within a block of 65,536 documents.
@@ -287,8 +288,12 @@ struct Phrases {
   }
 };
 
+// One chunk of the query file. Each line's size says how many boolean terms it has,
+// with 0 for a phrase, and each boolean term holds its operator in the low bits.
 struct ChunkPhrases {
-  vector<u32> lengths, slots, bool_slots;
+  vector<u8> sizes;
+  vector<u32> terms;
+  vector<u32> lengths, slots;
   vector<u64> hashes;
 };
 
@@ -304,24 +309,26 @@ static vector<size_t> query_chunks(const u8 *text, size_t size) {
   return bounds;
 }
 
-// Records every term in the table. Boolean queries need nothing else now, as they
-// are read again from the text when they are answered.
 static ChunkPhrases read_chunk(const u8 *text, size_t from, size_t to,
                                Draft &table) {
   ChunkPhrases chunk;
   for (const u8 *p = text + from; p < text + to;) {
     bool is_bool = *p == 'B';
     size_t index = 0, before = chunk.hashes.size();
-    p = scan_line(p, [&](const u8 *, u64 hash) {
+    u32 op = OP_AND;
+    p = scan_line(p, [&](const u8 *word, u64 hash) {
       if (is_bool) {
         if (index % 2)
-          chunk.bool_slots.push_back(table.intern(hash));
+          chunk.terms.push_back(table.intern(hash) << OP_BITS | op);
+        else if (index)
+          op = *word == 'A' ? OP_AND : *word == 'O' ? OP_OR : OP_NOT;
       } else if (index) {
         chunk.slots.push_back(table.intern(hash));
         chunk.hashes.push_back(hash);
       }
       index++;
     });
+    chunk.sizes.push_back(is_bool ? index / 2 : 0);
     if (!is_bool)
       chunk.lengths.push_back(chunk.hashes.size() - before);
   }
@@ -337,7 +344,7 @@ struct Plan {
 // Final ids run through the common terms, then those with lists, then anchors used
 // only in phrases, so an id alone says how a token is handled. Other terms used
 // only in phrases need no table entry, as phrases compare hashes.
-static Plan plan_index(const Draft &draft, const vector<ChunkPhrases> &chunks,
+static Plan plan_index(const Draft &draft, vector<ChunkPhrases> &chunks,
                        Table &table) {
   Plan plan;
   vector<u16> phrase_seen(draft.len), bool_seen(draft.len);
@@ -345,8 +352,8 @@ static Plan plan_index(const Draft &draft, const vector<ChunkPhrases> &chunks,
   for (auto &chunk : chunks) {
     for (u32 at : chunk.slots)
       phrase_seen[at]++;
-    for (u32 at : chunk.bool_slots)
-      bool_seen[at]++;
+    for (u32 term : chunk.terms)
+      bool_seen[term >> OP_BITS]++;
     plan.phrase_bases.push_back(phrase_count);
     phrase_count += chunk.lengths.size();
     term_count += chunk.hashes.size();
@@ -409,6 +416,13 @@ static Plan plan_index(const Draft &draft, const vector<ChunkPhrases> &chunks,
     phrases.anchored[phrases.anchor_starts[id + 1]++] = {(u32)phrase, at};
   }
 
+  for (auto &chunk : chunks) {
+    for (u32 &term : chunk.terms)
+      term = ids[term >> OP_BITS] << OP_BITS | (term & ((1 << OP_BITS) - 1));
+    chunk.slots = {};
+    chunk.lengths = {};
+    chunk.hashes = {};
+  }
   table.slots = (u64 *)calloc(draft.len, 8);
   table.mask = draft.mask;
   for (auto *terms : {&hot, &cold})
@@ -450,13 +464,13 @@ static size_t input_size;
 
 static u8 *log_regions;
 static size_t log_span;
-static Counter *next_log_page;
+static Counter *next_log_block;
 
-static u16 *claim_log_page(size_t partition, u32 group) {
-  auto page = (u16 *)(log_regions + partition * log_span +
-                      next_log_page[partition].take() * LOG_PAGE);
-  *page = MARKER | group;
-  return page + 1;
+static u16 *claim_log_block(size_t partition, u32 group) {
+  auto block = (u16 *)(log_regions + partition * log_span +
+                       next_log_block[partition].take() * LOG_BLOCK);
+  *block = MARKER | group;
+  return block + 1;
 }
 
 static void parse_docs(const Table &table, const Plan &plan, u64 *bits,
@@ -472,11 +486,20 @@ static void parse_docs(const Table &table, const Plan &plan, u64 *bits,
   u32 group = NO_GROUP;
   auto flush = [&](u32 doc) {
     size_t at = doc / 64 / LINE_WORDS * LINE_WORDS;
-    for (size_t row = 0; row < plan.high; row++)
-      for (size_t i = 0; i < LINE_WORDS; i++) {
-        bits[row * words + at + i] = lines[row * LINE_WORDS + i];
-        lines[row * LINE_WORDS + i] = 0;
+    const v4 zero = _mm256_setzero_si256();
+    for (size_t row = 0; row < plan.high; row++) {
+      u64 *from = lines + row * LINE_WORDS, *to = bits + row * words + at;
+      v4 a = _mm256_load_si256((const v4 *)from);
+      v4 b = _mm256_load_si256((const v4 *)(from + 4));
+      v4 any = _mm256_or_si256(a, b);
+      // Terms that barely occur keep their pages untouched.
+      if (!_mm256_testz_si256(any, any)) {
+        _mm256_storeu_si256((v4 *)to, a);
+        _mm256_storeu_si256((v4 *)(to + 4), b);
+        _mm256_store_si256((v4 *)from, zero);
+        _mm256_store_si256((v4 *)(from + 4), zero);
       }
+    }
   };
   const u8 *file_end = input + input_size;
   for (;;) {
@@ -501,8 +524,8 @@ static void parse_docs(const Table &table, const Plan &plan, u64 *bits,
       auto push = [&](size_t partition, u16 entry) {
         u16 *head = heads[partition];
         *head++ = entry;
-        if (!((size_t)head & (LOG_PAGE - 1)))
-          head = claim_log_page(partition, group);
+        if (!((size_t)head & (LOG_BLOCK - 1)))
+          head = claim_log_block(partition, group);
         heads[partition] = head;
       };
       if (doc >> GROUP_BITS != group) {
@@ -511,7 +534,7 @@ static void parse_docs(const Table &table, const Plan &plan, u64 *bits,
           if (heads[partition])
             push(partition, MARKER | group);
           else
-            heads[partition] = claim_log_page(partition, group);
+            heads[partition] = claim_log_block(partition, group);
       }
       u32 position = doc & (GROUP_DOCS - 1);
       u64 bit = 1ull << position;
@@ -613,16 +636,16 @@ struct ListBuilder {
 
   void build(size_t p) {
     auto log = (u16 *)(log_regions + p * log_span);
-    size_t pages = next_log_page[p].value.load(relaxed);
+    size_t used = next_log_block[p].value.load(relaxed) * LOG_BLOCK;
     u32 counts[PARTITION_TERMS] = {};
     runs.clear();
     group_starts.assign(groups + 2, 0);
-    for (size_t i = 0; i < pages * (LOG_PAGE / 2);) {
+    for (size_t i = 0; i < used / 2;) {
       u16 entry = log[i];
       if (entry < MARKER) {
         counts[entry >> GROUP_BITS]++;
       } else if (entry == LOG_END) {
-        i = (i | (LOG_PAGE / 2 - 1)) + 1;
+        i = (i | (LOG_BLOCK / 2 - 1)) + 1;
         continue;
       } else {
         runs.push_back(i);
@@ -671,8 +694,9 @@ struct ListBuilder {
     while (block < blocks)
       mark(++block);
     memcpy(log, image, sum * 2);
-    size_t kept = (sum * 2 + LOG_PAGE - 1) & -LOG_PAGE;
-    madvise((u8 *)log + kept, pages * LOG_PAGE - kept, MADV_DONTNEED);
+    size_t kept = (sum * 2 + PAGE - 1) & -PAGE;
+    if (used > kept)
+      madvise((u8 *)log + kept, used - kept, MADV_DONTNEED);
   }
 };
 
@@ -823,9 +847,8 @@ struct Evaluator {
     n = kept;
   }
 
-  // Applies one operator. `op` is its word's first byte.
-  void apply(u8 op, u32 id) {
-    if (!dense && !n && op != 'O')
+  void apply(u32 op, u32 id) {
+    if (!dense && !n && op != OP_OR)
       return;
     if (id < index.high) {
       const u64 *row = index.bits + id * index.words;
@@ -834,20 +857,20 @@ struct Evaluator {
           v4 x = _mm256_loadu_si256((const v4 *)(bits + i));
           v4 y = _mm256_loadu_si256((const v4 *)(row + i));
           _mm256_storeu_si256((v4 *)(bits + i),
-                              op == 'A'   ? _mm256_and_si256(x, y)
-                              : op == 'O' ? _mm256_or_si256(x, y)
-                                          : _mm256_andnot_si256(y, x));
+                              op == OP_AND  ? _mm256_and_si256(x, y)
+                              : op == OP_OR ? _mm256_or_si256(x, y)
+                                            : _mm256_andnot_si256(y, x));
         }
-      } else if (op == 'O') {
+      } else if (op == OP_OR) {
         to_dense(row);
       } else {
-        filter_bits(row, op == 'A');
+        filter_bits(row, op == OP_AND);
       }
       return;
     }
     size_t nl = index.lists.decode(id - index.high, l);
     if (dense) {
-      if (op == 'A') {
+      if (op == OP_AND) {
         std::swap(r, l);
         n = nl;
         filter_bits(bits, true);
@@ -856,12 +879,12 @@ struct Evaluator {
         for (size_t i = 0; i < nl; i++) {
           u64 bit = 1ull << (l[i] % 64);
           u64 &word = bits[l[i] / 64];
-          word = op == 'O' ? word | bit : word & ~bit;
+          word = op == OP_OR ? word | bit : word & ~bit;
         }
       }
       return;
     }
-    if (op == 'O') {
+    if (op == OP_OR) {
       // A long list of ids takes more room than a bitset.
       if (n + nl > index.words * 2) {
         to_dense(nullptr);
@@ -873,34 +896,34 @@ struct Evaluator {
       for (int i = 0; i < 8; i++)
         l[nl + i] = r[n + i] = UINT32_MAX;
       if (n * PROBE_RATIO < nl)
-        n = op == 'A' ? probe<true>(r, n, l, nl, tmp)
-                      : probe<false>(r, n, l, nl, tmp);
-      else if (op == 'A' && nl * PROBE_RATIO < n)
+        n = op == OP_AND ? probe<true>(r, n, l, nl, tmp)
+                         : probe<false>(r, n, l, nl, tmp);
+      else if (op == OP_AND && nl * PROBE_RATIO < n)
         n = probe<true>(l, nl, r, n, tmp);
       else
-        n = op == 'A' ? merge<'A'>(r, n, l, nl, tmp)
-                      : merge<'N'>(r, n, l, nl, tmp);
+        n = op == OP_AND ? merge<'A'>(r, n, l, nl, tmp)
+                         : merge<'N'>(r, n, l, nl, tmp);
     }
     std::swap(r, tmp);
   }
 
-  // `terms` holds each term's id above its operator's first byte, with 'A' for the
-  // first term.
-  void answer(u64 *terms, size_t count, std::string &out) {
-    auto key = [&](u64 term) {
-      return term_size(term >> 8) | (u64)((u8)term == 'N') << 32;
+  // `terms` holds each term's id above its operator, with AND for the first term.
+  void answer(u32 *terms, size_t count, std::string &out) {
+    auto op = [](u32 term) { return term & ((1 << OP_BITS) - 1); };
+    auto key = [&](u32 term) {
+      return term_size(term >> OP_BITS) | (u64)(op(term) == OP_NOT) << 32;
     };
     for (size_t i = 0; i < count;) {
       size_t end = i + 1;
-      while (end < count && (u8)terms[end] != 'O')
+      while (end < count && op(terms[end]) != OP_OR)
         end++;
       std::sort(terms + i + (i > 0), terms + end,
-                [&](u64 a, u64 b) { return key(a) < key(b); });
+                [&](u32 a, u32 b) { return key(a) < key(b); });
       i = end;
     }
-    start(terms[0] >> 8);
+    start(terms[0] >> OP_BITS);
     for (size_t i = 1; i < count; i++)
-      apply((u8)terms[i], terms[i] >> 8);
+      apply(op(terms[i]), terms[i] >> OP_BITS);
     u32 first[10];
     u64 total = n, sum = 0;
     if (dense) {
@@ -940,13 +963,12 @@ static void between_steps() noexcept {
   if (step == 0) {
     plan = plan_index(*draft, phrase_chunks, table);
     free(draft->hashes);
-    phrase_chunks = {};
     bits = (u64 *)reserve(plan.high * words * 8 + 64);
     size_t partitions = plan.low / PARTITION_TERMS + 1;
     // Each token takes at least 2 bytes of input and 2 bytes here.
-    log_span = (input_size + (1 << 24)) & ~(LOG_PAGE - 1);
+    log_span = (input_size + (1 << 24)) & -PAGE;
     log_regions = reserve(partitions * log_span);
-    next_log_page = new Counter[partitions];
+    next_log_block = new Counter[partitions];
     list_marks = (u32 *)calloc((plan.low + 1) * ((docs >> BLOCK_BITS) + 2), 4);
   } else if (step == 1) {
     index_all = {plan.high, words, bits, {list_marks, (docs >> BLOCK_BITS) + 1}};
@@ -965,6 +987,8 @@ static void between_steps() noexcept {
       for (const Hit &hit : scratch.hits)
         phrase_docs[cursors[hit.phrase]++] = hit.doc;
     plan.phrases = {};
+    free(table.slots);
+    munmap((void *)input, input_size + 4096);
   } else if (step == 2) {
   } else if (step == 3) {
   } else {
@@ -982,25 +1006,15 @@ static std::barrier<void (*)() noexcept> *sync_all;
 static void answer_queries(Scratch &scratch) {
   Evaluator evaluator{index_all, scratch.ids, scratch.high_ids, scratch.low_ids,
                       scratch.tokens};
-  u64 terms[64];
   for (size_t c; (c = next_answer.take()) < chunks;) {
     std::string &out = outputs[c];
     out.reserve(bounds[c + 1] - bounds[c]);
     size_t phrase = plan.phrase_bases[c];
-    for (const u8 *p = text + bounds[c]; p < text + bounds[c + 1];) {
-      if (*p == 'B') {
-        size_t position = 0, count = 0;
-        u8 op = 'A';
-        p = scan_line(p, [&](const u8 *word, u64 hash) {
-          if (position % 2 == 0) {
-            if (position)
-              op = *word;
-          } else {
-            terms[count++] = (u64)(table.find(hash) & ID_MASK) << 8 | op;
-          }
-          position++;
-        });
-        evaluator.answer(terms, count, out);
+    u32 *terms = phrase_chunks[c].terms.data();
+    for (u8 size : phrase_chunks[c].sizes) {
+      if (size) {
+        evaluator.answer(terms, size, out);
+        terms += size;
       } else {
         u32 *first = phrase_docs.data() + matched[phrase];
         u32 *end = phrase_docs.data() + matched[phrase + 1];
@@ -1011,7 +1025,6 @@ static void answer_queries(Scratch &scratch) {
           sum += *at;
         write_line(out, end - first, sum, first);
         phrase++;
-        p = (const u8 *)memchr(p, '\n', text + text_size - p) + 1;
       }
     }
   }
@@ -1053,7 +1066,7 @@ static void work(int t) {
       madvise(bits, plan.high * words * 8, MADV_DONTNEED);
     else
       madvise(log_regions + p * log_span,
-              next_log_page[p].value.load(relaxed) * LOG_PAGE, MADV_DONTNEED);
+              next_log_block[p].value.load(relaxed) * LOG_BLOCK, MADV_DONTNEED);
   sync_all->arrive_and_wait();
 }
 
@@ -1062,6 +1075,7 @@ int main() {
   // of a sparse region or a thread stack, and more when threads race to fault one.
   prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
   mallopt(M_MMAP_THRESHOLD, 1 << 16);
+  mallopt(M_ARENA_MAX, 1);
   memset(low_bytes, 255, 32);
   cpu_set_t cpus;
   sched_getaffinity(0, sizeof cpus, &cpus);
