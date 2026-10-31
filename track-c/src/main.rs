@@ -197,7 +197,6 @@ unsafe impl Sync for Job {}
 const BLOCKS: usize = 16;
 // A record is at least 11 bytes, of which 5 are structural.
 const MAX_MARKS: usize = BLOCKS * 64 + 64;
-const MAX_RECORDS: usize = MAX_MARKS / 5 + 1;
 
 // One 64-byte block as bitmasks: commas or LFs outside quotes, and second quotes of "" pairs. A
 // carry-less multiply by all ones is a running XOR of the quote bits, which is set from an opening
@@ -224,14 +223,6 @@ unsafe fn block_masks(p: *const u8, inside: &mut u64, closed: &mut u64) -> (u64,
         *closed = closers >> 63;
         (seps & !running, pairs)
     }
-}
-
-#[derive(Clone, Copy)]
-struct Rec {
-    sums: __m256i,
-    hash: u64,
-    region: u32,
-    amount: i32,
 }
 
 // Logs grow in segments from one shared arena, and each starts with the number of the segment
@@ -289,7 +280,6 @@ fn parse_chunk(job: &Job, first: usize, stop: usize, groups: &mut [Group]) {
     let mut marks = [0u32; MAX_MARKS];
     // Number of "" pairs in the field that each mark ends. Pairs are rare, so it stays mostly zero.
     let mut pairs = [0u32; MAX_MARKS + 1];
-    let mut recs = [Rec { sums: unsafe { _mm256_setzero_si256() }, hash: 0, region: 0, amount: 0 }; MAX_RECORDS];
     let (mut block, mut filled, mut inside, mut closed) = (first, 0usize, 0u64, 0u64);
     let mut start = first;
     loop {
@@ -318,7 +308,6 @@ fn parse_chunk(job: &Job, first: usize, stop: usize, groups: &mut [Group]) {
                 block += 64;
             }
             let whole = filled / 5;
-            let mut n = 0;
             let mut done = false;
             for r in 0..whole {
                 if start >= stop {
@@ -343,34 +332,25 @@ fn parse_chunk(job: &Job, first: usize, stop: usize, groups: &mut [Group]) {
                 let sign = -(negative as i32);
                 let amount = (cents as i32 ^ sign) - sign;
                 let hash = hash_name(base.add(c1 + 2), name_raw.saturating_sub(2) as usize);
-                _mm_prefetch::<_MM_HINT_T0>(by_id.add(region as usize).cast());
-                _mm_prefetch::<_MM_HINT_T0>(slots.add((hash >> (67 - NAME_BITS)) as usize * 8).cast());
                 let sums = _mm256_set_epi64x(
                     note_len as i64,
                     (1i64 << 32) | name_len as i64,
                     amount as i64,
                     id as i64,
                 );
-                *recs.get_unchecked_mut(n) = Rec { sums, hash, region, amount };
-                n += 1;
-                start = lf + 1;
-            }
-            // Group prefetching: this pass touches only what the pass above prefetched, so the
-            // cache misses of a whole batch overlap instead of stalling one at a time.
-            for rec in recs[..n].iter() {
-                let country = *by_id.add(rec.region as usize) as usize;
-                let group = groups.get_unchecked_mut(country);
-                let sums = group.sums.as_mut_ptr().cast();
-                _mm256_store_si256(sums, _mm256_add_epi64(_mm256_load_si256(sums), rec.sums));
-                group.amount_min = group.amount_min.min(rec.amount);
-                group.amount_max = group.amount_max.max(rec.amount);
-                let name = intern(job, slots, rec.hash);
+                let group = groups.get_unchecked_mut(*by_id.add(region as usize) as usize);
+                let at = group.sums.as_mut_ptr().cast();
+                _mm256_store_si256(at, _mm256_add_epi64(_mm256_load_si256(at), sums));
+                group.amount_min = group.amount_min.min(amount);
+                group.amount_max = group.amount_max.max(amount);
+                let name = intern(job, slots, hash);
                 let cursor = group.logs.get_unchecked_mut(name >> 16);
                 if *cursor as usize % SEGMENT == 0 {
                     *cursor = new_segment(job, *cursor);
                 }
                 *log.add(*cursor as usize) = name as u16;
                 *cursor += 1;
+                start = lf + 1;
             }
             if done || start >= stop {
                 return;
