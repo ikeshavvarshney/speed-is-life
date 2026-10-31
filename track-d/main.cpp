@@ -200,8 +200,12 @@ static Graph finish_graph(Slots slots, vector<Loose> loose) {
 static std::mutex pool_lock;
 static vector<std::pair<Slot *, size_t>> label_pool;
 
+// Mapped rather than allocated, so that untouched pages stay free however large
+// the table. Calloc would clear the whole table once earlier frees had raised
+// its threshold for mapping.
 static Slot *zeroed_labels(size_t len) {
-  return (Slot *)calloc(len, sizeof(Slot));
+  return (Slot *)mmap(0, len * sizeof(Slot), PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 }
 
 // Maps nodes to their forward and backward distances in one table, so a
@@ -260,7 +264,7 @@ struct Labels {
           label_pool.pop_back();
         }
       } else {
-        free(slots);
+        munmap(slots, capacity * sizeof(Slot));
         slots = zeroed_labels(size);
         capacity = size;
       }
