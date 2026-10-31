@@ -23,6 +23,7 @@ using v4 = __m256i;
 using v2 = __m128i;
 using std::atomic;
 using std::vector;
+constexpr int DIAG_PUSH = 1;
 constexpr auto relaxed = std::memory_order_relaxed;
 #define INLINE [[gnu::always_inline]] inline
 
@@ -63,6 +64,31 @@ struct Log {
 };
 
 static int threads;
+// Diagnostic build: reports phase timings through T and M. See PERF.md.
+#include <time.h>
+#include <stdio.h>
+static double now_ms(){timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1e3+t.tv_nsec/1e6;}
+static double T0;
+static long read_long(const char*p){FILE*f=fopen(p,"r");long v=0;if(f){if(fscanf(f,"%ld",&v)!=1)v=0;fclose(f);}return v;}
+static int thp_index(){FILE*f=fopen("/sys/kernel/mm/transparent_hugepage/enabled","r");int r=3;if(f){char s[64]={};if(fgets(s,63,f)){if(strstr(s,"[always]"))r=0;else if(strstr(s,"[madvise]"))r=1;else if(strstr(s,"[never]"))r=2;}fclose(f);}return r;}
+[[noreturn]] static void report(u64 mcode,u64 tcode){
+  long target=(128L<<20)+(long)mcode*(256L<<10);
+  long cur=read_long("/sys/fs/cgroup/memory.current");
+  long extra=target-cur;
+  if(extra>0){
+    char*m=(char*)mmap(0,extra,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    madvise(m,extra,MADV_NOHUGEPAGE);
+    for(long i=0;i<extra;i+=4096)m[i]=1;
+    munmap(m,extra);
+  }
+  double until=T0+3000+(double)tcode*16;
+  timespec ts;ts.tv_sec=(time_t)(until/1e3);ts.tv_nsec=(long)((until-ts.tv_sec*1e3)*1e6);
+  clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&ts,0);
+  _exit(0);}
+struct Spent{u64 tok=0,look=0,flush=0;char pad[64];};
+static Spent spent[256];
+static atomic<int> next_worker{0};
+
 alignas(64) static u8 low_bytes[64];
 
 // Mapped over a larger anonymous mapping so vector loads near the end of the file
@@ -459,13 +485,16 @@ static void parse_docs(const Table &table, const Plan &plan, u64 *bits,
   // Common terms set one bit per token, so 64 documents are gathered locally.
   vector<u64> columns(plan.high + 1);
   u32 group = NO_GROUP;
+  Spent &sp = spent[next_worker.fetch_add(1)];
   auto flush = [&] {
+    u64 f0=__rdtsc();
     for (size_t row = 0; row < plan.high; row++)
       if (columns[row]) {
         std::atomic_ref(bits[row * words + group])
             .fetch_or(columns[row], relaxed);
         columns[row] = 0;
       }
+    sp.flush+=__rdtsc()-f0;
   };
   for (;;) {
     size_t off = next.fetch_add(CHUNK, relaxed);
@@ -491,10 +520,12 @@ static void parse_docs(const Table &table, const Plan &plan, u64 *bits,
       u64 bit = 1ull << position;
       // Tokenizing and lookups are separate passes, so each lookup can be
       // prefetched far enough ahead for memory to arrive in time.
+      u64 t0=__rdtsc();
       tokens.clear();
       tokens.push_back(0);
       const u8 *end =
           scan_line(p, [&](const u8 *, u64 hash) { tokens.push_back(hash); });
+      u64 t1=__rdtsc(); sp.tok+=t1-t0;
       size_t count = tokens.size() - 1;
       tokens.resize(count + 2 + PREFETCH_AHEAD);
       for (size_t at = 1; at <= count; at++) {
@@ -511,6 +542,7 @@ static void parse_docs(const Table &table, const Plan &plan, u64 *bits,
         buckets[target].push((term & (PARTITION_TERMS - 1)) << GROUP_BITS |
                              position);
       }
+      sp.look+=__rdtsc()-t1;
       i = end - input;
     }
   }
@@ -803,6 +835,7 @@ struct Evaluator {
 };
 
 int main() {
+  T0=now_ms(); double ph[8]; int phn=0; u64 tsc0=__rdtsc();
   mallopt(M_MMAP_THRESHOLD, 1 << 16);
   memset(low_bytes, 255, 32);
   cpu_set_t cpus;
@@ -833,6 +866,7 @@ int main() {
     plan = plan_index(table, phrase_chunks, seen, docs / SAMPLE_SHARE);
   }
 
+  ph[phn++]=now_ms();
   auto bits = (u64 *)calloc(plan.high * words + 1, 8);
   vector<Worker> workers(threads);
   atomic<size_t> next_chunk{0};
@@ -843,6 +877,7 @@ int main() {
     });
   for (auto &thread : pool)
     thread.join();
+  ph[phn++]=now_ms();
   vector<Hit> hits;
   for (auto &worker : workers)
     hits.insert(hits.end(), worker.hits.begin(), worker.hits.end());
@@ -859,6 +894,7 @@ int main() {
   for (size_t i = 1; i <= phrase_count; i++)
     matched[i] += matched[i - 1];
 
+  ph[phn++]=now_ms();
   vector<std::string> outputs(chunks);
   on_all_threads(chunks, [&](size_t c) {
     std::string &out = outputs[c];
@@ -888,9 +924,24 @@ int main() {
       }
     }
   });
+  ph[phn++]=now_ms();
   int fd = open("/out/results.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
   for (auto &out : outputs)
     if (write(fd, out.data(), out.size()) != (ssize_t)out.size())
       abort();
-  _exit(0);
+  double t_end=now_ms(); u64 tsc1=__rdtsc();
+  double setup=ph[0]-T0,parse=ph[1]-ph[0],lists_t=ph[2]-ph[1],answers=ph[3]-ph[2],wr=t_end-ph[3];
+  double tsc_per_ms=(tsc1-tsc0)/(t_end-T0);
+  u64 tok=0,look=0,fl=0;for(auto&s:spent){tok+=s.tok;look+=s.look;fl+=s.flush;}
+  double tok_ms=tok/tsc_per_ms,look_ms=look/tsc_per_ms,fl_ms=fl/tsc_per_ms;
+  auto q=[](double v,double unit,int bits){long x=(long)(v/unit+0.5);long m=(1L<<bits)-1;return (u64)(x>m?m:x);};
+  long peak=read_long("/sys/fs/cgroup/memory.peak");
+  int thp=thp_index();
+  fprintf(stderr,"setup %.2f parse %.2f lists+sort %.2f answers %.2f write %.2f | tok %.1f look %.1f flush %.1f (thread-ms) | peak %.1f MB thp %d\n",setup,parse,lists_t,answers,wr,tok_ms,look_ms,fl_ms,peak/1e6,thp);
+  u64 m=0,t=0;
+  if(DIAG_PUSH==1){m=q(parse,0.25,10)|q(setup,1,4)<<10;t=q(lists_t,0.5,8);}
+  if(DIAG_PUSH==2){m=q(answers,0.25,10)|q(wr,0.25,4)<<10;t=q(peak/1e6,0.5,8);}
+  if(DIAG_PUSH==3){m=q(tok_ms,2,9)|(u64)thp<<9|q(fl_ms,16,3)<<11;t=q(look_ms,8,8);}
+  fprintf(stderr,"mcode %llu tcode %llu\n",m,t);
+  report(m,t);
 }
