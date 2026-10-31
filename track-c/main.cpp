@@ -29,19 +29,18 @@ const size_t COUNTRIES = 256, HUGE_PAGE = 1 << 21;
 // The generator's pool of 100,000 names, plus the few that edge-case blocks
 // add, fits at 77% load.
 const int NAME_BITS = 17;
-// One log segment in u16 entries: a two-entry link and 126 names.
-const size_t SEGMENT = 128;
+// Words of one country's bitset over name ids.
+const size_t WORDS = (1 << NAME_BITS) / 64;
 const size_t BLOCKS = 16, MAX_MARKS = BLOCKS * 64 + 64;
 const size_t MAX_RECORDS = MAX_MARKS / 5 + 1;
 
 // One worker's running values for one country, on one cache line. `sums` is
 // added to as one vector: id sum, amount sum, count << 32 | name bytes, note
 // bytes. Neither half of the third can carry into the other, as both stay below
-// 2^31. `logs` are the write positions of the two name logs.
+// 2^31.
 struct alignas(64) Group {
   u64 sums[4] = {};
   int min = INT32_MAX, max = INT32_MIN;
-  u32 logs[2] = {};
 };
 
 // Counters that every thread writes, away from what records read.
@@ -84,14 +83,14 @@ static size_t input_size, regions_size;
 static u8 *by_id;
 static u32 last_region;
 static atomic<u64> *slots;
-static u16 *name_log;
+static atomic<u64> *name_bits;
 static Group *groups;
 static int threads;
 static atomic<u8> seen_codes[26 * 26 * 26];
 static std::mutex codes_lock;
 static std::vector<std::string> codes;
 static atomic<u32> distinct_names[COUNTRIES];
-static Counter next_region, next_chunk, next_segment, next_country, next_unmap;
+static Counter next_region, next_chunk, next_country, next_unmap;
 
 // Claims pieces of regions.csv. by_id holds 1 + the country's index, and 0 for
 // anything unknown. Its last entry stays 0 and stands for every id above the
@@ -176,15 +175,6 @@ INLINE u64 hash_name(const u8 *p, size_t len) {
   }
   state = _mm_aesenc_si128(state, key);
   return _mm_cvtsi128_si64(_mm_aesenc_si128(state, key)) | 1;
-}
-
-// Logs grow in segments from one shared arena, and each starts with the number
-// of the segment before it. Segment 0 is never handed out, so it ends a chain.
-[[gnu::cold]] static u32 new_segment(u32 cursor) {
-  u32 previous = cursor ? cursor / SEGMENT - 1 : 0;
-  size_t segment = next_segment.take(1);
-  __builtin_memcpy(name_log + segment * SEGMENT, &previous, 4);
-  return segment * SEGMENT + 2;
 }
 
 // Lock-free table of 64-bit name hashes, whose slot number is the name's id.
@@ -323,10 +313,18 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
       group.min = std::min(group.min, rec.amount);
       group.max = std::max(group.max, rec.amount);
       size_t name = intern(rec.hash);
-      u32 &cursor = group.logs[name >> 16];
-      if (cursor % SEGMENT == 0)
-        cursor = new_segment(cursor);
-      name_log[cursor++] = name;
+      size_t word = ids[rec.region] * WORDS + name / 64;
+      __builtin_prefetch(name_bits + word, 1);
+      recs[r].hash = word;
+      recs[r].region = name % 64;
+    }
+    // A set bit costs no write, and a write costs a locked instruction that
+    // often has to fetch the line from another core, so it is the last step.
+    for (size_t r = 0; r < n; r++) {
+      auto &word = name_bits[recs[r].hash];
+      u64 bit = 1ull << recs[r].region;
+      if (!(word.load(relaxed) & bit))
+        word.fetch_or(bit, relaxed);
     }
     if (done || start >= stop)
       return;
@@ -379,33 +377,13 @@ static void worker(int index, std::barrier<> *barrier) {
             MADV_DONTNEED);
   }
 
-  // Nothing writes the logs now. Each country goes to one worker, whose bitset
-  // fits in L1.
-  u64 seen[1 << 10] = {};
   for (;;) {
     size_t country = next_country.take(1);
     if (country >= COUNTRIES)
       return;
     u32 distinct = 0;
-    for (int list = 0; list < 2; list++) {
-      for (int t = 0; t < threads; t++) {
-        size_t cursor = groups[t * COUNTRIES + country].logs[list];
-        while (cursor) {
-          size_t segment = (cursor - 1) / SEGMENT;
-          for (size_t at = segment * SEGMENT + 2; at < cursor; at++) {
-            u32 name = name_log[at];
-            seen[name / 64] |= 1ull << (name % 64);
-          }
-          u32 previous;
-          __builtin_memcpy(&previous, name_log + segment * SEGMENT, 4);
-          cursor = previous ? (previous + 1) * SEGMENT : 0;
-        }
-      }
-      for (u64 &word : seen) {
-        distinct += __builtin_popcountll(word);
-        word = 0;
-      }
-    }
+    for (size_t i = 0; i < WORDS; i++)
+      distinct += __builtin_popcountll(name_bits[country * WORDS + i].load(relaxed));
     distinct_names[country].store(distinct, relaxed);
   }
 }
@@ -439,13 +417,12 @@ int main() {
   for (size_t page = 0; page < tables_size; page += HUGE_PAGE)
     by_id[page] = 0;
   slots = (atomic<u64> *)(by_id + names_at);
-  // Worst case: 11-byte records, each with one u16, plus a segment per open log
-  // and the links. Written in order and racing at its end, so small pages.
-  name_log = (u16 *)zeroed(input_size / 4 + threads * COUNTRIES * 4 * SEGMENT,
-                           MADV_NOHUGEPAGE);
+  // 241 groups fill two huge pages. Touched first, like the tables above.
+  name_bits = (atomic<u64> *)zeroed(COUNTRIES * WORDS * 8, MADV_HUGEPAGE);
+  for (size_t page = 0; page < 2; page++)
+    *(u8 *)(name_bits + page * HUGE_PAGE / 8) = 0;
   groups = (Group *)zeroed(threads * COUNTRIES * sizeof(Group), MADV_NOHUGEPAGE);
   next_region.value = 1; // The first piece starts after the header.
-  next_segment.value = 1;
   std::barrier barrier(threads);
   std::vector<std::thread> pool;
   for (int t = 1; t < threads; t++)
