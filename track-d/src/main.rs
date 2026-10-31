@@ -1,35 +1,63 @@
+use std::arch::x86_64::*;
 use std::ffi::c_void;
 use std::fs::File;
-use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering::Relaxed};
 
 const CHUNK: usize = 1 << 18;
-const PARTITIONS: usize = 64;
-const BLOCK: usize = 13107;
-const TABLE_START: usize = 1 << 11;
-const TABLE_KEEP: usize = 1 << 17;
+const PLACE_AHEAD: usize = 16;
+
+// Each node has four 4-byte slots at a computed address, so finding its edges takes no lookup and
+// can be prefetched from the node id alone. Over 98% of nodes have at most four edges. A slot
+// holds head + 1 above 11 bits of weight, and 0 when empty. Edges that do not fit, or that weigh
+// too much, go to a side list that the node's last used slot points to with an ESCAPE weight.
+const SLOTS: usize = 4;
+const WEIGHT_BITS: u32 = 11;
+const ESCAPE: u32 = (1 << WEIGHT_BITS) - 1;
+const LIST_END: u32 = u32::MAX;
+
+// Heap items and labels pack a distance above a 21-bit node. The generated graphs stay far below
+// the 2^43 this allows for distances.
+const NODE_BITS: u32 = 21;
+const NODE_MASK: u64 = (1 << NODE_BITS) - 1;
+const DIST_BITS: u32 = 64 - NODE_BITS;
+const NO_DIST: u64 = (1 << DIST_BITS) - 1;
+const KEY_MASK: u64 = !NO_DIST;
+const LABELS_START: usize = 1 << 12;
+const LABELS_KEEP: usize = 1 << 16;
 
 unsafe extern "C" {
     #[link_name = "_exit"]
     fn exit(code: i32) -> !;
-    fn mallopt(param: i32, value: i32) -> i32;
+    fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
     fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
 }
 
-const M_MMAP_THRESHOLD: i32 = -3;
+const PROT_READ_WRITE: i32 = 3;
+const PROT_READ: i32 = 1;
+const MAP_PRIVATE: i32 = 2;
+const MAP_FIXED: i32 = 0x10;
+const MAP_ANONYMOUS: i32 = 0x20;
 
 // Mapped over a larger anonymous mapping so word loads near the end of the file stay readable.
 fn map_input(file: &File, size: usize) -> &'static [u8] {
-    const PROT_READ: i32 = 1;
-    const MAP_PRIVATE: i32 = 2;
-    const MAP_FIXED: i32 = 0x10;
-    const MAP_ANONYMOUS: i32 = 0x20;
     unsafe {
         let base = mmap(std::ptr::null_mut(), size + 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         mmap(base, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, file.as_raw_fd(), 0);
         std::slice::from_raw_parts(base as *const u8, size)
+    }
+}
+
+// Zeroed memory on 2 MB boundaries with huge pages requested, as graph accesses are random.
+fn zeroed_slots(len: usize) -> &'static [AtomicU32] {
+    const HUGE: usize = 1 << 21;
+    const MADV_HUGEPAGE: i32 = 14;
+    let bytes = (len * 4).next_multiple_of(HUGE);
+    unsafe {
+        let raw = mmap(std::ptr::null_mut(), bytes + HUGE, PROT_READ_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        let aligned = (raw as usize).next_multiple_of(HUGE) as *mut c_void;
+        madvise(aligned, bytes, MADV_HUGEPAGE);
+        std::slice::from_raw_parts(aligned as *const AtomicU32, len)
     }
 }
 
@@ -57,66 +85,47 @@ fn parse_digits(p: *const u8) -> (u64, *const u8) {
     (value, unsafe { p.add(len) })
 }
 
-#[derive(Clone, Copy)]
-#[repr(C, packed)]
-struct Edge {
-    tail: u16,
+struct Loose {
+    node: u32,
     head: u32,
     weight: u32,
 }
 
-#[derive(Default)]
-struct Bucket {
-    blocks: Vec<Box<MaybeUninit<[Edge; BLOCK]>>>,
-    used: usize,
-    total: usize,
-}
-
-impl Bucket {
-    #[inline(always)]
-    fn push(&mut self, edge: Edge) {
-        if self.used == 0 {
-            self.blocks.push(Box::new_uninit());
+#[inline(always)]
+fn place(slots: &[AtomicU32], node: u32, head: u32, weight: u32, loose: &mut Vec<Loose>) {
+    if weight < ESCAPE {
+        let entry = (head + 1) << WEIGHT_BITS | weight;
+        let at = node as usize * SLOTS;
+        for slot in unsafe { slots.get_unchecked(at..at + SLOTS) } {
+            if slot.load(Relaxed) == 0 && slot.compare_exchange(0, entry, Relaxed, Relaxed).is_ok() {
+                return;
+            }
         }
-        unsafe {
-            let block = self.blocks.last_mut().unwrap_unchecked().as_mut_ptr();
-            block.cast::<Edge>().add(self.used).write(edge);
-        }
-        self.used = (self.used + 1) % BLOCK;
-        self.total += 1;
     }
-
-    fn edges(&self) -> impl Iterator<Item = &[Edge]> {
-        self.blocks.iter().enumerate().map(|(i, block)| {
-            let n = if i + 1 == self.blocks.len() && self.used != 0 { self.used } else { BLOCK };
-            unsafe { std::slice::from_raw_parts(block.as_ptr().cast::<Edge>(), n) }
-        })
-    }
+    loose.push(Loose { node, head, weight });
 }
 
-struct Graph {
-    offsets: Vec<u32>,
-    edges: Vec<(u32, u32)>,
-}
-
-struct Shared<T>(*mut T);
-unsafe impl<T> Sync for Shared<T> {}
-
-// Sorts edges into node ranges as they are parsed, so that the graph can then be built one range
-// at a time by a single thread, inside its cache, with no shared counters.
-fn parse_edges(input: &'static [u8], start: usize, shift: u32, threads: usize) -> Vec<Vec<Bucket>> {
+// Places edges directly as they are parsed, with no log. Each placement is prefetched and made
+// some edges later, so that the cache misses of these random writes overlap.
+fn read_edges(input: &[u8], start: usize, graphs: [&[AtomicU32]; 2], threads: usize) -> [Vec<Loose>; 2] {
     let next = AtomicUsize::new(start);
-    std::thread::scope(|scope| {
-        let workers: Vec<_> = (0..threads)
+    let results = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
             .map(|_| {
                 let next = &next;
                 scope.spawn(move || {
-                    let mut buckets: Vec<Bucket> = (0..PARTITIONS).map(|_| Bucket::default()).collect();
+                    let mut loose = [Vec::new(), Vec::new()];
+                    let mut ring = [(u32::MAX, 0, 0); PLACE_AHEAD];
+                    let mut at = 0;
                     let base = input.as_ptr();
                     loop {
                         let off = next.fetch_add(CHUNK, Relaxed);
                         if off >= input.len() {
-                            return buckets;
+                            for &(tail, head, weight) in ring.iter().filter(|edge| edge.0 != u32::MAX) {
+                                place(graphs[0], tail, head, weight, &mut loose[0]);
+                                place(graphs[1], head, tail, weight, &mut loose[1]);
+                            }
+                            return loose;
                         }
                         let mut i = off;
                         if off != start {
@@ -128,323 +137,266 @@ fn parse_edges(input: &'static [u8], start: usize, shift: u32, threads: usize) -
                                 let (tail, p) = parse_digits(base.add(i));
                                 let (head, p) = parse_digits(p.add(1));
                                 let (weight, p) = parse_digits(p.add(1));
-                                let bucket = buckets.get_unchecked_mut((tail >> shift) as usize);
-                                bucket.push(Edge {
-                                    tail: (tail & ((1 << shift) - 1)) as u16,
-                                    head: head as u32,
-                                    weight: weight as u32,
-                                });
                                 i = p.offset_from(base) as usize + 1;
+                                let (tail, head, weight) = (tail as u32, head as u32, weight as u32);
+                                // A self-loop never shortens a path.
+                                if tail == head {
+                                    continue;
+                                }
+                                _mm_prefetch::<_MM_HINT_ET0>(graphs[0].as_ptr().add(tail as usize * SLOTS).cast());
+                                _mm_prefetch::<_MM_HINT_ET0>(graphs[1].as_ptr().add(head as usize * SLOTS).cast());
+                                let old = std::mem::replace(ring.get_unchecked_mut(at), (tail, head, weight));
+                                at = (at + 1) % PLACE_AHEAD;
+                                if old.0 != u32::MAX {
+                                    place(graphs[0], old.0, old.1, old.2, &mut loose[0]);
+                                    place(graphs[1], old.1, old.0, old.2, &mut loose[1]);
+                                }
                             }
                         }
                     }
                 })
             })
             .collect();
-        workers.into_iter().map(|w| w.join().unwrap()).collect()
-    })
-}
-
-fn build_graph(parsed: Vec<Vec<Bucket>>, n: usize, shift: u32, threads: usize) -> Graph {
-    let mut partitions: Vec<Vec<Bucket>> = (0..PARTITIONS).map(|_| Vec::with_capacity(threads)).collect();
-    for buckets in parsed {
-        for (p, bucket) in buckets.into_iter().enumerate() {
-            partitions[p].push(bucket);
-        }
-    }
-    let mut bases = vec![0usize; PARTITIONS + 1];
-    for p in 0..PARTITIONS {
-        bases[p + 1] = bases[p] + partitions[p].iter().map(|b| b.total).sum::<usize>();
-    }
-    let total = bases[PARTITIONS];
-    let tasks: Vec<Mutex<Vec<Bucket>>> = partitions.into_iter().map(Mutex::new).collect();
-    let mut offsets = vec![0u32; n + 1];
-    let mut edges = vec![(0u32, 0u32); total];
-    let offsets_ptr = Shared(offsets.as_mut_ptr());
-    let edges_ptr = Shared(edges.as_mut_ptr());
-    let next = AtomicUsize::new(0);
-    std::thread::scope(|scope| {
-        for _ in 0..threads {
-            let (next, tasks, bases, offsets_ptr, edges_ptr) =
-                (&next, &tasks, &bases, &offsets_ptr, &edges_ptr);
-            scope.spawn(move || {
-                let mut cursors = vec![0u32; 1 << shift];
-                loop {
-                    let p = next.fetch_add(1, Relaxed);
-                    if p >= PARTITIONS {
-                        return;
-                    }
-                    let buckets = std::mem::take(&mut *tasks[p].lock().unwrap());
-                    cursors.fill(0);
-                    for bucket in &buckets {
-                        for block in bucket.edges() {
-                            for edge in block {
-                                cursors[edge.tail as usize] += 1;
-                            }
-                        }
-                    }
-                    let first = p << shift;
-                    let last = ((p + 1) << shift).min(n);
-                    let mut sum = bases[p] as u32;
-                    // Each node range and edge range has one owner: the thread that claimed p.
-                    for node in first..last {
-                        let degree = cursors[node - first];
-                        cursors[node - first] = sum;
-                        unsafe { *offsets_ptr.0.add(node) = sum };
-                        sum += degree;
-                    }
-                    for bucket in &buckets {
-                        for block in bucket.edges() {
-                            for edge in block {
-                                let (head, weight) = (edge.head, edge.weight);
-                                let cursor = &mut cursors[edge.tail as usize];
-                                unsafe { *edges_ptr.0.add(*cursor as usize) = (head, weight) };
-                                *cursor += 1;
-                            }
-                        }
-                    }
-                }
-            });
-        }
+        handles.into_iter().map(|handle| handle.join().unwrap()).collect::<Vec<_>>()
     });
-    offsets[n] = total as u32;
-    Graph { offsets, edges }
+    let mut merged = [Vec::new(), Vec::new()];
+    for [forward, backward] in results {
+        merged[0].extend(forward);
+        merged[1].extend(backward);
+    }
+    merged
 }
 
-fn reverse_edges(graph: &Graph, n: usize, shift: u32, threads: usize) -> Vec<Vec<Bucket>> {
-    let next = AtomicUsize::new(0);
-    std::thread::scope(|scope| {
-        let workers: Vec<_> = (0..threads)
-            .map(|_| {
-                let next = &next;
-                scope.spawn(move || {
-                    let mut buckets: Vec<Bucket> = (0..PARTITIONS).map(|_| Bucket::default()).collect();
-                    loop {
-                        let first = next.fetch_add(1 << shift, Relaxed);
-                        if first >= n {
-                            return buckets;
-                        }
-                        for node in first..(first + (1 << shift)).min(n) {
-                            let begin = graph.offsets[node] as usize;
-                            for &(head, weight) in &graph.edges[begin..graph.offsets[node + 1] as usize] {
-                                buckets[(head >> shift) as usize].push(Edge {
-                                    tail: (head & ((1 << shift) - 1)) as u16,
-                                    head: node as u32,
-                                    weight,
-                                });
-                            }
-                        }
-                    }
-                })
-            })
-            .collect();
-        workers.into_iter().map(|w| w.join().unwrap()).collect()
-    })
+struct Graph {
+    slots: &'static [AtomicU32],
+    side_list: Vec<(u32, u32)>,
 }
 
-// Open-addressing node-to-distance map. Most searches settle few nodes, so a small table stays in
-// cache where a distance array per thread would be megabytes of misses and memory.
-struct Distances {
-    keys: Vec<u32>,
-    values: Vec<u64>,
+// Moves each node's loose edges to the side list, with its last slot pointing there.
+fn finish_graph(slots: &'static [AtomicU32], mut loose: Vec<Loose>) -> Graph {
+    loose.sort_unstable_by_key(|edge| edge.node);
+    let mut side_list = Vec::with_capacity(loose.len() * 2);
+    let mut i = 0;
+    while i < loose.len() {
+        let node = loose[i].node as usize;
+        let own = &slots[node * SLOTS..(node + 1) * SLOTS];
+        let index = side_list.len() as u32 + 1;
+        let used = own.iter().position(|slot| slot.load(Relaxed) == 0).unwrap_or(SLOTS - 1);
+        let displaced = own[used].load(Relaxed);
+        if displaced != 0 {
+            side_list.push(((displaced >> WEIGHT_BITS) - 1, displaced & ESCAPE));
+        }
+        while i < loose.len() && loose[i].node as usize == node {
+            side_list.push((loose[i].head, loose[i].weight));
+            i += 1;
+        }
+        side_list.push((LIST_END, 0));
+        own[used].store(index << WEIGHT_BITS | ESCAPE, Relaxed);
+    }
+    Graph { slots, side_list }
+}
+
+// Maps nodes to their forward and backward distances in one table, so a relaxation that looks at
+// both directions touches one slot. Node ids are random, so their low bits index it directly.
+struct Labels {
+    slots: Vec<[u64; 2]>,
     mask: usize,
     used: usize,
 }
 
-impl Distances {
+impl Labels {
     fn new() -> Self {
-        Self { keys: vec![0; TABLE_START], values: vec![0; TABLE_START], mask: TABLE_START - 1, used: 0 }
+        Self { slots: vec![[0; 2]; LABELS_START], mask: LABELS_START - 1, used: 0 }
     }
 
-    // Capacity is kept between searches, but only the part this search used is cleared, and the
-    // next search starts small again. Rare huge tables are released rather than kept per thread.
     fn reset(&mut self) {
-        if self.keys.len() > TABLE_KEEP {
+        if self.slots.len() > LABELS_KEEP {
             *self = Self::new();
         } else {
-            self.keys[..=self.mask].fill(0);
-            self.mask = TABLE_START - 1;
+            self.slots[..=self.mask].fill([0; 2]);
+            self.mask = LABELS_START - 1;
             self.used = 0;
         }
     }
 
     #[inline(always)]
-    fn slot(&self, node: u32) -> usize {
-        let key = node + 1;
-        let mut slot = (key.wrapping_mul(0x9E37_79B1) >> 7) as usize & self.mask;
+    fn entry(&mut self, node: u32) -> *mut [u64; 2] {
+        let key = (node as u64 + 1) << DIST_BITS;
+        let mut at = node as usize & self.mask;
         loop {
-            let seen = unsafe { *self.keys.get_unchecked(slot) };
-            if seen == key || seen == 0 {
+            let slot = unsafe { self.slots.get_unchecked_mut(at) };
+            let found = slot[0] & KEY_MASK;
+            if found == key {
                 return slot;
             }
-            slot = (slot + 1) & self.mask;
-        }
-    }
-
-    #[inline(always)]
-    fn get(&self, node: u32) -> u64 {
-        let slot = self.slot(node);
-        if self.keys[slot] == 0 { u64::MAX } else { self.values[slot] }
-    }
-
-    // Stores the distance if it is an improvement, and says whether it was.
-    #[inline(always)]
-    fn improve(&mut self, node: u32, distance: u64) -> bool {
-        let slot = self.slot(node);
-        let key = unsafe { *self.keys.get_unchecked(slot) };
-        if key != 0 {
-            let value = unsafe { self.values.get_unchecked_mut(slot) };
-            if distance >= *value {
-                return false;
+            if found == 0 {
+                *slot = [key | NO_DIST, NO_DIST];
+                self.used += 1;
+                return slot;
             }
-            *value = distance;
-            return true;
+            at = (at + 1) & self.mask;
         }
-        self.keys[slot] = node + 1;
-        self.values[slot] = distance;
-        self.used += 1;
-        if self.used * 2 > self.mask {
-            self.grow();
-        }
-        true
     }
 
     #[cold]
     fn grow(&mut self) {
         let old_size = self.mask + 1;
+        let live: Vec<[u64; 2]> = self.slots[..old_size].iter().copied().filter(|slot| slot[0] != 0).collect();
         let size = old_size * 4;
-        let live: Vec<(u32, u64)> = (0..old_size)
-            .filter(|&i| self.keys[i] != 0)
-            .map(|i| (self.keys[i], self.values[i]))
-            .collect();
-        if size > self.keys.len() {
-            self.keys = vec![0; size];
-            self.values = vec![0; size];
+        if size > self.slots.len() {
+            self.slots = vec![[0; 2]; size];
         } else {
-            self.keys[..size].fill(0);
+            self.slots[..size].fill([0; 2]);
         }
         self.mask = size - 1;
-        for (key, value) in live {
-            let slot = self.slot(key - 1);
-            self.keys[slot] = key;
-            self.values[slot] = value;
+        for slot in live {
+            let mut at = (slot[0] >> DIST_BITS) as usize - 1 & self.mask;
+            while self.slots[at][0] != 0 {
+                at = (at + 1) & self.mask;
+            }
+            self.slots[at] = slot;
         }
     }
 }
 
-// Four children per node: shallower than a binary heap, and siblings share a cache line.
+#[inline(always)]
+fn set_dist(slot: &mut [u64; 2], side: usize, dist: u64) {
+    slot[side] = slot[side] & KEY_MASK | dist;
+}
+
+// Four children per node: shallower than a binary heap, and siblings mostly share a cache line.
 #[derive(Default)]
 struct Heap {
-    items: Vec<(u64, u32)>,
+    items: Vec<u64>,
 }
 
 impl Heap {
     #[inline(always)]
-    fn push(&mut self, item: (u64, u32)) {
+    fn push(&mut self, item: u64) {
         let mut i = self.items.len();
         self.items.push(item);
-        while i > 0 {
-            let parent = (i - 1) / 4;
-            if self.items[parent].0 <= item.0 {
-                break;
+        unsafe {
+            while i > 0 {
+                let parent = (i - 1) / 4;
+                let above = *self.items.get_unchecked(parent);
+                if above <= item {
+                    break;
+                }
+                *self.items.get_unchecked_mut(i) = above;
+                i = parent;
             }
-            self.items[i] = self.items[parent];
-            i = parent;
+            *self.items.get_unchecked_mut(i) = item;
         }
-        self.items[i] = item;
     }
 
     #[inline(always)]
-    fn pop(&mut self) -> Option<(u64, u32)> {
-        let top = *self.items.first()?;
+    fn pop(&mut self) -> u64 {
+        let top = self.items[0];
         let last = self.items.pop().unwrap();
         let n = self.items.len();
         if n > 0 {
             let mut i = 0;
-            loop {
-                let first = 4 * i + 1;
-                if first >= n {
-                    break;
-                }
-                let mut best = first;
-                for child in first + 1..(first + 4).min(n) {
-                    if self.items[child].0 < self.items[best].0 {
-                        best = child;
+            unsafe {
+                loop {
+                    let first = 4 * i + 1;
+                    if first >= n {
+                        break;
                     }
+                    let mut best = first;
+                    for child in first + 1..(first + 4).min(n) {
+                        if *self.items.get_unchecked(child) < *self.items.get_unchecked(best) {
+                            best = child;
+                        }
+                    }
+                    let smallest = *self.items.get_unchecked(best);
+                    if smallest >= last {
+                        break;
+                    }
+                    *self.items.get_unchecked_mut(i) = smallest;
+                    i = best;
                 }
-                if self.items[best].0 >= last.0 {
-                    break;
-                }
-                self.items[i] = self.items[best];
-                i = best;
+                *self.items.get_unchecked_mut(i) = last;
             }
-            self.items[i] = last;
         }
-        Some(top)
+        top
     }
 }
 
-#[derive(Default)]
-struct Side {
-    dist: Option<Distances>,
-    heap: Heap,
+struct Search {
+    labels: Labels,
+    heaps: [Heap; 2],
+}
+
+#[inline(always)]
+fn relax(search: &mut Search, side: usize, graph: &Graph, head: u32, next: u64, far_top: u64, best: &mut u64) {
+    if next + far_top < *best {
+        let slot = unsafe { &mut *search.labels.entry(head) };
+        if next < slot[side] & NO_DIST {
+            set_dist(slot, side, next);
+            let across = slot[1 - side] & NO_DIST;
+            if across != NO_DIST {
+                *best = (*best).min(next + across);
+            }
+            search.heaps[side].push(next << NODE_BITS | head as u64);
+            unsafe { _mm_prefetch::<_MM_HINT_T0>(graph.slots.as_ptr().add(head as usize * SLOTS).cast()) };
+            if search.labels.used * 2 > search.labels.mask {
+                search.labels.grow();
+            }
+        }
+    }
 }
 
 // Bidirectional Dijkstra: two balls of half the radius settle far fewer nodes than one. An empty
 // heap means that side reached everything it can, so unreachable targets end immediately.
-fn shortest_path(graphs: [&Graph; 2], s: u32, t: u32, sides: &mut [Side; 2]) -> i64 {
+fn shortest_path(graphs: &[Graph; 2], s: u32, t: u32, search: &mut Search) -> i64 {
     if s == t {
         return 0;
     }
-    for (side, start) in sides.iter_mut().zip([s, t]) {
-        let dist = side.dist.get_or_insert_with(Distances::new);
-        dist.reset();
-        dist.improve(start, 0);
-        side.heap.items.clear();
-        side.heap.push((0, start));
+    search.labels.reset();
+    for (side, start) in [s, t].into_iter().enumerate() {
+        set_dist(unsafe { &mut *search.labels.entry(start) }, side, 0);
+        search.heaps[side].items.clear();
+        search.heaps[side].push(start as u64);
     }
     let mut best = u64::MAX;
     loop {
-        let (Some(&top0), Some(&top1)) = (sides[0].heap.items.first(), sides[1].heap.items.first()) else {
+        let (Some(&top0), Some(&top1)) = (search.heaps[0].items.first(), search.heaps[1].items.first()) else {
             break;
         };
-        if top0.0 + top1.0 >= best {
+        let (dist0, dist1) = (top0 >> NODE_BITS, top1 >> NODE_BITS);
+        if dist0 + dist1 >= best {
             break;
         }
-        let this = (sides[0].heap.items.len() > sides[1].heap.items.len()) as usize;
-        let (left, right) = sides.split_at_mut(1);
-        let (near, far) = if this == 0 { (&mut left[0], &right[0]) } else { (&mut right[0], &left[0]) };
-        let (d, u) = near.heap.pop().unwrap();
-        let (dist, other) = (near.dist.as_mut().unwrap(), far.dist.as_ref().unwrap());
-        // Any path through a node this far out already costs at least `best` once the far side's
-        // frontier is added, so those nodes need not be pushed at all.
-        let far_top = far.heap.items[0].0;
-        if d > dist.get(u) {
+        let side = (search.heaps[0].items.len() > search.heaps[1].items.len()) as usize;
+        let far_top = if side == 0 { dist1 } else { dist0 };
+        let item = search.heaps[side].pop();
+        let (dist, node) = (item >> NODE_BITS, (item & NODE_MASK) as u32);
+        if dist > unsafe { (*search.labels.entry(node))[side] } & NO_DIST {
             continue;
         }
-        let graph = graphs[this];
-        let begin = graph.offsets[u as usize] as usize;
-        let end = graph.offsets[u as usize + 1] as usize;
-        for &(v, w) in &graph.edges[begin..end] {
-            let next = d + w as u64;
-            if next + far_top < best && dist.improve(v, next) {
-                let across = other.get(v);
-                if across != u64::MAX {
-                    best = best.min(next + across);
-                }
-                unsafe {
-                    let offset = graph.offsets.as_ptr().add(v as usize).cast::<i8>();
-                    std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(offset);
-                }
-                near.heap.push((next, v));
+        let graph = &graphs[side];
+        for slot in unsafe { graph.slots.get_unchecked(node as usize * SLOTS..(node as usize + 1) * SLOTS) } {
+            let entry = slot.load(Relaxed);
+            if entry == 0 {
+                break;
             }
+            let (head, weight) = ((entry >> WEIGHT_BITS) - 1, entry & ESCAPE);
+            if weight == ESCAPE {
+                let mut at = head as usize;
+                while graph.side_list[at].0 != LIST_END {
+                    let (head, weight) = graph.side_list[at];
+                    relax(search, side, graph, head, dist + weight as u64, far_top, &mut best);
+                    at += 1;
+                }
+                break;
+            }
+            relax(search, side, graph, head, dist + weight as u64, far_top, &mut best);
         }
     }
     if best == u64::MAX { -1 } else { best as i64 }
 }
 
 fn main() {
-    unsafe { mallopt(M_MMAP_THRESHOLD, 1 << 16) };
     let file = File::open("/data/graph.txt").unwrap();
     let size = file.metadata().unwrap().len() as usize;
     let input = map_input(&file, size);
@@ -464,24 +416,23 @@ fn main() {
         queries.push((s as u32, t as u32));
     }
 
-    // Partitions need at most PARTITIONS ranges of at most 2^16 nodes.
-    let bits = usize::BITS - n.max(1).leading_zeros();
-    let shift = bits.saturating_sub(PARTITIONS.trailing_zeros()).max(1);
-    assert!(shift <= 16);
-    let parsed = parse_edges(input, start, shift, threads);
-    let forward = build_graph(parsed, n, shift, threads);
-    let backward = build_graph(reverse_edges(&forward, n, shift, threads), n, shift, threads);
+    let (forward, backward) = (zeroed_slots(n * SLOTS), zeroed_slots(n * SLOTS));
+    let [loose_forward, loose_backward] = read_edges(input, start, [forward, backward], threads);
+    let graphs = std::thread::scope(|scope| {
+        let handle = scope.spawn(|| finish_graph(backward, loose_backward));
+        [finish_graph(forward, loose_forward), handle.join().unwrap()]
+    });
 
     let answers: Vec<AtomicI64> = queries.iter().map(|_| AtomicI64::new(0)).collect();
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| {
-                let mut sides = [Side::default(), Side::default()];
+                let mut search = Search { labels: Labels::new(), heaps: [Heap::default(), Heap::default()] };
                 loop {
                     let q = next.fetch_add(1, Relaxed);
                     let Some(&(s, t)) = queries.get(q) else { return };
-                    answers[q].store(shortest_path([&forward, &backward], s, t, &mut sides), Relaxed);
+                    answers[q].store(shortest_path(&graphs, s, t, &mut search), Relaxed);
                 }
             });
         }
