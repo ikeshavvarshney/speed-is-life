@@ -108,19 +108,38 @@ fn mum(a: u64, b: u64) -> u64 {
     product as u64 ^ (product >> 64) as u64
 }
 
+const LOW_BYTES: [u8; 64] = {
+    let mut table = [0u8; 64];
+    let mut i = 0;
+    while i < 32 {
+        table[i] = 0xFF;
+        i += 1;
+    }
+    table
+};
+
+// Names vary in length, so a loop per word mispredicts constantly. Up to 32 bytes are masked and
+// mixed at a fixed cost. Longer names, which are rare, loop over the rest.
 #[inline(always)]
 fn hash_name(p: *const u8, len: usize) -> u64 {
-    let mut h = len as u64 ^ 0x2D35_8DCC_AA6C_78A5;
-    let mut i = 0;
-    while i + 8 <= len {
-        h = mum(h ^ load64(unsafe { p.add(i) }), 0x8BB8_4B93_962E_ACC9);
-        i += 8;
+    unsafe {
+        let mask = _mm256_loadu_si256(LOW_BYTES.as_ptr().add(32 - len.min(32)).cast());
+        let bytes = _mm256_and_si256(_mm256_loadu_si256(p.cast()), mask);
+        let word0 = _mm256_extract_epi64::<0>(bytes) as u64;
+        let word1 = _mm256_extract_epi64::<1>(bytes) as u64;
+        let word2 = _mm256_extract_epi64::<2>(bytes) as u64;
+        let word3 = _mm256_extract_epi64::<3>(bytes) as u64;
+        let mut h = mum(word0 ^ 0x2D35_8DCC_AA6C_78A5, word1 ^ 0x8BB8_4B93_962E_ACC9)
+            ^ mum(word2 ^ 0x4B33_A62E_D433_D4A3, word3 ^ len as u64 ^ 0xC2B2_AE3D_27D4_EB4F);
+        let mut i = 32;
+        while i < len {
+            let left = len - i;
+            let word = load64(p.add(i)) & if left >= 8 { u64::MAX } else { (1u64 << (left * 8)) - 1 };
+            h = mum(h ^ word, 0x8BB8_4B93_962E_ACC9);
+            i += 8;
+        }
+        mum(h, 0x9E37_79B9_7F4A_7C15).max(1)
     }
-    if i < len {
-        let tail = load64(unsafe { p.add(i) }) & ((1u64 << ((len - i) * 8)) - 1);
-        h = mum(h ^ tail, 0x4B33_A62E_D433_D4A3);
-    }
-    mum(h, 0x9E37_79B9_7F4A_7C15).max(1)
 }
 
 // Lock-free table of 64-bit name hashes, whose slot number is the name's id. Comparing hashes
