@@ -34,72 +34,19 @@ fn load64(p: *const u8) -> u64 {
     unsafe { p.cast::<u64>().read_unaligned() }
 }
 
-// Decodes digits up to the next delimiter. Only digits have bit 4 set among the bytes that can
-// follow a number, so up to seven digits take a branch-free SWAR path.
 #[inline(always)]
-fn parse_digits(p: *const u8) -> (u64, *const u8) {
-    let word = load64(p);
-    let stop = !word & 0x1010_1010_1010_1010;
-    if stop == 0 {
-        let (mut value, mut p) = (0u64, p);
-        unsafe {
-            while (*p).is_ascii_digit() {
-                value = value * 10 + (*p - b'0') as u64;
-                p = p.add(1);
-            }
-        }
-        return (value, p);
-    }
-    let len = stop.trailing_zeros() as usize / 8;
-    let digits = (word << ((8 - len) * 8)) & 0x0F0F_0F0F_0F0F_0F0F;
+fn swar(word: u64) -> u64 {
+    let digits = word & 0x0F0F_0F0F_0F0F_0F0F;
     let pairs = digits.wrapping_mul(2561) >> 8;
     let quads = (pairs & 0x00FF_00FF_00FF_00FF).wrapping_mul(6553601) >> 16;
-    let value = (quads & 0x0000_FFFF_0000_FFFF).wrapping_mul(42949672960001) >> 32;
-    (value, unsafe { p.add(len) })
+    (quads & 0x0000_FFFF_0000_FFFF).wrapping_mul(42949672960001) >> 32
 }
 
-// Returns the closing quote of a quoted field and how many "" pairs it held. Each pair is two
-// raw bytes but one value byte, so lengths need no unescaping.
+// Decodes up to eight digits that end just before `end`. Field lengths are known from the
+// structural masks, so there is no scan and no branch on the number of digits.
 #[inline(always)]
-fn scan_quoted(mut p: *const u8) -> (*const u8, usize) {
-    let mut escapes = 0;
-    unsafe {
-        let quotes = _mm256_set1_epi8(b'"' as i8);
-        loop {
-            let chunk = _mm256_loadu_si256(p.cast());
-            let mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, quotes)) as u32;
-            if mask == 0 {
-                p = p.add(32);
-                continue;
-            }
-            let quote = p.add(mask.trailing_zeros() as usize);
-            if *quote.add(1) != b'"' {
-                return (quote, escapes);
-            }
-            escapes += 1;
-            p = quote.add(2);
-        }
-    }
-}
-
-// Reads a text field at `p`. Returns its raw start, raw length, value length and the delimiter.
-#[inline(always)]
-fn read_text(p: *const u8) -> (*const u8, usize, usize, *const u8) {
-    unsafe {
-        if *p == b'"' {
-            let start = p.add(1);
-            let (end, escapes) = scan_quoted(start);
-            let raw = end.offset_from(start) as usize;
-            (start, raw, raw - escapes, end.add(1))
-        } else {
-            let mut end = p;
-            while *end != b',' {
-                end = end.add(1);
-            }
-            let raw = end.offset_from(p) as usize;
-            (p, raw, raw, end)
-        }
-    }
+fn digits_before(end: *const u8, len: usize) -> u64 {
+    swar(load64(unsafe { end.sub(8) }) & (u64::MAX << ((8 - len) * 8)))
 }
 
 #[inline(always)]
@@ -138,7 +85,7 @@ fn hash_name(p: *const u8, len: usize) -> u64 {
             h = mum(h ^ word, 0x8BB8_4B93_962E_ACC9);
             i += 8;
         }
-        mum(h, 0x9E37_79B9_7F4A_7C15).max(1)
+        mum(h, 0x9E37_79B9_7F4A_7C15) | 1
     }
 }
 
@@ -163,7 +110,7 @@ impl Names {
 
     #[inline(always)]
     fn prefetch(&self, hash: u64) {
-        let slot = self.slots[(hash >> self.shift) as usize].as_ptr();
+        let slot = unsafe { self.slots.get_unchecked((hash >> self.shift) as usize) }.as_ptr();
         unsafe { _mm_prefetch::<_MM_HINT_T0>(slot as *const i8) };
     }
 
@@ -231,26 +178,30 @@ struct Regions {
     codes: Vec<[u8; 3]>,
 }
 
-// by_id holds 1 + the country's index, and 0 for anything unknown. Ids are listed ascending, so
-// the last line sizes the table. Countries fit u8: the spec has 240 of them.
+// by_id holds 1 + the country's index, and 0 for anything unknown. Its last entry stays 0 and
+// stands for every id above the table.
 fn load_regions() -> Regions {
     let data = std::fs::read("/data/regions.csv").unwrap();
     let last = data[..data.len() - 1].iter().rposition(|&b| b == b'\n').unwrap() + 1;
-    let (max_id, _) = parse_digits(data[last..].as_ptr());
-    let mut by_id = vec![0u8; max_id as usize + 1];
+    let max_id = data[last..].iter().take_while(|b| b.is_ascii_digit()).fold(0usize, |v, b| v * 10 + (b - b'0') as usize);
+    let mut by_id = vec![0u8; max_id + 2];
     let mut seen = vec![0u8; 26 * 26 * 26];
     let mut codes = Vec::with_capacity(255);
     let mut i = data.iter().position(|&b| b == b'\n').unwrap() + 1;
     while i < data.len() {
-        let (id, comma) = parse_digits(unsafe { data.as_ptr().add(i) });
-        let at = unsafe { comma.offset_from(data.as_ptr()) } as usize + 1;
+        let mut id = 0usize;
+        while data[i] != b',' {
+            id = id * 10 + (data[i] - b'0') as usize;
+            i += 1;
+        }
+        let at = i + 1;
         let code = [data[at], data[at + 1], data[at + 2]];
         let key = code.iter().fold(0, |k, &c| k * 26 + (c - b'A') as usize);
         if seen[key] == 0 {
             codes.push(code);
             seen[key] = codes.len() as u8;
         }
-        by_id[id as usize] = seen[key];
+        by_id[id] = seen[key];
         i = at + 4;
     }
     Regions { by_id, codes }
@@ -264,105 +215,150 @@ struct Shared {
 }
 unsafe impl Sync for Shared {}
 
-const PIPE: usize = 16;
-const NO_COUNTRY: u32 = u32::MAX;
+const BLOCKS: usize = 16;
+// A record is at least 11 bytes, of which 5 are structural.
+const MAX_MARKS: usize = BLOCKS * 64 + 64;
+const MAX_RECORDS: usize = MAX_MARKS / 5 + 1;
 
-// Name lookups and bitset writes are random accesses that miss cache on nearly every record. Each
-// is prefetched here and performed PIPE records later, so the misses overlap instead of stalling.
-struct Pipe {
-    names: [(u64, u32); PIPE],
-    bits: [(u32, u64); PIPE],
-    head: usize,
+// One 64-byte block as bitmasks: quotes, and commas or LFs outside quotes. A carry-less multiply
+// by all ones is a running XOR of the quote bits, so it marks exactly the bytes inside quotes;
+// a "" pair toggles twice and leaves the state alone.
+#[inline(always)]
+unsafe fn block_masks(p: *const u8, inside: &mut u64) -> (u64, u64) {
+    unsafe {
+        let finder = _mm256_setr_epi8(
+            -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0x0A, -1, 0x2C, -1, -1, -1,
+            -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0x0A, -1, 0x2C, -1, -1, -1,
+        );
+        let quote = _mm256_set1_epi8(b'"' as i8);
+        let (a, b) = (_mm256_loadu_si256(p.cast()), _mm256_loadu_si256(p.add(32).cast()));
+        let mask = |x, y| _mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y)) as u32 as u64;
+        let quotes = mask(a, quote) | mask(b, quote) << 32;
+        let seps = mask(_mm256_shuffle_epi8(finder, a), a) | mask(_mm256_shuffle_epi8(finder, b), b) << 32;
+        let q = _mm_set_epi64x(0, quotes as i64);
+        let running = _mm_cvtsi128_si64(_mm_clmulepi64_si128::<0>(q, _mm_set1_epi8(-1))) as u64 ^ *inside;
+        *inside = ((running as i64) >> 63) as u64;
+        (quotes, seps & !running)
+    }
 }
 
-impl Pipe {
-    fn new() -> Self {
-        Self { names: [(0, NO_COUNTRY); PIPE], bits: [(0, 0); PIPE], head: 0 }
-    }
+#[derive(Clone, Copy, Default)]
+struct Rec {
+    id: u32,
+    region: u32,
+    amount: i32,
+    name_len: u32,
+    note_len: u32,
+    bit: u32,
+    hash: u64,
+}
 
-    #[inline(always)]
-    fn step(&mut self, shared: &Shared, hash: u64, country: u32) {
-        let head = self.head;
-        self.head = (head + 1) % PIPE;
-        let (old_hash, old_country) = self.names[head];
-        self.names[head] = (hash, country);
-        if country != NO_COUNTRY && hash != 0 {
-            shared.names.prefetch(hash);
-        }
-        if old_country == NO_COUNTRY {
-            return;
-        }
-        // One bitset per country over name ids. Bit 0 is the empty name, however it was quoted.
-        let bit = if old_hash == 0 { 0 } else { shared.names.intern(old_hash) + 1 };
-        let word = old_country as usize * shared.words + bit / 64;
-        unsafe {
-            _mm_prefetch::<_MM_HINT_T0>(shared.bits.as_ptr().add(word).cast());
-        }
-        let (old_word, old_mask) = self.bits[head];
-        self.bits[head] = (word as u32, 1u64 << (bit % 64));
-        Self::set(shared, old_word, old_mask);
-    }
-
-    #[inline(always)]
-    fn set(shared: &Shared, word: u32, mask: u64) {
-        if mask != 0 {
-            let word = unsafe { shared.bits.get_unchecked(word as usize) };
-            if word.load(Relaxed) & mask == 0 {
-                word.fetch_or(mask, Relaxed);
-            }
-        }
-    }
-
-    fn drain(&mut self, shared: &Shared) {
-        for _ in 0..PIPE {
-            self.step(shared, 0, NO_COUNTRY);
-        }
-        for i in 0..PIPE {
-            let (word, mask) = self.bits[i];
-            Self::set(shared, word, mask);
-            self.bits[i] = (0, 0);
-        }
-    }
+// A quoted field holds q quotes: two delimiters and q/2 - 1 pairs, so its value is raw - q/2 - 1
+// bytes. An unquoted field here is always empty, with q = 0 and raw = 0.
+#[inline(always)]
+fn value_len(raw: u32, quotes: u32) -> u32 {
+    (raw - quotes / 2).saturating_sub(1)
 }
 
 fn parse_chunk(shared: &Shared, by_id: &[u8], first: usize, stop: usize, totals: &mut [Totals]) {
     let base = shared.input;
-    let mut pipe = Pipe::new();
-    let mut i = first;
-    while i < stop {
+    let last_region = by_id.len() as u64 - 1;
+    let mut marks = [0u32; MAX_MARKS];
+    let mut counts = [0u32; MAX_MARKS];
+    let mut recs = [Rec::default(); MAX_RECORDS];
+    let (mut block, mut filled, mut inside, mut seen) = (first, 0usize, 0u64, 0u32);
+    let mut start = first;
+    loop {
         unsafe {
-            let mut p = base.add(i);
-            if *p == BOM_FIRST {
-                p = p.add(3);
+            for _ in 0..BLOCKS {
+                let (quotes, mut seps) = block_masks(base.add(block), &mut inside);
+                let found = seps.count_ones() as usize;
+                let mut k = filled;
+                // Blocks hold about six marks. Writing eight every time beats a branch on the count.
+                loop {
+                    for _ in 0..8 {
+                        *marks.get_unchecked_mut(k) = block as u32 + seps.trailing_zeros();
+                        *counts.get_unchecked_mut(k) = seen + (quotes & (seps ^ seps.wrapping_sub(1))).count_ones();
+                        seps &= seps.wrapping_sub(1);
+                        k += 1;
+                    }
+                    if seps == 0 {
+                        break;
+                    }
+                }
+                filled += found;
+                seen += quotes.count_ones();
+                block += 64;
             }
-            let (id, comma) = parse_digits(p);
-            let (name, name_raw, name_len, comma) = read_text(comma.add(1));
-            let (_, _, note_len, comma) = read_text(comma.add(1));
-            let (region, comma) = parse_digits(comma.add(1));
-            let negative = *comma.add(1) == b'-';
-            let (whole, dot) = parse_digits(comma.add(1 + negative as usize));
-            let cents = (whole * 100
-                + (*dot.add(1) - b'0') as u64 * 10
-                + (*dot.add(2) - b'0') as u64) as i64;
-            let amount = if negative { -cents } else { cents };
-            let end = dot.add(3);
-            i = end.offset_from(base) as usize + 1 + (*end == b'\r') as usize;
-
-            let country = by_id.get(region as usize).copied().unwrap_or(0) as usize;
-            let total = totals.get_unchecked_mut(country);
-            total.count += 1;
-            total.id_sum += id;
-            total.amount_sum += amount;
-            total.amount_min = total.amount_min.min(amount);
-            total.amount_max = total.amount_max.max(amount);
-            total.name_bytes += name_len as u64;
-            total.note_bytes += note_len as u64;
-
-            let hash = if name_raw == 0 { 0 } else { hash_name(name, name_raw) };
-            pipe.step(shared, hash, country as u32);
+            let whole = filled / 5;
+            let mut n = 0;
+            let mut done = false;
+            for r in 0..whole {
+                if start >= stop {
+                    done = true;
+                    break;
+                }
+                let m = marks.as_ptr().add(r * 5);
+                let c = counts.as_ptr().add(r * 5);
+                let (c1, c2, c3, c4, lf) =
+                    (*m as usize, *m.add(1) as usize, *m.add(2) as usize, *m.add(3) as usize, *m.add(4) as usize);
+                let id_at = start + 3 * (*base.add(start) == BOM_FIRST) as usize;
+                let id = digits_before(base.add(c1), c1 - id_at);
+                let name_raw = (c2 - c1 - 1) as u32;
+                let note_raw = (c3 - c2 - 1) as u32;
+                let name_len = value_len(name_raw, *c.add(1) - *c);
+                let note_len = value_len(note_raw, *c.add(2) - *c.add(1));
+                let region = digits_before(base.add(c4), c4 - c3 - 1).min(last_region);
+                let end = lf - (*base.add(lf - 1) == b'\r') as usize;
+                let negative = *base.add(c4 + 1) == b'-';
+                let text = load64(base.add(end - 8)) & (u64::MAX << ((8 - (end - c4 - 1 - negative as usize)) * 8));
+                let cents = swar(text << 24) * 100 + ((text >> 48) & 15) * 10 + ((text >> 56) & 15);
+                let amount = if negative { -(cents as i32) } else { cents as i32 };
+                let hash = hash_name(base.add(c1 + 2), name_raw.saturating_sub(2) as usize);
+                _mm_prefetch::<_MM_HINT_T0>(by_id.as_ptr().add(region as usize).cast());
+                shared.names.prefetch(hash);
+                *recs.get_unchecked_mut(n) =
+                    Rec { id: id as u32, region: region as u32, amount, name_len, note_len, bit: 0, hash };
+                n += 1;
+                start = lf + 1;
+            }
+            // Group prefetching: each pass touches only what the pass before it prefetched, so the
+            // cache misses of a whole batch overlap instead of stalling one at a time.
+            for rec in recs[..n].iter_mut() {
+                let country = *by_id.get_unchecked(rec.region as usize) as usize;
+                let total = totals.get_unchecked_mut(country);
+                let amount = rec.amount as i64;
+                total.count += 1;
+                total.id_sum += rec.id as u64;
+                total.amount_sum += amount;
+                total.amount_min = total.amount_min.min(amount);
+                total.amount_max = total.amount_max.max(amount);
+                total.name_bytes += rec.name_len as u64;
+                total.note_bytes += rec.note_len as u64;
+                let bit = shared.names.intern(rec.hash);
+                let word = country * shared.words + bit / 64;
+                _mm_prefetch::<7>(shared.bits.as_ptr().add(word).cast());
+                rec.region = word as u32;
+                rec.bit = bit as u32 % 64;
+            }
+            for rec in recs[..n].iter() {
+                let word = shared.bits.get_unchecked(rec.region as usize);
+                let mask = 1u64 << rec.bit;
+                if word.load(Relaxed) & mask == 0 {
+                    word.fetch_or(mask, Relaxed);
+                }
+            }
+            if done || start >= stop {
+                return;
+            }
+            let left = filled - whole * 5;
+            for i in 0..left {
+                marks[i] = marks[whole * 5 + i];
+                counts[i] = counts[whole * 5 + i];
+            }
+            filled = left;
         }
     }
-    pipe.drain(shared);
 }
 
 // Past a chunk's start, the next record starts after an LF followed by a digit or BOM. Newlines
@@ -380,7 +376,7 @@ fn first_record(input: &[u8], off: usize) -> usize {
 
 fn run(input: &[u8], regions: &Regions, bits: u32, threads: usize) -> Option<(Vec<Totals>, Shared)> {
     let countries = regions.codes.len() + 1;
-    let words = ((1usize << bits) + 64) / 64;
+    let words = (1usize << bits) / 64;
     let shared = Shared {
         input: input.as_ptr(),
         names: Names::new(bits),
@@ -401,7 +397,9 @@ fn run(input: &[u8], regions: &Regions, bits: u32, threads: usize) -> Option<(Ve
                         }
                         let first = if off == 0 { header_end } else { first_record(input, off) };
                         let stop = (off + CHUNK).min(input.len());
-                        parse_chunk(&shared, &regions.by_id, first, stop, &mut totals);
+                        if first < stop {
+                            parse_chunk(&shared, &regions.by_id, first, stop, &mut totals);
+                        }
                     }
                 })
             })
