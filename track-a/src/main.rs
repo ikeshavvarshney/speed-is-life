@@ -3,12 +3,11 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::mem::MaybeUninit;
-use std::os::unix::fs::FileExt;
+use std::ffi::c_void;
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 const CHUNK: usize = 1 << 18;
-const MAX_LINE: usize = 256;
-const PAD: usize = 64;
 const HOURS: usize = 72;
 const TS_LEN: usize = 27;
 const ERR_FLAG: u16 = 1 << 15;
@@ -167,10 +166,8 @@ fn parse_latency(p: *const u8) -> (u32, *const u8) {
     (value as u32, unsafe { p.add(len + 1) })
 }
 
-fn parse_chunk(buf: &[u8], first: usize, limit: usize, end: usize, sink: &mut Worker) {
-    let base = buf.as_ptr();
+fn parse_chunk(base: *const u8, first: usize, stop: usize, sink: &mut Worker) {
     let mut i = first;
-    let stop = limit.min(end);
     while i < stop {
         unsafe {
             let line = base.add(i);
@@ -195,31 +192,46 @@ struct Worker {
     names: Interner,
 }
 
-fn parse_file(file: &File, size: usize, threads: usize) -> Vec<Worker> {
+// A file ending on a page boundary would fault on the vector loads near its end, so the file is
+// mapped over a slightly larger anonymous mapping that provides zeroed bytes after it.
+fn map_input(file: &File, size: usize) -> *const u8 {
+    const PROT_READ: i32 = 1;
+    const MAP_PRIVATE: i32 = 2;
+    const MAP_FIXED: i32 = 0x10;
+    const MAP_ANONYMOUS: i32 = 0x20;
+    unsafe {
+        let base = mmap(std::ptr::null_mut(), size + 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if size > 0 {
+            mmap(base, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, file.as_raw_fd(), 0);
+        }
+        base as *const u8
+    }
+}
+
+fn parse_file(base: *const u8, size: usize, threads: usize) -> Vec<Worker> {
     let next = AtomicUsize::new(0);
+    let input = Shared(base as *mut u8);
     std::thread::scope(|scope| {
         let workers: Vec<_> = (0..threads)
             .map(|_| {
-                scope.spawn(|| {
-                    let mut buf = vec![0u8; CHUNK + MAX_LINE + PAD + 1];
+                let (next, input) = (&next, &input);
+                scope.spawn(move || {
                     let mut sink = Worker {
                         buckets: (0..HOURS).map(|_| Bucket::default()).collect(),
                         names: Interner::new(),
                     };
+                    let bytes = unsafe { std::slice::from_raw_parts(input.0 as *const u8, size) };
                     loop {
                         let off = next.fetch_add(CHUNK, Relaxed);
                         if off >= size {
                             return sink;
                         }
-                        let begin = off.saturating_sub(1);
-                        let want = (off + CHUNK + MAX_LINE).min(size) - begin;
-                        file.read_exact_at(&mut buf[..want], begin as u64).unwrap();
                         let first = if off == 0 {
                             0
                         } else {
-                            buf[..want].iter().position(|&b| b == b'\n').unwrap() + 1
+                            off + bytes[off - 1..].iter().position(|&b| b == b'\n').unwrap()
                         };
-                        parse_chunk(&buf, first, off + CHUNK - begin, want, &mut sink);
+                        parse_chunk(input.0, first, (off + CHUNK).min(size), &mut sink);
                     }
                 })
             })
@@ -344,6 +356,7 @@ unsafe extern "C" {
     #[link_name = "_exit"]
     fn exit(code: i32) -> !;
     fn mallopt(param: i32, value: i32) -> i32;
+    fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
 }
 
 const M_MMAP_THRESHOLD: i32 = -3;
@@ -353,7 +366,7 @@ fn main() {
     let file = File::open("/data/requests.log").unwrap();
     let size = file.metadata().unwrap().len() as usize;
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let mut parsed = parse_file(&file, size, threads);
+    let mut parsed = parse_file(map_input(&file, size), size, threads);
 
     let name_tables: Vec<Interner> = parsed
         .iter_mut()
