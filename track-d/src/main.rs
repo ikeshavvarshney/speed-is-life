@@ -3,7 +3,7 @@ use std::fs::File;
 use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering::Relaxed};
 
 const CHUNK: usize = 1 << 18;
 const PARTITIONS: usize = 64;
@@ -97,16 +97,10 @@ impl Bucket {
 struct Graph {
     offsets: Vec<u32>,
     edges: Vec<(u32, u32)>,
-    has_in: Vec<AtomicU64>,
 }
 
 struct Shared<T>(*mut T);
 unsafe impl<T> Sync for Shared<T> {}
-
-fn zeroed_atomics(len: usize) -> Vec<AtomicU64> {
-    let mut zeros = std::mem::ManuallyDrop::new(vec![0u64; len]);
-    unsafe { Vec::from_raw_parts(zeros.as_mut_ptr().cast(), len, len) }
-}
 
 // Sorts edges into node ranges as they are parsed, so that the graph can then be built one range
 // at a time by a single thread, inside its cache, with no shared counters.
@@ -151,7 +145,7 @@ fn parse_edges(input: &'static [u8], start: usize, shift: u32, threads: usize) -
     })
 }
 
-fn build_graph(parsed: Vec<Vec<Bucket>>, n: usize, shift: u32, wanted: &[u64], threads: usize) -> Graph {
+fn build_graph(parsed: Vec<Vec<Bucket>>, n: usize, shift: u32, threads: usize) -> Graph {
     let mut partitions: Vec<Vec<Bucket>> = (0..PARTITIONS).map(|_| Vec::with_capacity(threads)).collect();
     for buckets in parsed {
         for (p, bucket) in buckets.into_iter().enumerate() {
@@ -166,14 +160,13 @@ fn build_graph(parsed: Vec<Vec<Bucket>>, n: usize, shift: u32, wanted: &[u64], t
     let tasks: Vec<Mutex<Vec<Bucket>>> = partitions.into_iter().map(Mutex::new).collect();
     let mut offsets = vec![0u32; n + 1];
     let mut edges = vec![(0u32, 0u32); total];
-    let has_in = zeroed_atomics(n / 64 + 1);
     let offsets_ptr = Shared(offsets.as_mut_ptr());
     let edges_ptr = Shared(edges.as_mut_ptr());
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         for _ in 0..threads {
-            let (next, tasks, bases, has_in, offsets_ptr, edges_ptr) =
-                (&next, &tasks, &bases, &has_in, &offsets_ptr, &edges_ptr);
+            let (next, tasks, bases, offsets_ptr, edges_ptr) =
+                (&next, &tasks, &bases, &offsets_ptr, &edges_ptr);
             scope.spawn(move || {
                 let mut cursors = vec![0u32; 1 << shift];
                 loop {
@@ -207,10 +200,6 @@ fn build_graph(parsed: Vec<Vec<Bucket>>, n: usize, shift: u32, wanted: &[u64], t
                                 let cursor = &mut cursors[edge.tail as usize];
                                 unsafe { *edges_ptr.0.add(*cursor as usize) = (head, weight) };
                                 *cursor += 1;
-                                let node = head as usize;
-                                if wanted[node / 64] >> (node % 64) & 1 != 0 {
-                                    has_in[node / 64].fetch_or(1 << (node % 64), Relaxed);
-                                }
                             }
                         }
                     }
@@ -219,7 +208,38 @@ fn build_graph(parsed: Vec<Vec<Bucket>>, n: usize, shift: u32, wanted: &[u64], t
         }
     });
     offsets[n] = total as u32;
-    Graph { offsets, edges, has_in }
+    Graph { offsets, edges }
+}
+
+fn reverse_edges(graph: &Graph, n: usize, shift: u32, threads: usize) -> Vec<Vec<Bucket>> {
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                let next = &next;
+                scope.spawn(move || {
+                    let mut buckets: Vec<Bucket> = (0..PARTITIONS).map(|_| Bucket::default()).collect();
+                    loop {
+                        let first = next.fetch_add(1 << shift, Relaxed);
+                        if first >= n {
+                            return buckets;
+                        }
+                        for node in first..(first + (1 << shift)).min(n) {
+                            let begin = graph.offsets[node] as usize;
+                            for &(head, weight) in &graph.edges[begin..graph.offsets[node + 1] as usize] {
+                                buckets[(head >> shift) as usize].push(Edge {
+                                    tail: (head & ((1 << shift) - 1)) as u16,
+                                    head: node as u32,
+                                    weight,
+                                });
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        workers.into_iter().map(|w| w.join().unwrap()).collect()
+    })
 }
 
 // Open-addressing node-to-distance map. Most searches settle few nodes, so a small table stays in
@@ -356,39 +376,56 @@ impl Heap {
     }
 }
 
-fn shortest_path(graph: &Graph, s: u32, t: u32, dist: &mut Distances, heap: &mut Heap) -> i64 {
+#[derive(Default)]
+struct Side {
+    dist: Option<Distances>,
+    heap: Heap,
+}
+
+// Bidirectional Dijkstra: two balls of half the radius settle far fewer nodes than one. An empty
+// heap means that side reached everything it can, so unreachable targets end immediately.
+fn shortest_path(graphs: [&Graph; 2], s: u32, t: u32, sides: &mut [Side; 2]) -> i64 {
     if s == t {
         return 0;
     }
-    // Without this, a target nothing points to would make the search settle the whole graph.
-    if graph.has_in[t as usize / 64].load(Relaxed) >> (t % 64) & 1 == 0 {
-        return -1;
+    for (side, start) in sides.iter_mut().zip([s, t]) {
+        let dist = side.dist.get_or_insert_with(Distances::new);
+        dist.reset();
+        dist.improve(start, 0);
+        side.heap.items.clear();
+        side.heap.push((0, start));
     }
-    dist.reset();
-    heap.items.clear();
-    dist.improve(s, 0);
-    heap.push((0, s));
-    let mut bound = u64::MAX;
-    while let Some((d, u)) = heap.pop() {
-        if u == t {
-            return d as i64;
+    let mut best = u64::MAX;
+    loop {
+        let (Some(&top0), Some(&top1)) = (sides[0].heap.items.first(), sides[1].heap.items.first()) else {
+            break;
+        };
+        if top0.0 + top1.0 >= best {
+            break;
         }
+        let this = (sides[0].heap.items.len() > sides[1].heap.items.len()) as usize;
+        let (left, right) = sides.split_at_mut(1);
+        let (near, far) = if this == 0 { (&mut left[0], &right[0]) } else { (&mut right[0], &left[0]) };
+        let (d, u) = near.heap.pop().unwrap();
+        let (dist, other) = (near.dist.as_mut().unwrap(), far.dist.as_ref().unwrap());
         if d > dist.get(u) {
             continue;
         }
+        let graph = graphs[this];
         let begin = graph.offsets[u as usize] as usize;
         let end = graph.offsets[u as usize + 1] as usize;
         for &(v, w) in &graph.edges[begin..end] {
             let next = d + w as u64;
-            if next < bound && dist.improve(v, next) {
-                if v == t {
-                    bound = next;
+            if next < best && dist.improve(v, next) {
+                let across = other.get(v);
+                if across != u64::MAX {
+                    best = best.min(next + across);
                 }
-                heap.push((next, v));
+                near.heap.push((next, v));
             }
         }
     }
-    -1
+    if best == u64::MAX { -1 } else { best as i64 }
 }
 
 fn main() {
@@ -404,13 +441,11 @@ fn main() {
 
     let text = std::fs::read("/data/queries.txt").unwrap();
     let mut queries = Vec::with_capacity(text.len() / 12);
-    let mut wanted = vec![0u64; n / 64 + 1];
     let mut i = 0;
     while i < text.len() {
         let (s, p) = parse_digits(unsafe { text.as_ptr().add(i) });
         let (t, p) = parse_digits(unsafe { p.add(1) });
         i = unsafe { p.offset_from(text.as_ptr()) } as usize + 1;
-        wanted[t as usize / 64] |= 1 << (t % 64);
         queries.push((s as u32, t as u32));
     }
 
@@ -419,19 +454,19 @@ fn main() {
     let shift = bits.saturating_sub(PARTITIONS.trailing_zeros()).max(1);
     assert!(shift <= 16);
     let parsed = parse_edges(input, start, shift, threads);
-    let graph = build_graph(parsed, n, shift, &wanted, threads);
+    let forward = build_graph(parsed, n, shift, threads);
+    let backward = build_graph(reverse_edges(&forward, n, shift, threads), n, shift, threads);
 
     let answers: Vec<AtomicI64> = queries.iter().map(|_| AtomicI64::new(0)).collect();
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| {
-                let mut dist = Distances::new();
-                let mut heap = Heap::default();
+                let mut sides = [Side::default(), Side::default()];
                 loop {
                     let q = next.fetch_add(1, Relaxed);
                     let Some(&(s, t)) = queries.get(q) else { return };
-                    answers[q].store(shortest_path(&graph, s, t, &mut dist, &mut heap), Relaxed);
+                    answers[q].store(shortest_path([&forward, &backward], s, t, &mut sides), Relaxed);
                 }
             });
         }
