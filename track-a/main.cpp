@@ -413,7 +413,7 @@ static double pass(const Case &c, int fd, size_t size, double *cycles) {
 }
 static void run_all(int fd, size_t size) {
   int shift = 0;
-  for (const char *want : {"none", "p192", "p1024", "p192p1024"}) {
+  for (const char *want : {"none", "p192", "p1024", "b4k"}) {
     for (const Case &c : cases)
       if (!strcmp(c.name, want)) {
         double best = 1e18, cyc = 0;
@@ -422,7 +422,7 @@ static void run_all(int fd, size_t size) {
           if (v < best) { best = v; cyc = cy; }
         }
         fprintf(stderr, "%s wall %.2f ms, %.1f cycles per line per worker\n", c.name, best, cyc);
-        long x = (long)((best - 3) / 0.1 + 0.5);
+        long x = (long)((best - 6) / 0.25 + 0.5);
         x = x < 0 ? 0 : x > 63 ? 63 : x;
         code |= (u64)x << shift;
         shift += 6;
