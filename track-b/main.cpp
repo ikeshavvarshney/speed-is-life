@@ -154,10 +154,13 @@ INLINE v4 held(int byte) {
 }
 
 // Calls `visit` with each token of the line at `p`, and returns what follows its
-// newline. One classification covers 64 bytes, and tokens then come straight from
-// bit masks. A window restarts at a token that runs past its end, so tokens never
-// need joining up. Documents and query lines are both read this way.
-template <class F> INLINE const u8 *scan_line(const u8 *p, F &&visit) {
+// newline. One classification covers 64 bytes, and the bit mask of where tokens start
+// and end goes through a table a byte at a time, with no branch. A branch per token
+// would be mispredicted once per window, as their number varies, which costs more than
+// this does. Tokens are then read in one long loop. `edges` needs room for the line's
+// edges, and 8 more. Documents and query lines are both read this way.
+template <class F>
+INLINE const u8 *scan_line(const u8 *p, u32 *edges, F &&visit) {
   const v4 lower = held(0x20), letter_add = held(127 - 'z'), digit_add = held(127 - '9');
   const v4 letter_top = held(127 - 26), digit_top = held(127 - 10), newline = held('\n');
   // Adding moves each range to the top of the signed bytes, where one compare finds
@@ -168,37 +171,40 @@ template <class F> INLINE const u8 *scan_line(const u8 *p, F &&visit) {
     return _mm256_movemask_epi8(_mm256_or_si256(_mm256_cmpgt_epi8(letter, letter_top),
                                                 _mm256_cmpgt_epi8(digit, digit_top)));
   };
-  for (;;) {
-    v4 first = load(p), second = load(p + 32);
+  const v4 eight = _mm256_set1_epi32(8);
+  u32 *edge = edges;
+  u64 newlines = 0, carry = 0;
+  size_t at = 0;
+  for (;; at += 64) {
+    v4 first = load(p + at), second = load(p + at + 32);
     u64 tokens = token_mask(first) | (u64)token_mask(second) << 32;
     v4 low = _mm256_cmpeq_epi8(first, newline);
     v4 high = _mm256_cmpeq_epi8(second, newline);
     v4 any = _mm256_or_si256(low, high);
-    u64 newlines = 0;
     // Most windows hold no newline, and those need no bit mask of them.
     if (!_mm256_testz_si256(any, any)) {
       newlines = (u32)_mm256_movemask_epi8(low) |
                  (u64)_mm256_movemask_epi8(high) << 32;
       tokens &= newlines - 1;
     }
-    u64 starts = tokens & ~(tokens << 1), ends = ~tokens & (tokens << 1);
-    for (; ends; starts &= starts - 1, ends &= ends - 1) {
-      u64 start = _tzcnt_u64(starts);
-      visit(p + start, token_hash(p + start, start - _tzcnt_u64(ends)));
+    u64 changes = tokens ^ (tokens << 1 | carry);
+    carry = tokens >> 63;
+    v4 base = _mm256_set1_epi32(at);
+    for (int byte = 0; byte < 8; byte++, changes >>= 8) {
+      u32 bits = changes & 255;
+      v4 order = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const v2 *)(lane_orders + bits)));
+      store(edge, _mm256_add_epi32(order, base));
+      edge += __builtin_popcount(bits);
+      base = _mm256_add_epi32(base, eight);
     }
     if (newlines)
-      return p + _tzcnt_u64(newlines) + 1;
-    if (starts == 1) {
-      const u8 *start = p;
-      p += 64;
-      // No library call here: it would clobber the constants this loop keeps in registers.
-      while ((u8)((*p | 0x20) - 0x61) < 26 || (u8)(*p - 0x30) < 10)
-        p++;
-      visit(start, long_token_hash(start, p - start));
-    } else {
-      p += _tzcnt_u64(starts);
-    }
+      break;
   }
+  for (const u32 *e = edges; e < edge; e += 2) {
+    const u8 *start = p + e[0];
+    visit(start, token_hash(start, (long)e[0] - e[1]));
+  }
+  return p + at + _tzcnt_u64(newlines) + 1;
 }
 
 INLINE u32 parse_id(const u8 *&p) {
@@ -349,7 +355,7 @@ static void find_query_chunks() {
   chunks = bounds.size() - 1;
 }
 
-static void read_chunk(size_t c) {
+static void read_chunk(size_t c, u32 *edges) {
   size_t from = bounds[c] / 2;
   QueryChunk &chunk = query_chunks[c];
   chunk = {query_lines + from, query_slots + from, query_lengths + from,
@@ -360,7 +366,7 @@ static void read_chunk(size_t c) {
     u32 op = OP_AND;
     if (is_bool)
       chunk.line_words++;
-    p = scan_line(p, [&](const u8 *word, u64 hash) {
+    p = scan_line(p, edges, [&](const u8 *word, u64 hash) {
       if (is_bool) {
         if (index % 2)
           chunk.lines[chunk.line_words++] = draft.intern(hash) << OP_BITS | op;
@@ -470,11 +476,12 @@ static u16 *claim_log_block(size_t partition) {
 // The passes over a document are separate functions, so each loop has the registers for
 // its own constants: inlined together, the compiler rebuilds them in every iteration.
 // Each lookup is prefetched as soon as its hash is known, so memory arrives in time.
-[[gnu::noinline]] static const u8 *hash_tokens(const u8 *p, u64 *tokens, size_t &count) {
+[[gnu::noinline]] static const u8 *hash_tokens(const u8 *p, u32 *edges, u64 *tokens,
+                                               size_t &count) {
   const u64 *slots = table.slots;
   const size_t mask = table.mask;
   u64 *token = tokens;
-  p = scan_line(p, [&](const u8 *, u64 hash) {
+  p = scan_line(p, edges, [&](const u8 *, u64 hash) {
     _mm_prefetch(slots + (hash & mask), _MM_HINT_T0);
     *token++ = hash;
   });
@@ -606,7 +613,7 @@ static void parse_docs(Scratch &scratch) {
       }
       size_t count;
       tokens[0] = 0;
-      p = hash_tokens(p, tokens + 1, count);
+      p = hash_tokens(p, scratch.ids, tokens + 1, count);
       tokens[count + 1] = 0;
       look_up(tokens, scratch.ids, count);
       sort_by_kind(scratch, count, doc);
@@ -1080,11 +1087,11 @@ static void work(int t) {
   Scratch &scratch = scratches[t];
   size_t most = input_size / 2 + (1 << 16);
   scratch.tokens = (u64 *)reserve(most * 8);
-  scratch.ids = (u32 *)reserve(most * 4);
+  scratch.ids = (u32 *)reserve(most * 8);
   scratch.high_ids = (u32 *)reserve(most * 4);
   scratch.low_ids = (u32 *)reserve(most * 4);
   for (size_t c; (c = next_query.take()) < chunks;)
-    read_chunk(c);
+    read_chunk(c, scratch.ids);
   sync_all->arrive_and_wait();
   parse_docs(scratch);
   // Exit would otherwise clear the input's page tables page by page on one
