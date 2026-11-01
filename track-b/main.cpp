@@ -33,9 +33,8 @@ const size_t PAGE = 1 << 12, RELEASE_STEP = 1 << 22, PROBE_RATIO = 6;
 const size_t DENSE_LIMIT = 1 << 10;
 // A term this frequent among the queries is likely in over 1/32 of documents,
 // where a bitset is smaller than its list. The queries sample the corpus: phrases
-// are windows of documents, and boolean terms are drawn by band. More frequent
-// terms also go into the table first, from HOT_COUNT up.
-const u32 HIGH_COUNT = 25, HOT_COUNT = 4;
+// are windows of documents, and boolean terms are drawn by band.
+const u32 HIGH_COUNT = 25;
 
 // A table slot holds the high bits of the term's hash, its id and two flags.
 const int ID_BITS = 18, TAG_SHIFT = 20, PAIR_BITS = 20;
@@ -225,10 +224,10 @@ struct Draft {
   }
 };
 
-// The lookup table. Nearly every token needs just one load: frequent terms are
-// placed first, so they sit in their home slot. A home slot with no match answers
-// for all other tokens, unless its flag says that a term with this home went
-// elsewhere. The hit or miss itself is unpredictable, so no branch depends on it.
+// The lookup table. Nearly every token needs just one load: at this low load most
+// terms sit in their home slot. A home slot with no match answers for all other
+// tokens, unless its flag says that a term with this home went elsewhere. The hit or
+// miss itself is unpredictable, so no branch depends on it.
 struct Table {
   u64 *slots;
   size_t mask;
@@ -248,7 +247,6 @@ struct Table {
         return slots[at] & (NO_ID | ANCHOR);
     return NO_ID;
   }
-
 };
 
 struct Hit {
@@ -387,13 +385,11 @@ static void plan_index() {
   for (size_t at = 0; at < draft.len; at++)
     if (bool_seen[at])
       (seen(at) > HIGH_COUNT ? high_terms : low_terms)++;
-  vector<u32> ids(draft.len, NO_ID), hot, cold;
+  vector<u32> ids(draft.len, NO_ID);
   size_t next_high = 0, next_id = high_terms;
   for (size_t at = 0; at < draft.len; at++)
-    if (bool_seen[at]) {
+    if (bool_seen[at])
       ids[at] = seen(at) > HIGH_COUNT ? next_high++ : next_id++;
-      (seen(at) >= HOT_COUNT ? hot : cold).push_back(at);
-    }
 
   phrases.terms = query_hashes;
   phrases.starts.resize(phrase_count + 1);
@@ -416,10 +412,8 @@ static void plan_index() {
                   }) - list;
       u32 slot = list[at];
       phrase++;
-      if (ids[slot] == NO_ID) {
+      if (ids[slot] == NO_ID)
         ids[slot] = next_id++;
-        cold.push_back(slot);
-      }
       is_anchor[slot] = true;
       phrases.next_of_anchor[phrase] = phrases.first_of_anchor[ids[slot]];
       phrases.first_of_anchor[ids[slot]] = phrase;
@@ -438,11 +432,12 @@ static void plan_index() {
     });
   munmap(query_slots, text_size * 2);
   munmap(query_lengths, text_size * 2);
-  // Four times the size of the draft, which leaves few displaced terms.
+  // Four times the size of the draft, as a lookup that misses its home slot is costly:
+  // about 1% do at this size, 3% at half of it.
   size_t table_size = (draft.mask + 1) * 4;
   table = {(u64 *)huge_pages((table_size + TABLE_PADDING) * 8), table_size - 1};
-  for (auto *terms : {&hot, &cold})
-    for (u32 at : *terms)
+  for (size_t at = 0; at < draft.len; at++)
+    if (ids[at] != NO_ID)
       table.insert(draft.hashes[at].load(relaxed),
                    ids[at] | (is_anchor[at] ? ANCHOR : 0));
   free(draft.hashes);
