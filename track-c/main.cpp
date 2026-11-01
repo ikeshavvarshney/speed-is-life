@@ -359,6 +359,7 @@ static void worker(int index, std::barrier<> *barrier) {
     size_t first = off ? first_record(off)
                        : (const u8 *)memchr(input, '\n', input_size) - input + 1;
     size_t stop = std::min(off + CHUNK, input_size);
+    madvise((void *)(input + off), stop - off, 22); // MADV_POPULATE_READ
     if (first < stop)
       parse_chunk(first, stop, mine);
   }
