@@ -29,7 +29,7 @@ constexpr auto relaxed = std::memory_order_relaxed;
 #define LOW _mm256_castsi256_si128
 #define HIGH(v) _mm256_extracti128_si256(v, 1)
 
-const size_t CHUNK = 1 << 16, HOURS = 72, BLOCK = 256;
+const size_t CHUNK = 1 << 18, CLEAR_STEP = 1 << 23, HOURS = 72, BLOCK = 256;
 // The longest line in the spec's grammar is under this, so reading this much more
 // than a chunk gives every line that starts in it.
 const size_t LONGEST_LINE = 256;
@@ -72,6 +72,7 @@ alignas(64) static atomic<u64> stamps[HOURS];
 alignas(64) static atomic<size_t> cursors[HOURS];
 alignas(64) static atomic<u32 *> bases[HOURS];
 alignas(64) static atomic<size_t> next_chunk;
+alignas(64) static atomic<size_t> next_clear;
 // Guards the rest: how far parsing has got, which hours are over and taken, the free
 // regions and the turn to write.
 alignas(64) static std::mutex plan_lock;
@@ -87,6 +88,7 @@ alignas(64) static size_t input_size, capacity, chunk_count;
 static atomic<u32> *chunk_states;
 const u32 DONE = 1 << 31;
 static u32 *regions;
+static const u8 *input;
 static int out_fd;
 
 // A vector whose first `n` bytes are set, for n up to 128, then clear bytes.
@@ -222,9 +224,8 @@ struct Walk {
 
 INLINE void parse_line(Walk &walk, size_t &lowest, v4 space_vector) {
   const u8 *line = walk.line;
-  // The buffer was just copied into the second cache level, and misses in the first
-  // stall every load on this line, so the input ahead is brought in early.
-  _mm_prefetch((const char *)line + 256, _MM_HINT_T0);
+  // The hardware prefetcher stops at page boundaries.
+  _mm_prefetch((const char *)line + 1024, _MM_HINT_T0);
   // These bytes hold the month, day and hour. Nearly every line has the hour
   // of the line before it, as the file is the shards' chunks in arrival order.
   u64 now = load64(line + 5);
@@ -538,11 +539,6 @@ static size_t next_task() {
 
 static void worker() {
   u32 *heads[HOURS * 2] = {};
-  // Reading costs less than faulting the file in from one mapping that all threads
-  // share, which then also has to be unmapped page by page. Each thread has its own
-  // open file so that they don't share its reference count.
-  alignas(64) u8 buffer[CHUNK + LONGEST_LINE + 128];
-  int fd = open("/data/requests.log", O_RDONLY);
   for (;;) {
     size_t hour = next_task(), chunk;
     if (hour < HOURS) {
@@ -552,18 +548,19 @@ static void worker() {
       deliver(hour, text);
     } else if ((chunk = next_chunk.fetch_add(1, relaxed)) < chunk_count) {
       size_t off = chunk * CHUNK;
-      ssize_t got = pread(fd, buffer, CHUNK + LONGEST_LINE, off);
+      const u8 *start = input + off;
       // A chunk's lines are those that begin after its first byte, up to and including
       // the first byte of the next chunk.
-      const u8 *line = buffer;
-      if (off)
-        line = (const u8 *)memchr(buffer, '\n', got) + 1;
-      const u8 *end = buffer + std::min<size_t>(CHUNK + 1, got);
+      const u8 *line = off ? (const u8 *)memchr(start, '\n', LONGEST_LINE) + 1 : start;
+      const u8 *end = input + std::min(off + CHUNK + 1, input_size);
       u32 minute = 0;
       if (line < end)
         minute = hour_index(line) * 60 + line[14] * 10 + line[15] - 528;
       size_t lowest = parse_chunk(line, end, heads);
       chunk_states[chunk].store(DONE | lowest << 16 | minute, std::memory_order_release);
+    } else if (size_t off = next_clear.fetch_add(CLEAR_STEP, relaxed); off < input_size) {
+      // Exit would clear the input's page tables on one thread, with the clock running.
+      madvise((void *)(input + off), std::min(CLEAR_STEP, input_size - off), MADV_DONTNEED);
     } else if (hour > HOURS) {
       return;
     } else {
@@ -578,7 +575,12 @@ int main(int argc, char **) {
   // thread stack or a small mapping.
   prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
   memset(masks, 255, 128);
-  input_size = lseek(open("/data/requests.log", O_RDONLY), 0, SEEK_END);
+  int fd = open("/data/requests.log", O_RDONLY);
+  input_size = lseek(fd, 0, SEEK_END);
+  // Mapped over a larger anonymous mapping, so vector loads past the end stay readable.
+  input = (const u8 *)map_zeroed(input_size + (1 << 13));
+  if (input_size)
+    mmap((void *)input, input_size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
   cpu_set_t cpus;
   sched_getaffinity(0, sizeof cpus, &cpus);
   int workers = CPU_COUNT(&cpus);
