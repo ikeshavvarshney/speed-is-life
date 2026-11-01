@@ -8,7 +8,8 @@
 #include <string_view>
 #include <sys/mman.h>
 #include <sys/prctl.h>
-#include <thread>
+#include <pthread.h>
+#include <sched.h>
 #include <unistd.h>
 
 using u8 = unsigned char;
@@ -27,6 +28,9 @@ constexpr auto relaxed = std::memory_order_relaxed;
 const size_t WORKERS = 12;
 const size_t CHUNK = 1 << 18, CLEAR_STEP = 1 << 23, HOURS = 72, BLOCK = 256;
 const size_t SLOTS = 1 << 13, MAX_IDS = 1 << 11, NONE = -1;
+// The stack each thread gets, of which the top is real from the start. A pool of this
+// many regions of this size covers what the last hours need together.
+const size_t STACK = 1 << 16, STACK_TOUCHED = 1 << 14, POOL = 13, WARM = 376 << 10;
 // A log entry is id << 21 | is_error << 20 | latency. A latency that does not fit,
 // on about 1% of lines, puts BIG in the entry and takes the next slot whole. An
 // all-zero entry is an unused part of a block, and id 0 is reserved to absorb it.
@@ -44,7 +48,7 @@ alignas(64) static atomic<u64> table[SLOTS];
 static std::mutex names_lock;
 static u64 order[MAX_IDS];
 static size_t name_count, sorted, name_end;
-alignas(64) static char name_bytes[MAX_IDS * 128];
+static char *name_bytes;
 // Written by every thread, so kept off the lines that each line of input reads.
 alignas(64) static atomic<u64> stamps[HOURS];
 alignas(64) static atomic<size_t> cursors[HOURS];
@@ -61,7 +65,7 @@ static size_t grace;
 static u32 *pool[HOURS * 3];
 // What the thread that parsed a chunk leaves for planning the hours: its first line's
 // minute, its lowest hour and a bit to say that it is done.
-alignas(64) static atomic<u32> chunk_states[1 << 14];
+alignas(64) static atomic<u32> chunk_states[1 << 12];
 // Each hour's text and one more than its size, which also says that it is ready.
 alignas(64) static atomic<u32> text_sizes[HOURS];
 static u8 *texts[HOURS];
@@ -166,11 +170,7 @@ static u32 *take_region() {
   return pooled ? pool[--pooled] : regions + carved++ * capacity;
 }
 
-// The output file grows until the end, so that is when the peak is set. Only near the
-// end is memory left in a free region worth more to the score than the saved faults.
 static void give_region(const void *region) {
-  if (next_hour >= HOURS * 5 / 6)
-    madvise((void *)region, capacity * 4, MADV_DONTNEED);
   std::lock_guard guard(plan_lock);
   pool[pooled++] = (u32 *)region;
 }
@@ -368,8 +368,10 @@ static void render_hour(size_t hour, u32 *space) {
   {
     // Few names are new after the first hour, so sorting them is a small job.
     std::lock_guard guard(names_lock);
-    std::sort(order + sorted, order + name_count, by_name);
-    std::inplace_merge(order, order + sorted, order + name_count, by_name);
+    u64 *found = order + name_count;
+    std::sort(order + sorted, found, by_name);
+    for (u64 *at = order + sorted; at < found; at++)
+      std::rotate(std::upper_bound(order, at, *at, by_name), at, at + 1);
     sorted = known = name_count;
     memcpy(names, order, known * 8);
   }
@@ -377,16 +379,19 @@ static void render_hour(size_t hour, u32 *space) {
   u32 *log = bases[hour].load(relaxed);
   memset(counts, 0, MAX_IDS * 8);
   for (size_t i = 0; i < used; i++) {
+    // Other cores wrote these entries, so each new line takes long to arrive.
+    _mm_prefetch((const char *)(log + i + 64), _MM_HINT_T0);
     counts[log[i] >> 20]++;
     i += (log[i] & BIG) == BIG;
   }
   // Groups lie in reverse order, so the vector stores that run past the end of
   // the group being answered only overwrite one that is finished.
-  u32 sum = 0;
+  u32 sum = 0, largest = 0;
   for (size_t i = known; i--;) {
-    u32 id = (u16)names[i];
+    u32 id = (u16)names[i], n = counts[id * 2] + counts[id * 2 + 1];
     starts[id] = sum;
-    sum += counts[id * 2] + counts[id * 2 + 1];
+    sum += n;
+    largest = std::max(largest, n);
   }
   starts[0] = sum;
   for (size_t i = 0; i < used; i++) {
@@ -409,7 +414,7 @@ static void render_hour(size_t hour, u32 *space) {
     sum -= n;
     size_t ranks[6] = {rank(50, n), rank(95, n), rank(99, n), NONE, NONE, NONE};
     u32 found[6];
-    select_ranks(values + sum, n, 0, ranks, found, space + capacity - 8);
+    select_ranks(values + sum, n, 0, ranks, found, values + used + largest + 8);
     store(cursor, load(label));
     cursor += 21;
     Text name = name_of(names[i]);
@@ -468,7 +473,7 @@ static bool parse_or_clear(u32 **heads) {
   return off < input_size && (madvise((void *)(input + off), CLEAR_STEP, MADV_DONTNEED), true);
 }
 
-static void worker() {
+static void *worker(void *) {
   u32 *heads[HOURS * 2] = {};
   for (;;) {
     size_t hour = next_task();
@@ -478,8 +483,8 @@ static void worker() {
       give_region(space);
     } else if (!parse_or_clear(heads)) {
       if (hour > HOURS)
-        return;
-      std::this_thread::yield();
+        return nullptr;
+      sched_yield();
     }
   }
 }
@@ -505,9 +510,28 @@ int main(int argc, char **) {
   // scratch space for answering it, or its text, in whole pages.
   capacity = (3 * (input_size / 20 + WORKERS * 2 * BLOCK) + (1 << 17)) & -1024;
   regions = (u32 *)map_zeroed(std::size(pool) * capacity * 4);
+  name_bytes = (char *)map_zeroed(MAX_IDS * 128);
+  char *stacks = (char *)map_zeroed(WORKERS * STACK);
+  // Each CPU that charges memory keeps up to 256 KB charged in reserve, which counts
+  // towards the peak, so this thread alone faults everything the others will touch.
+  extern char __data_start, _end;
+  madvise((void *)((size_t)&__data_start & -4096), &_end - &__data_start, MADV_POPULATE_WRITE);
+  madvise(name_bytes, 1 << 17, MADV_POPULATE_WRITE);
+  for (size_t r = 0; r < 2; r++)
+    madvise(regions + r * capacity, WARM, MADV_POPULATE_WRITE);
   int out = open("/out/summary.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  for (size_t w = 1; w < WORKERS; w++)
-    std::thread(worker).detach();
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  for (size_t w = 1; w < WORKERS; w++) {
+    pthread_t thread;
+    madvise(stacks + w * STACK - STACK_TOUCHED, STACK_TOUCHED, MADV_POPULATE_WRITE);
+    pthread_attr_setstack(&attr, stacks + (w - 1) * STACK, STACK);
+    pthread_create(&thread, &attr, worker, nullptr);
+  }
+  for (size_t at = 0; at < input_size; at += 1 << 21)
+    *(volatile const u8 *)(input + at);
+  for (size_t r = 2; r < POOL; r++)
+    madvise(regions + r * capacity, WARM, MADV_POPULATE_WRITE);
   // This thread alone writes, in order, and parses while the next hour is not ready.
   // Writing the last hour ends the process, which needs no threads to be joined.
   u32 *heads[HOURS * 2] = {};
@@ -518,7 +542,7 @@ int main(int argc, char **) {
         _exit(1);
       give_region(texts[hour++]);
     } else if (!parse_or_clear(heads))
-      std::this_thread::yield();
+      sched_yield();
   }
   _exit(0);
 }
