@@ -40,6 +40,7 @@ const u32 HIGH_COUNT = 25, HOT_COUNT = 4;
 // A table slot holds the high bits of the term's hash, its id and two flags.
 const int ID_BITS = 18, TAG_SHIFT = 20, PAIR_BITS = 20;
 const u32 NO_ID = (1 << ID_BITS) - 1, ANCHOR = 1 << ID_BITS;
+const int DISPLACED_BIT = ID_BITS + 1;
 const u64 DISPLACED = ANCHOR << 1, TAG_MASK = ~0ull << TAG_SHIFT;
 const size_t TABLE_PADDING = 1 << 10;
 const u32 OP_AND = 0, OP_OR = 1, OP_NOT = 2, OP_BITS = 2;
@@ -483,6 +484,10 @@ static void parse_docs(Scratch &scratch) {
     }
     filled[part] = k;
   };
+  const v4 slot_mask = _mm256_set1_epi64x(table_mask), zero = _mm256_setzero_si256();
+  const v4 miss = _mm256_set1_epi64x(NO_ID);
+  const v4 found_mask = _mm256_set1_epi64x(NO_ID | ANCHOR);
+  const v4 low_halves = _mm256_setr_epi32(0, 2, 4, 6, 0, 0, 0, 0);
   const v4 id_mask = _mm256_set1_epi32(NO_ID);
   const v4 high_limit = _mm256_set1_epi32(high);
   const v4 list_limit = _mm256_set1_epi32(high + low);
@@ -522,10 +527,27 @@ static void parse_docs(Scratch &scratch) {
       size_t count = token - tokens - 1;
       for (size_t i = 0; i <= PREFETCH_AHEAD; i++)
         token[i] = 0;
-      for (size_t at = 1; at <= count; at++) {
-        _mm_prefetch(table_slots + (tokens[at + PREFETCH_AHEAD] & table_mask),
-                     _MM_HINT_T0);
-        ids[at] = table.find(tokens[at]);
+      // Four lookups in one vector step. A displaced term or a token sharing its home
+      // slot takes another look, about 3% of tokens.
+      for (size_t at = 1; at <= count; at += 4) {
+        for (size_t i = 0; i < 4; i++)
+          _mm_prefetch(table_slots + (tokens[at + i + PREFETCH_AHEAD] & table_mask),
+                       _MM_HINT_T0);
+        v4 hash = load(tokens + at);
+        v4 value = _mm256_i64gather_epi64((const long long *)table_slots,
+                                          _mm256_and_si256(hash, slot_mask), 8);
+        v4 same = _mm256_cmpeq_epi64(
+            _mm256_srli_epi64(_mm256_xor_si256(value, hash), TAG_SHIFT), zero);
+        u32 is_same = _mm256_movemask_pd(_mm256_castsi256_pd(same));
+        u32 displaced = _mm256_movemask_pd(
+            _mm256_castsi256_pd(_mm256_slli_epi64(value, 63 - DISPLACED_BIT)));
+        v4 found = _mm256_blendv_epi8(miss, _mm256_and_si256(value, found_mask), same);
+        _mm_storeu_si128((v2 *)(ids + at), _mm256_castsi256_si128(
+            _mm256_permutevar8x32_epi32(found, low_halves)));
+        for (u32 again = displaced & ~is_same; again; again &= again - 1) {
+          size_t i = at + __builtin_ctz(again);
+          ids[i] = table.find_displaced(tokens[i]);
+        }
       }
       for (size_t i = 1; i <= 8; i++)
         ids[count + i] = NO_ID;
