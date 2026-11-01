@@ -35,7 +35,7 @@ const size_t DENSE_LIMIT = 1 << 10;
 // where a bitset is smaller than its list. The queries sample the corpus: phrases
 // are windows of documents, and boolean terms are drawn by band. More frequent
 // terms also go into the table first, from HOT_COUNT up.
-const u32 HIGH_COUNT = 25, HOT_COUNT = 4;
+const u32 HIGH_COUNT = 30, HOT_COUNT = 4;
 
 // A table slot holds the high bits of the term's hash, its id and two flags.
 const int ID_BITS = 18, TAG_SHIFT = 20, PAIR_BITS = 20;
