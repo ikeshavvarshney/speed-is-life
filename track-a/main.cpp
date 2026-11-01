@@ -41,7 +41,7 @@ const size_t LONGEST_LINE = 256;
 // A chunk that starts this many minutes into an hour shows that the hour before is
 // over, as the spec has the last upload of an hour land within 10 minutes of its end.
 const size_t HOUR_GRACE = 10;
-constexpr int DIAG_PUSH = 2;
+constexpr int DIAG_PUSH = 4;
 static double now_ms(){timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1e3+t.tv_nsec/1e6;}
 static double T0=now_ms();
 static long read_long(const char*p){FILE*f=fopen(p,"r");long v=0;if(f){if(fscanf(f,"%ld",&v)!=1)v=0;fclose(f);}return v;}
