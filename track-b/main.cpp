@@ -43,6 +43,7 @@ const int DISPLACED_BIT = ID_BITS + 1;
 const u64 DISPLACED = ANCHOR << 1, TAG_MASK = ~0ull << TAG_SHIFT;
 const size_t TABLE_PADDING = 1 << 10;
 const u32 OP_AND = 0, OP_OR = 1, OP_NOT = 2, OP_BITS = 2;
+const u64 SEEN_IN_BOOL = 1ull << 32 | 1;
 
 // A logged hit is 16 bits: a term within its partition, a document within its group
 // of 64, and a clear low bit. A worker writes a marker when it starts a group: the
@@ -233,18 +234,25 @@ struct alignas(64) QueryChunk {
   std::string out;
 };
 
-// Terms as they are found in the queries, by all threads at once.
+// Terms as they are found in the queries, by all threads at once. Its low half counts
+// a term's uses. Above that, it counts uses in boolean queries, and later holds its id.
+struct DraftSlot {
+  std::atomic<u64> hash, seen;
+};
+
 struct Draft {
-  std::atomic<u64> *hashes;
+  DraftSlot *slots;
   size_t mask, len;
 
-  u32 intern(u64 hash) {
+  u32 intern(u64 hash, u64 one) {
     for (size_t at = hash & mask;; at++) {
-      u64 value = hashes[at].load(relaxed);
+      u64 value = slots[at].hash.load(relaxed);
       if (value == hash ||
-          (!value && (hashes[at].compare_exchange_strong(value, hash, relaxed) ||
-                      value == hash)))
+          (!value && (slots[at].hash.compare_exchange_strong(value, hash, relaxed) ||
+                      value == hash))) {
+        slots[at].seen.fetch_add(one, relaxed);
         return at;
+      }
     }
   }
 };
@@ -257,13 +265,20 @@ struct Table {
   u64 *slots;
   size_t mask;
 
-  void insert(u64 hash, u64 payload) {
-    size_t at = hash & mask;
-    if (slots[at])
-      slots[at] |= DISPLACED;
-    while (slots[at])
-      at++;
-    slots[at] = (hash & TAG_MASK) | payload;
+  // By all threads at once, and any number of times for one term.
+  void add(u64 hash, u64 payload) {
+    for (size_t at = hash & mask;; at++) {
+      u64 value = 0;
+      if (__atomic_compare_exchange_n(slots + at, &value, (hash & TAG_MASK) | payload,
+                                      false, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+        return;
+      if (!((value ^ hash) >> TAG_SHIFT)) {
+        __atomic_fetch_or(slots + at, payload & ANCHOR, __ATOMIC_RELAXED);
+        return;
+      }
+      if (at == (hash & mask))
+        __atomic_fetch_or(slots + at, DISPLACED, __ATOMIC_RELAXED);
+    }
   }
 
   [[gnu::cold]] u32 find_displaced(u64 hash) const {
@@ -289,9 +304,14 @@ INLINE size_t pair_bit(u64 first, u64 second) {
 // Nearly all anchor tokens match nothing, so a small bitset of (term, neighbour)
 // pairs rejects them before the phrase tables are touched. Phrases sharing an
 // anchor are linked, numbered from 1.
+struct Phrase {
+  u32 start, next;
+  u8 anchor_at, length;
+};
+
 struct Phrases {
-  vector<u32> starts, first_of_anchor, next_of_anchor;
-  vector<u8> anchor_at, lengths;
+  vector<Phrase> list;
+  vector<u32> first_of_anchor;
   vector<u64> pairs;
   const u64 *terms;
 
@@ -303,9 +323,9 @@ struct Phrases {
   // `tokens` holds the document's hashes, with a 0 before and after them.
   [[gnu::cold]] void check(size_t id, const u64 *tokens, size_t count, size_t token,
                            u32 doc, vector<Hit> &hits) const {
-    for (u32 p = first_of_anchor[id]; p; p = next_of_anchor[p]) {
-      const u64 *first = terms + starts[p];
-      size_t len = lengths[p], at = anchor_at[p];
+    for (u32 p = first_of_anchor[id]; p; p = list[p].next) {
+      const u64 *first = terms + list[p].start;
+      size_t len = list[p].length, at = list[p].anchor_at;
       if (token + len - at <= count + 2 && at <= token &&
           std::equal(first, first + len, tokens + token - at))
         hits.push_back({p - 1, doc});
@@ -340,8 +360,8 @@ static u8 *log_regions;
 static u64 *high_bits;
 static u32 *list_marks;
 static Counter *next_log_block;
-static Counter next_query, next_chunk, next_unmap, next_partition, next_answer;
-static Counter next_release;
+static Counter next_query, next_plan, next_chunk, next_unmap, next_partition;
+static Counter next_answer, next_release;
 
 static void find_query_chunks() {
   bounds = {0};
@@ -369,11 +389,11 @@ static void read_chunk(size_t c, u32 *edges) {
     p = scan_line(p, edges, [&](const u8 *word, u64 hash) {
       if (is_bool) {
         if (index % 2)
-          chunk.lines[chunk.line_words++] = draft.intern(hash) << OP_BITS | op;
+          chunk.lines[chunk.line_words++] = draft.intern(hash, SEEN_IN_BOOL) << OP_BITS | op;
         else if (index)
           op = *word == 'A' ? OP_AND : *word == 'O' ? OP_OR : OP_NOT;
       } else if (index) {
-        chunk.slots[chunk.slot_count] = draft.intern(hash);
+        chunk.slots[chunk.slot_count] = draft.intern(hash, 1);
         chunk.hashes[chunk.slot_count++] = hash;
       }
       index++;
@@ -387,85 +407,70 @@ static void read_chunk(size_t c, u32 *edges) {
   }
 }
 
-// Final ids run through the terms with lists, then the common terms, then anchors used
-// only in phrases, so an id alone says how a token is handled. Other terms used
-// only in phrases need no table entry, as phrases compare hashes.
-static void plan_index() {
-  vector<u16> phrase_seen(draft.len), bool_seen(draft.len);
+// Final ids run through the terms with lists, then the common terms, then those used
+// only in phrases, so an id alone says how a token is handled.
+static void plan_terms() {
   size_t phrase_count = 0;
-  // Calls `f` with each boolean term of the lines of a chunk.
-  auto each_term = [](QueryChunk &chunk, auto &&f) {
-    for (size_t i = 0; i < chunk.line_words; i++)
-      for (u32 left = chunk.lines[i]; left; left--)
-        f(chunk.lines[++i]);
-  };
   for (auto &chunk : query_chunks) {
-    for (size_t i = 0; i < chunk.slot_count; i++)
-      phrase_seen[chunk.slots[i]]++;
-    each_term(chunk, [&](u32 term) { bool_seen[term >> OP_BITS]++; });
     phrase_bases.push_back(phrase_count);
     phrase_count += chunk.phrase_count;
   }
-  auto seen = [&](size_t at) { return (u32)phrase_seen[at] + bool_seen[at]; };
-  for (size_t at = 0; at < draft.len; at++)
-    if (bool_seen[at])
-      (seen(at) > HIGH_COUNT ? high_terms : low_terms)++;
-  vector<u32> ids(draft.len, NO_ID);
-  size_t next_low = 0, next_id = low_terms;
-  for (size_t at = 0; at < draft.len; at++)
-    if (bool_seen[at])
-      ids[at] = seen(at) > HIGH_COUNT ? next_id++ : next_low++;
-
-  phrases.terms = query_hashes;
-  phrases.starts.resize(phrase_count + 1);
-  phrases.lengths.resize(phrase_count + 1);
-  phrases.first_of_anchor.resize(next_id + phrase_count + 1);
-  phrases.next_of_anchor.resize(phrase_count + 1);
-  phrases.anchor_at.resize(phrase_count + 1);
-  phrases.pairs.resize(1 << (PAIR_BITS - 6));
-  vector<bool> is_anchor(draft.len);
-  u32 phrase = 0;
-  for (auto &chunk : query_chunks) {
-    size_t first = 0;
-    for (size_t p = 0; p < chunk.phrase_count; p++) {
-      size_t length = chunk.lengths[p];
-      const u32 *list = chunk.slots + first;
-      const u64 *hashes = chunk.hashes + first;
-      first += length;
-      size_t at = std::min_element(list, list + length, [&](u32 a, u32 b) {
-                    return seen(a) < seen(b);
-                  }) - list;
-      u32 slot = list[at];
-      phrase++;
-      if (ids[slot] == NO_ID)
-        ids[slot] = next_id++;
-      is_anchor[slot] = true;
-      phrases.next_of_anchor[phrase] = phrases.first_of_anchor[ids[slot]];
-      phrases.first_of_anchor[ids[slot]] = phrase;
-      phrases.anchor_at[phrase] = at;
-      size_t one = at + 1 < length ? at : at - 1;
-      size_t bit = pair_bit(hashes[one], hashes[one + 1]);
-      phrases.pairs[bit / 64] |= 1ull << (bit % 64);
-      phrases.starts[phrase] = hashes - query_hashes;
-      phrases.lengths[phrase] = length;
-    }
+  auto is_high = [](u64 seen) { return (u32)seen > HIGH_COUNT; };
+  for (size_t at = 0; at < draft.len; at++) {
+    u64 seen = draft.slots[at].seen.load(relaxed);
+    if (seen >> 32)
+      (is_high(seen) ? high_terms : low_terms)++;
   }
-
-  for (auto &chunk : query_chunks)
-    each_term(chunk, [&](u32 &term) {
-      term = ids[term >> OP_BITS] << OP_BITS | (term & ((1 << OP_BITS) - 1));
-    });
-  munmap(query_slots, text_size * 2);
-  munmap(query_lengths, text_size * 2);
+  size_t next_low = 0, next_high = low_terms, next_other = low_terms + high_terms;
+  for (size_t at = 0; at < draft.len; at++) {
+    u64 seen = draft.slots[at].seen.load(relaxed);
+    u64 id = !(seen >> 32) ? next_other : is_high(seen) ? next_high : next_low;
+    next_other += !(seen >> 32) && seen;
+    next_high += (seen >> 32) && is_high(seen);
+    next_low += (seen >> 32) && !is_high(seen);
+    draft.slots[at].seen.store(id << 32 | (u32)seen, relaxed);
+  }
+  phrases.terms = query_hashes;
+  phrases.list.resize(phrase_count + 1);
+  phrases.first_of_anchor.resize(next_other);
+  phrases.pairs.resize(1 << (PAIR_BITS - 6));
   // Four times the size of the draft, as a lookup that misses its home slot is costly:
   // about 1% do at this size, 3% at half of it.
   size_t table_size = (draft.mask + 1) * 4;
   table = {(u64 *)huge_pages((table_size + TABLE_PADDING) * 8), table_size - 1};
-  for (size_t at = 0; at < draft.len; at++)
-    if (ids[at] != NO_ID)
-      table.insert(draft.hashes[at].load(relaxed),
-                   ids[at] | (is_anchor[at] ? ANCHOR : 0));
-  free(draft.hashes);
+}
+
+// Picks each phrase's anchor and fills the lookup table, on all threads. The table only
+// holds terms with lists or bitsets and anchors, as phrases compare hashes.
+static void plan_chunk(size_t c) {
+  QueryChunk &chunk = query_chunks[c];
+  u32 phrase = phrase_bases[c];
+  const u32 *list = chunk.slots;
+  const u64 *hashes = chunk.hashes;
+  auto seen = [](u32 slot) { return draft.slots[slot].seen.load(relaxed); };
+  for (size_t p = 0; p < chunk.phrase_count; p++) {
+    size_t length = chunk.lengths[p];
+    size_t at = std::min_element(list, list + length, [&](u32 a, u32 b) {
+                  return (u32)seen(a) < (u32)seen(b);
+                }) - list;
+    u32 id = seen(list[at]) >> 32;
+    phrase++;
+    table.add(hashes[at], id | ANCHOR);
+    u32 next = __atomic_exchange_n(&phrases.first_of_anchor[id], phrase, __ATOMIC_RELAXED);
+    phrases.list[phrase] = {(u32)(hashes - query_hashes), next, (u8)at, (u8)length};
+    size_t one = at + 1 < length ? at : at - 1;
+    size_t bit = pair_bit(hashes[one], hashes[one + 1]);
+    __atomic_fetch_or(&phrases.pairs[bit / 64], 1ull << (bit % 64), __ATOMIC_RELAXED);
+    list += length;
+    hashes += length;
+  }
+  for (size_t i = 0; i < chunk.line_words; i++)
+    for (u32 left = chunk.lines[i]; left; left--) {
+      u32 &term = chunk.lines[++i];
+      u32 slot = term >> OP_BITS, id = seen(slot) >> 32;
+      table.add(draft.slots[slot].hash.load(relaxed), id);
+      term = id << OP_BITS | (term & ((1 << OP_BITS) - 1));
+    }
 }
 
 static u16 *claim_log_block(size_t partition) {
@@ -1031,8 +1036,10 @@ static void answer_queries(Scratch &scratch) {
 }
 
 // Each run on one thread once all threads have arrived at the barrier.
-static void after_queries() {
-  plan_index();
+static void after_plan() {
+  free(draft.slots);
+  munmap(query_slots, text_size * 2);
+  munmap(query_lengths, text_size * 2);
   high_bits = (u64 *)reserve(high_terms * words * 8 + 64);
   partitions = low_terms / PARTITION_TERMS + 1;
   // A token takes at least 2 bytes of input, and 2 bytes here.
@@ -1044,7 +1051,7 @@ static void after_queries() {
 
 // Groups the phrases' documents by phrase. Answers sort each phrase's few documents.
 static void after_parsing() {
-  size_t phrase_count = phrases.starts.size() - 1, total = 0;
+  size_t phrase_count = phrases.list.size() - 1, total = 0;
   munmap(query_hashes, text_size * 4);
   matched.resize(phrase_count + 1);
   for (auto &scratch : scratches)
@@ -1073,10 +1080,12 @@ static void write_output() {
 static void between_steps() noexcept {
   static int step = 0;
   if (step == 0)
-    after_queries();
+    plan_terms();
   if (step == 1)
+    after_plan();
+  if (step == 2)
     after_parsing();
-  if (step == 4)
+  if (step == 5)
     write_output();
   step++;
 }
@@ -1092,6 +1101,9 @@ static void work(int t) {
   scratch.low_ids = (u32 *)reserve(most * 4);
   for (size_t c; (c = next_query.take()) < chunks;)
     read_chunk(c, scratch.ids);
+  sync_all->arrive_and_wait();
+  for (size_t c; (c = next_plan.take()) < chunks;)
+    plan_chunk(c);
   sync_all->arrive_and_wait();
   parse_docs(scratch);
   // Exit would otherwise clear the input's page tables page by page on one
@@ -1136,7 +1148,7 @@ int main() {
   size_t size = std::max<size_t>(std::bit_ceil(text_size / 16 + 16), 1 << 10);
   draft.len = size + TABLE_PADDING;
   draft.mask = size - 1;
-  draft.hashes = (std::atomic<u64> *)calloc(draft.len, 8);
+  draft.slots = (DraftSlot *)calloc(draft.len, sizeof(DraftSlot));
   query_chunks.resize(chunks);
   // A line has a size as well as its terms, and a line takes at least 7 bytes.
   query_lines = (u32 *)reserve(text_size * 3);
