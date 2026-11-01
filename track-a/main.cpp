@@ -232,8 +232,8 @@ static u32 *claim_block(size_t hour) {
 
 #include <stdio.h>
 #include <time.h>
-#include <sys/wait.h>
 #include <x86intrin.h>
+#include <barrier>
 namespace probe {
 static double now_ms(){timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1e3+t.tv_nsec/1e6;}
 static double T0=now_ms();
@@ -252,74 +252,207 @@ static long read_long(const char*p){FILE*f=fopen(p,"r");long v=0;if(f){if(fscanf
   timespec ts;ts.tv_sec=(time_t)(until/1e3);ts.tv_nsec=(long)((until-ts.tv_sec*1e3)*1e6);
   clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&ts,0);
   _exit(0);}
+static std::atomic<u64> sink;
 static u64 code;
-static u64 scan(const u8*p,size_t n){
-  v4 acc=_mm256_setzero_si256();
-  for(size_t i=0;i+32<=n;i+=32)acc=_mm256_or_si256(acc,_mm256_loadu_si256((const v4*)(p+i)));
-  return _mm256_extract_epi64(acc,0);
+
+#define SPLIT()                                                                \
+    const u8 *fields = line + 28;                                              \
+    u64 mask = spaces(fields);                                                 \
+    const u8 *name = fields + __builtin_ctzll(mask) + 1;                       \
+    u64 rest = mask & (mask - 1);                                              \
+    while (!rest) {                                                            \
+      fields += 64;                                                            \
+      rest = spaces(fields);                                                   \
+    }                                                                          \
+    const u8 *space = fields + __builtin_ctzll(rest);                          \
+    size_t len = space - name;
+
+#define STAMP()                                                                \
+    u64 now = load64(line + 5);                                                \
+    if (now != stamp) {                                                        \
+      stamp = now;                                                             \
+      total += hour_index(line);                                               \
+    }
+
+#define LOOKUP()                                                               \
+    u64 hash = hash_name(name, len) | 1 << 16, seen = table[hash % SLOTS].load(relaxed); \
+    u32 id = (seen ^ hash) >> 16 ? find_name(hash, name, len) : (u16)seen;
+
+#define STORE()                                                                \
+    u32 error = space[1] == '5';                                               \
+    u32 entry = id << (LATENCY_BITS + 1) | error << LATENCY_BITS;              \
+    if (latency >= BIG) {                                                      \
+      *at++ = entry | BIG;                                                     \
+      entry = 0;                                                               \
+    }                                                                          \
+    *at++ = entry | latency;                                                   \
+    if (at > log + (1 << 14))                                                  \
+      at = log;
+
+static size_t full(const u8 *line, const u8 *end, u32 *log) {
+  size_t lines = 0; u32 *at = log; u64 stamp = 0, total = 0;
+  while (line < end) {
+    STAMP() SPLIT() LOOKUP()
+    const u8 *next = space + 5;
+    u32 latency = parse_latency(next);
+    STORE()
+    line = next;
+    lines++;
+  }
+  sink.fetch_add(total, relaxed);
+  return lines;
 }
-struct Gate{atomic<int> go,done;atomic<size_t> next;atomic<u64> sink;};
-// Forked workers, each mapping its chunk, touching it and unmapping it.
-static double procs(int fd,size_t size,size_t piece,int n,bool populate){
-  Gate*g=(Gate*)mmap(0,4096,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
-  double fork_start=now_ms();
-  for(int i=0;i<n;i++)
-    if(!fork()){
-      while(!g->go.load())_mm_pause();
-      u64 s=0;
-      for(;;){
-        size_t o=g->next.fetch_add(piece);
-        if(o>=size)break;
-        size_t len=std::min(piece,size-o);
-        void*m=mmap(0,len,PROT_READ,MAP_PRIVATE|(populate?MAP_POPULATE:0),fd,o);
-        s|=scan((const u8*)m,len);
-        munmap(m,len);
+template <int DISTANCE> static size_t fetched(const u8 *line, const u8 *end, u32 *log) {
+  size_t lines = 0; u32 *at = log; u64 stamp = 0, total = 0;
+  while (line < end) {
+    _mm_prefetch((const char *)line + DISTANCE, _MM_HINT_T0);
+    STAMP() SPLIT() LOOKUP()
+    const u8 *next = space + 5;
+    u32 latency = parse_latency(next);
+    STORE()
+    line = next;
+    lines++;
+  }
+  sink.fetch_add(total, relaxed);
+  return lines;
+}
+static size_t split_only(const u8 *line, const u8 *end, u32 *) {
+  size_t lines = 0; u64 stamp = 0, total = 0;
+  while (line < end) {
+    STAMP() SPLIT()
+    const u8 *next = space + 5;
+    u32 latency = parse_latency(next);
+    total += latency + len + (space[1] == '5');
+    line = next;
+    lines++;
+  }
+  sink.fetch_add(total, relaxed);
+  return lines;
+}
+static size_t with_hash(const u8 *line, const u8 *end, u32 *) {
+  size_t lines = 0; u64 stamp = 0, total = 0;
+  while (line < end) {
+    STAMP() SPLIT()
+    total += hash_name(name, len);
+    const u8 *next = space + 5;
+    u32 latency = parse_latency(next);
+    total += latency + (space[1] == '5');
+    line = next;
+    lines++;
+  }
+  sink.fetch_add(total, relaxed);
+  return lines;
+}
+static size_t with_table(const u8 *line, const u8 *end, u32 *) {
+  size_t lines = 0; u64 stamp = 0, total = 0;
+  while (line < end) {
+    STAMP() SPLIT() LOOKUP()
+    const u8 *next = space + 5;
+    u32 latency = parse_latency(next);
+    total += latency + id + (space[1] == '5');
+    line = next;
+    lines++;
+  }
+  sink.fetch_add(total, relaxed);
+  return lines;
+}
+// Only walks to each line's end by memchr-free newline scan, as a floor for touching the bytes.
+static size_t scan_only(const u8 *line, const u8 *end, u32 *) {
+  v4 acc = _mm256_setzero_si256();
+  for (const u8 *p = line; p < end; p += 32)
+    acc = _mm256_or_si256(acc, load(p));
+  sink.fetch_add(_mm256_extract_epi64(acc, 0), relaxed);
+  return (end - line) / 77;
+}
+// Newlines first, so no line's start waits for the line before it.
+static size_t two_stage(const u8 *first, const u8 *end, u32 *log) {
+  static thread_local u32 starts[(1 << 16) / 40 + 64];
+  const v4 nl = _mm256_set1_epi8('\n');
+  size_t bytes = end - first, n = 1;
+  starts[0] = 0;
+  for (size_t i = 0; i < bytes; i += 64) {
+    u32 low = _mm256_movemask_epi8(_mm256_cmpeq_epi8(load(first + i), nl));
+    u32 high = _mm256_movemask_epi8(_mm256_cmpeq_epi8(load(first + i + 32), nl));
+    u64 m = low | (u64)high << 32;
+    starts[n] = i + __builtin_ctzll(m | 1ull << 63) + 1;
+    starts[n + 1] = i + __builtin_ctzll((m & (m - 1)) | 1ull << 63) + 1;
+    n += __builtin_popcountll(m);
+  }
+  while (n > 1 && starts[n - 1] >= bytes)
+    n--;
+  u32 *at = log; u64 stamp = 0, total = 0;
+  for (size_t k = 0; k < n; k++) {
+    const u8 *line = first + starts[k];
+    STAMP() SPLIT() LOOKUP()
+    const u8 *next = space + 5;
+    u32 latency = parse_latency(next);
+    STORE()
+  }
+  sink.fetch_add(total, relaxed);
+  return n;
+}
+using Fn = size_t (*)(const u8 *, const u8 *, u32 *);
+struct Case { const char *name; Fn fn; int threads; size_t chunk; };
+static const Case table_of_cases[] = {
+  {"full12", full, 12, 1 << 16}, {"full12c32", full, 12, 1 << 15}, {"full12c16", full, 12, 1 << 14},
+  {"two12", two_stage, 12, 1 << 16}, {"two12c16", two_stage, 12, 1 << 14},
+  {"fetch192", fetched<192>, 12, 1 << 16}, {"fetch512", fetched<512>, 12, 1 << 16},
+  {"split12", split_only, 12, 1 << 16}, {"hash12", with_hash, 12, 1 << 16}, {"table12", with_table, 12, 1 << 16},
+  {"scan12", scan_only, 12, 1 << 16},
+  {"full1", full, 1, 1 << 16}, {"split1", split_only, 1, 1 << 16}, {"two1", two_stage, 1, 1 << 16},
+  {"full6", full, 6, 1 << 16},
+};
+static double measure(const Case &c, int fd, size_t size) {
+  double best = 1e18;
+  for (int r = 0; r < 3; r++) {
+    std::atomic<size_t> next{0};
+    std::atomic<u64> total_cycles{0}, total_lines{0};
+    vector<std::thread> pool;
+    std::barrier gate(c.threads);
+    for (int t = 0; t < c.threads; t++)
+      pool.emplace_back([&] {
+        vector<u8> buffer((1 << 16) + 1024);
+        vector<u32> log_space((1 << 14) + 64);
+        u64 cycles = 0, count = 0;
+        gate.arrive_and_wait();
+        for (;;) {
+          size_t off = next.fetch_add(c.chunk);
+          if (off >= size)
+            break;
+          size_t before = off > 0;
+          ssize_t got = pread(fd, buffer.data(), before + c.chunk + 256, off - before);
+          const u8 *line = buffer.data();
+          if (before)
+            line = (const u8 *)memchr(buffer.data(), '\n', got) + 1;
+          const u8 *end = buffer.data() + std::min<size_t>(got, before + c.chunk);
+          u64 a = __rdtsc();
+          count += c.fn(line, end, log_space.data());
+          cycles += __rdtsc() - a;
+        }
+        total_cycles += cycles;
+        total_lines += count;
+      });
+    for (auto &t : pool)
+      t.join();
+    best = std::min(best, (double)total_cycles / total_lines);
+  }
+  return best;
+}
+static void run_all(int fd, size_t size) {
+  int shift = 0;
+  auto a = __rdtsc(); double b = now_ms(); while (now_ms() - b < 2.0) {} double per_ms = (__rdtsc() - a) / (now_ms() - b);
+  fprintf(stderr, "tsc per ms %.0f\n", per_ms);
+  for (const char *want : {"full12", "split12", "two12"}) {
+    for (const Case &c : table_of_cases)
+      if (!strcmp(c.name, want)) {
+        double v = measure(c, fd, size);
+        fprintf(stderr, "%s %.1f\n", c.name, v);
+        u64 x = (u64)(v + 0.5);
+        code |= (x > 255 ? 255 : x) << shift;
+        shift += 8;
       }
-      g->sink.fetch_or(s);
-      g->done.fetch_add(1);
-      _exit(0);
-    }
-  double forked=now_ms()-fork_start;
-  double a=now_ms();
-  g->go.store(1);
-  while(g->done.load()<n)_mm_pause();
-  double t=now_ms()-a;
-  while(wait(nullptr)>0){}
-  fprintf(stderr,"procs piece %zu n %d populate %d: fork %.2f pass %.2f\n",piece,n,populate,forked,t);
-  munmap(g,4096);
-  return t;
-}
-// Threads sharing one address space, each mapping its own chunk.
-static double thread_maps(int fd,size_t size,size_t piece,int n){
-  atomic<size_t> next{0};
-  atomic<u64> sink{0};
-  vector<std::thread> ts;
-  double a=now_ms();
-  for(int i=0;i<n;i++)ts.emplace_back([&]{
-    u64 s=0;
-    for(;;){
-      size_t o=next.fetch_add(piece);
-      if(o>=size)break;
-      size_t len=std::min(piece,size-o);
-      void*m=mmap(0,len,PROT_READ,MAP_PRIVATE,fd,o);
-      s|=scan((const u8*)m,len);
-      munmap(m,len);
-    }
-    sink.fetch_or(s);
-  });
-  for(auto&t:ts)t.join();
-  double t=now_ms()-a;
-  fprintf(stderr,"thread maps piece %zu: %.2f\n",piece,t);
-  return t;
-}
-static u64 q(double v,double unit,int nbits){long x=(long)(v/unit+0.5);long m=(1L<<nbits)-1;return (u64)(x>m?m:x);}
-static void run_all(int fd,size_t size){
-  double a,b,c;
-  if(2==1){a=procs(fd,size,1<<18,12,false);b=procs(fd,size,1<<20,12,false);c=procs(fd,size,1<<16,12,false);}
-  if(2==2){a=thread_maps(fd,size,1<<20,12);b=thread_maps(fd,size,1<<18,12);c=procs(fd,size,1<<18,12,true);}
-  if(2==3){a=procs(fd,size,1<<18,6,false);b=procs(fd,size,1<<21,12,false);c=procs(fd,size,1<<18,1,false);}
-  code=q(a,0.125,8)|q(b,0.125,8)<<8|q(c,0.125,8)<<16;
-  fprintf(stderr,"code %llu mcode %llu tcode %llu\n",code,code&16383,code>>14);
+  }
+  fprintf(stderr, "code %llu mcode %llu tcode %llu sink %llu\n", code, code & 16383, code >> 14, (u64)sink);
 }
 }
 
