@@ -522,9 +522,9 @@ int main(int argc, char **) {
         _exit(1);
       give_region(texts[hour++]);
       // The output grows until the end, so that is when the peak is set, and regions
-      // left idle after an earlier rush are worth more released. Once only: trimming
+      // left idle are worth more released, for the last hours only: trimming
       // them all along costs 5% of the time in faults and interrupts.
-      for (u32 *idle; hour == 60 && (idle = pop_region());)
+      for (u32 *idle; hour >= 66 && (idle = pop_region());)
         madvise(idle, capacity * 4, MADV_DONTNEED);
     } else if (!parse_or_clear(heads))
       std::this_thread::yield();
