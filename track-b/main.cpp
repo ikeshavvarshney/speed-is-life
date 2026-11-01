@@ -523,7 +523,10 @@ static void parse_docs(Scratch &scratch) {
       // unpredictable and a branch on it would be mispredicted constantly.
       tokens[0] = 0;
       u64 *token = tokens + 1;
-      p = scan_line(p, [&](const u8 *, u64 hash) { *token++ = hash; });
+      p = scan_line(p, [&](const u8 *, u64 hash) {
+        _mm_prefetch(table_slots + (hash & table_mask), _MM_HINT_T0);
+        *token++ = hash;
+      });
       size_t count = token - tokens - 1;
       for (size_t i = 0; i <= PREFETCH_AHEAD; i++)
         token[i] = 0;
