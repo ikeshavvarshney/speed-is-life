@@ -1,17 +1,12 @@
 #include <algorithm>
 #include <atomic>
-#include <barrier>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
-#include <memory>
 #include <fcntl.h>
 #include <immintrin.h>
-#include <mutex>
+#include <sched.h>
 #include <sys/mman.h>
-#include <sys/prctl.h>
 #include <sys/stat.h>
-#include <thread>
 #include <unistd.h>
 
 using u8 = uint8_t;
@@ -23,8 +18,11 @@ using std::atomic;
 constexpr auto relaxed = std::memory_order_relaxed;
 #define INLINE [[gnu::always_inline]] inline
 
-const size_t CHUNK = 1 << 18, REGION_CHUNK = 1 << 16;
-const size_t COUNTRIES = 256, HUGE_PAGE = 1 << 21;
+const size_t CHUNK = 1 << 18, REGION_CHUNK = 1 << 16, UNMAP_STEP = 1 << 23;
+// 240 countries at every scale (spec section 2.3), plus _UNMATCHED. The box has 12
+// threads, and more than that would only cost time.
+const size_t COUNTRIES = 241, HUGE_PAGE = 1 << 21, MAX_THREADS = 12;
+const size_t STACK = 1 << 13, LINE = 128;
 // Region ids stop below this at every scale (spec section 2.3). Its own entry
 // stays 0 and stands for every id above the table.
 const u32 REGION_END = 1000000;
@@ -34,15 +32,17 @@ const size_t NAMES_AT = REGION_END + 64, CODES = 26 * 26 * 26;
 const int NAME_BITS = 17;
 // Words of one country's bitset over name ids.
 const size_t WORDS = (1 << NAME_BITS) / 64;
-const size_t BLOCKS = 16, MAX_MARKS = BLOCKS * 64 + 64, MAX_RECORDS = MAX_MARKS / 5 + 1;
+// The shortest record is 11 bytes and has 5 marks, so a batch holds at most 466
+// marks, plus 4 left over and 8 written past the last.
+const size_t BLOCKS = 16, MAX_MARKS = 512, MAX_RECORDS = MAX_MARKS / 5 + 1;
 
 // One worker's running values for one country, on one cache line. `sums` is
 // added to as one vector: id sum, amount sum, count << 32 | name bytes, note
 // bytes. Neither half of the third can carry into the other, as both stay below
 // 2^31.
 struct alignas(64) Group {
-  u64 sums[4] = {};
-  int min = INT32_MAX, max = INT32_MIN;
+  u64 sums[4];
+  int min, max;
 };
 
 struct Rec {
@@ -61,54 +61,78 @@ static const u8 *map_input(const char *path, size_t &size) {
   void *base =
       mmap(0, size + 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   mmap(base, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
+  // Page tables for the first of it. See the note in main.
+  for (size_t off = 0; off < std::min(size, 2 * HUGE_PAGE); off += HUGE_PAGE)
+    *((volatile const u8 *)base + off);
   return (const u8 *)base;
 }
 
-// Zeroed memory on 2 MB boundaries. Lives until process exit.
-static u8 *zeroed(size_t bytes) {
-  auto raw = (size_t)mmap(0, bytes + HUGE_PAGE, PROT_READ | PROT_WRITE,
-                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  return (u8 *)((raw + HUGE_PAGE - 1) & -HUGE_PAGE);
-}
+// Work split into pieces that threads claim as they become free. Threads wait by
+// spinning, as they do so for microseconds, and waking from a futex takes longer.
+struct Job {
+  alignas(64) atomic<size_t> next;
+  alignas(64) atomic<size_t> done;
+};
+
+// One mapping at a fixed address, so its addresses are constants and take no
+// register. The address is above where the kernel may randomize the heap to (up
+// to 1 GB), where libc's thread block lives, and below 2 GB, the limit for
+// constants in instructions. Huge pages hold the first 6 MB, which avoids a TLB miss on most
+// records. Groups and stacks fit in what the tables leave of those pages, so
+// they cost no memory or page faults. A huge page needs 2 MB of mapping, so the
+// rest takes 4 KB pages.
+struct Memory {
+  u8 by_id[NAMES_AT];
+  atomic<u64> slots[1 << NAME_BITS];
+  atomic<u64> name_bits[COUNTRIES * WORDS];
+  Group groups[MAX_THREADS * COUNTRIES];
+  u8 stacks[MAX_THREADS][STACK];
+  Job region_job, chunk_job, country_job;
+  atomic<u8> seen_codes[CODES];
+  u32 code_of[COUNTRIES];
+  u8 lengths[COUNTRIES];
+  char lines[COUNTRIES][LINE];
+  char text[COUNTRIES * LINE];
+};
+#define mem (*(Memory *)0x60000000)
 
 static const u8 *input, *regions;
 static size_t input_size, regions_size;
-static u8 *by_id;
-static atomic<u64> *slots, *name_bits;
-static Group *groups;
-static int threads;
-static atomic<u8> seen_codes[CODES];
-static std::mutex codes_lock;
+static size_t threads;
+static std::atomic_flag codes_lock;
 static int code_count;
-static atomic<u32> distinct_names[COUNTRIES];
-// Written by every thread, so kept away from what records read.
-alignas(64) static atomic<size_t> next_region{1}; // The first piece holds the header.
-alignas(64) static atomic<size_t> next_chunk, next_country;
 
-// Claims pieces of regions.csv. by_id holds 1 + the country's index, and 0 for
+template <class F> INLINE void run(Job &job, size_t size, size_t step, F piece) {
+  for (size_t off; (off = job.next.fetch_add(step, relaxed)) < size;
+       job.done.fetch_add(step))
+    piece(off);
+  while (job.done.load() < size)
+    _mm_pause();
+}
+
+// One piece of regions.csv. by_id holds 1 + the country's index, and 0 for
 // anything unknown. Ids are unique, so each byte has one writer.
-static void load_regions() {
-  for (;;) {
-    size_t off = next_region.fetch_add(REGION_CHUNK, relaxed);
-    if (off >= regions_size)
-      return;
-    size_t stop = std::min(off + REGION_CHUNK, regions_size), i = off;
-    while (regions[i - 1] != '\n')
-      i++;
-    while (i < stop) {
-      size_t id = 0;
-      for (; regions[i] != ','; i++)
-        id = id * 10 + regions[i] - '0';
-      const u8 *c = regions + i + 1;
-      int key = (c[0] - 'A') * 676 + (c[1] - 'A') * 26 + c[2] - 'A';
-      if (!seen_codes[key].load(relaxed)) {
-        std::lock_guard guard(codes_lock);
-        if (!seen_codes[key].load(relaxed))
-          seen_codes[key].store(++code_count, relaxed);
+static void load_regions(size_t off) {
+  size_t stop = std::min(off + REGION_CHUNK, regions_size), i = off;
+  while (regions[i - 1] != '\n')
+    i++;
+  while (i < stop) {
+    size_t id = 0;
+    for (; regions[i] != ','; i++)
+      id = id * 10 + regions[i] - '0';
+    const u8 *c = regions + i + 1;
+    int key = (c[0] - 'A') * 676 + (c[1] - 'A') * 26 + c[2] - 'A';
+    if (!mem.seen_codes[key].load(relaxed)) {
+      while (codes_lock.test_and_set(std::memory_order_acquire))
+        _mm_pause();
+      if (!mem.seen_codes[key].load(relaxed)) {
+        mem.code_of[++code_count] = key;
+        mem.seen_codes[key].store(code_count, relaxed);
       }
-      by_id[id] = seen_codes[key].load(relaxed);
-      i += 5;
+      codes_lock.clear(std::memory_order_release);
     }
+    mem.by_id[id] = mem.seen_codes[key].load(relaxed);
+    i += 5;
   }
 }
 
@@ -200,12 +224,12 @@ INLINE size_t intern(atomic<u64> *table, u64 hash) {
 
 static void parse_chunk(size_t first, size_t stop, Group *mine) {
   const u8 *base = input;
-  const u8 *ids = by_id;
+  const u8 *ids = mem.by_id;
   const __m128i top = _mm_set1_epi32(REGION_END);
   const __m128i three = _mm_setr_epi16(3, 0, 3, 0, 0, 0, 0, 0);
   const __m128i key = _mm_set_epi64x(0x8BB84B93962EACC9, 0x2D358DCCAA6C78A5);
-  const auto table = slots;
-  const auto bits = name_bits;
+  const auto table = mem.slots;
+  const auto bits = mem.name_bits;
   u32 marks[MAX_MARKS];
   // Number of "" pairs in the field each mark ends. It stays mostly zero.
   u32 pairs[MAX_MARKS + 8] = {};
@@ -355,103 +379,146 @@ static size_t first_record(size_t off) {
   return i;
 }
 
-static void worker(int index, std::barrier<> *barrier) {
-  load_regions();
-  barrier->arrive_and_wait();
-  Group *mine = groups + index * COUNTRIES;
-  std::uninitialized_default_construct_n(mine, COUNTRIES);
-  for (;;) {
-    size_t off = next_chunk.fetch_add(CHUNK, relaxed);
-    if (off >= input_size)
-      break;
-    size_t first = off ? first_record(off)
-                       : (const u8 *)memchr(input, '\n', input_size) - input + 1;
+// Digits of `value` written backward, ending just before `p`.
+static char *digits(char *p, u64 value) {
+  do
+    *--p = '0' + value % 10;
+  while (value /= 10);
+  return p;
+}
+
+static char *money(char *p, long long cents) {
+  u64 abs = cents < 0 ? -cents : cents;
+  *--p = '0' + abs % 10;
+  *--p = '0' + abs / 10 % 10;
+  *--p = '.';
+  p = digits(p, abs / 100);
+  if (cents < 0)
+    *--p = '-';
+  *--p = ' ';
+  return p;
+}
+
+// Merges one country and formats its line. Each worker's group was last written
+// by another core, so doing this on all threads overlaps those misses.
+static void finish_country(size_t country) {
+  // Process exit would otherwise unmap every page of the input on one thread,
+  // while the clock runs. Clearing the page tables now, on all threads, removes
+  // most of that cost. The first turns also take one piece of it each. Each call
+  // interrupts every thread to flush its TLB, so calls must be few.
+  // A call must stop at the end of the file, or it clears what is mapped above.
+  size_t off = country * UNMAP_STEP;
+  if (off < input_size)
+    madvise((void *)(input + off), std::min(UNMAP_STEP, input_size - off),
+            MADV_DONTNEED);
+  Group total{{}, INT32_MAX, INT32_MIN};
+  for (size_t t = 0; t < threads; t++) {
+    const Group &from = mem.groups[t * COUNTRIES + country];
+    for (int i = 0; i < 4; i++)
+      total.sums[i] += from.sums[i];
+    total.min = std::min(total.min, from.min);
+    total.max = std::max(total.max, from.max);
+  }
+  u64 count = total.sums[2] >> 32, distinct = 0;
+  if (!count)
+    return;
+  for (size_t i = 0; i < WORDS; i++)
+    distinct += __builtin_popcountll(
+        mem.name_bits[country * WORDS + i].load(relaxed));
+  char *end = mem.lines[country] + LINE, *p = end - 1;
+  *p = '\n';
+  p = digits(p, total.sums[3]);
+  *--p = ' ';
+  p = digits(p, (u32)total.sums[2]);
+  *--p = ' ';
+  p = digits(p, distinct);
+  *--p = ' ';
+  p = money(p, total.max);
+  p = money(p, total.min);
+  p = money(p, total.sums[1]);
+  p = digits(p, total.sums[0]);
+  *--p = ' ';
+  p = digits(p, count);
+  *--p = ' ';
+  if (country) {
+    u32 code = mem.code_of[country];
+    p -= 3;
+    p[0] = 'A' + code / 676;
+    p[1] = 'A' + code / 26 % 26;
+    p[2] = 'A' + code % 26;
+  } else {
+    p -= 10;
+    memcpy(p, "_UNMATCHED", 10);
+  }
+  mem.lengths[country] = end - p;
+}
+
+// Runs on a thread with no state of its own in libc, so it may call only what
+// keeps none. Returning ends the thread with no stack to unmap or free.
+static int worker(void *index) {
+  run(mem.region_job, regions_size - 1, REGION_CHUNK,
+      [](size_t off) { load_regions(off + 1); });
+  // See the note in main. The other threads start at the file's start, and this
+  // moves far faster than they do, so it stays ahead of them.
+  if (!index)
+    for (size_t off = 0; off < input_size; off += HUGE_PAGE)
+      *(volatile const u8 *)(input + off);
+  Group *mine = mem.groups + (size_t)index * COUNTRIES;
+  run(mem.chunk_job, input_size, CHUNK, [=](size_t off) {
+    size_t first =
+        off ? first_record(off)
+            : (const u8 *)memchr(input, '\n', input_size) - input + 1;
     size_t stop = std::min(off + CHUNK, input_size);
     if (first < stop)
       parse_chunk(first, stop, mine);
-  }
-  barrier->arrive_and_wait();
-
-  // Process exit would otherwise unmap every page of the input on one thread,
-  // while the clock runs. Clearing the page tables now, on all threads, removes
-  // most of that cost. The first turns also take one piece of it each.
-  // Each call interrupts every thread to flush its TLB, so calls must be few.
-  const size_t step = 1 << 23;
-  for (;;) {
-    size_t country = next_country.fetch_add(1, relaxed);
-    if (country >= COUNTRIES)
-      break;
-    if (country * step < input_size)
-      madvise((void *)(input + country * step), step, MADV_DONTNEED);
-    u32 distinct = 0;
-    for (size_t i = 0; i < WORDS; i++)
-      distinct += __builtin_popcountll(name_bits[country * WORDS + i].load(relaxed));
-    distinct_names[country].store(distinct, relaxed);
-  }
-  barrier->arrive_and_wait();
-}
-
-static char *money(char *out, long long cents) {
-  u64 abs = cents < 0 ? -cents : cents;
-  return out + sprintf(out, " %s%llu.%02llu", cents < 0 ? "-" : "", abs / 100, abs % 100);
+  });
+  run(mem.country_job, COUNTRIES, 1, finish_country);
+  return 0;
 }
 
 int main() {
   memset(LOW_BYTES, 255, 32);
   cpu_set_t cpus;
   sched_getaffinity(0, sizeof cpus, &cpus);
-  threads = CPU_COUNT(&cpus);
+  threads = std::min<size_t>(CPU_COUNT(&cpus), MAX_THREADS);
   regions = map_input("/data/regions.csv", regions_size);
   input = map_input("/data/records.csv", input_size);
-  // The randomly accessed tables share a huge page, which avoids a TLB miss on
-  // most records. They are touched before the workers start: threads racing to
-  // fault one huge page are each charged 2 MB until the race resolves, which
-  // shows up in peak memory.
-  size_t tables_size = NAMES_AT + (8ull << NAME_BITS);
-  by_id = zeroed(tables_size);
-  by_id[0] = 0;
-  slots = (atomic<u64> *)(by_id + NAMES_AT);
-  // 241 groups fill two huge pages. Touched first, like the tables above.
-  name_bits = (atomic<u64> *)zeroed(COUNTRIES * WORDS * 8);
-  for (size_t page = 0; page < 2; page++)
-    *(u8 *)(name_bits + page * HUGE_PAGE / 8) = 0;
-  // The box has huge pages always on. From here, a first touch of a thread's stack
-  // or the groups takes 4 KB, not 2 MB.
-  prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
-  groups = (Group *)zeroed(threads * COUNTRIES * sizeof(Group));
-  std::barrier barrier(threads);
-  for (int t = 1; t < threads; t++)
-    std::thread(worker, t, &barrier).detach();
-  worker(0, &barrier);
+  if (mmap(&mem, sizeof(Memory), PROT_READ | PROT_WRITE,
+           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0) != &mem)
+    abort();
+  // The first memory charge on a CPU reserves 256 KB for that CPU, and peak memory
+  // counts the reserve. So this thread faults what the workers would otherwise
+  // be charged for: the huge pages, the small pages they write, and page tables
+  // for the input, of which thread 0 makes the rest as they start on it.
+  for (size_t page = 0; page < 3; page++)
+    ((volatile u8 *)&mem)[page * HUGE_PAGE] = 0;
+  madvise((void *)((size_t)&mem.region_job & -4096),
+          (char *)mem.text - (char *)&mem.region_job + 4096,
+          MADV_POPULATE_WRITE);
+  // Here and not in the workers, as a late one must not be merged half made.
+  for (size_t i = 0; i < threads * COUNTRIES; i++) {
+    mem.groups[i].min = INT32_MAX;
+    mem.groups[i].max = INT32_MIN;
+  }
+  for (size_t t = 1; t < threads; t++)
+    clone(worker, mem.stacks[t] + STACK,
+          CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD |
+              CLONE_SYSVSEM,
+          (void *)t);
+  worker(0);
 
   // Countries in code order are already sorted, and _UNMATCHED sorts last.
-  char text[32768], *out = text;
+  char *out = mem.text;
   for (size_t code = 0; code <= CODES; code++) {
-    int country = code < CODES ? seen_codes[code].load(relaxed) : 0;
+    int country = code < CODES ? mem.seen_codes[code].load(relaxed) : 0;
     if (!country && code < CODES)
       continue;
-    char key[] = {char('A' + code / 676), char('A' + code / 26 % 26),
-                  char('A' + code % 26), 0};
-    Group total;
-    for (int t = 0; t < threads; t++) {
-      const Group &from = groups[t * COUNTRIES + country];
-      for (int i = 0; i < 4; i++)
-        total.sums[i] += from.sums[i];
-      total.min = std::min(total.min, from.min);
-      total.max = std::max(total.max, from.max);
-    }
-    u64 count = total.sums[2] >> 32;
-    if (!count)
-      continue;
-    out += sprintf(out, "%s %llu %llu", code < CODES ? key : "_UNMATCHED", count, total.sums[0]);
-    out = money(out, total.sums[1]);
-    out = money(out, total.min);
-    out = money(out, total.max);
-    out += sprintf(out, " %u %u %llu\n", distinct_names[country].load(relaxed),
-                   (u32)total.sums[2], total.sums[3]);
+    size_t length = mem.lengths[country];
+    memcpy(out, mem.lines[country] + LINE - length, length);
+    out += length;
   }
   int fd = open("/out/aggregates.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  if (write(fd, text, out - text) != out - text)
+  if (write(fd, mem.text, out - mem.text) != out - mem.text)
     abort();
   _exit(0);
 }
