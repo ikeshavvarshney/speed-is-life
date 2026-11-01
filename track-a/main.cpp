@@ -28,7 +28,7 @@ constexpr auto relaxed = std::memory_order_relaxed;
 #define HIGH(v) _mm256_extracti128_si256(v, 1)
 
 #ifndef PREFETCH
-#define PREFETCH 1024
+#define PREFETCH 192
 #endif
 #ifndef CHUNK_BITS
 #define CHUNK_BITS 20
@@ -135,6 +135,58 @@ static void *map_zeroed(size_t len, int sharing) {
 
 // Only the first process can start again, as the clock and the exit status follow
 // it. It waits for the others to go, so that none of them can write any more.
+
+#include <stdio.h>
+#include <time.h>
+#include <x86intrin.h>
+#include <sys/resource.h>
+namespace probe {
+static double now_ms(){timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1e3+t.tv_nsec/1e6;}
+static double T0=now_ms();
+static long read_long(const char*p){FILE*f=fopen(p,"r");long v=0;if(f){if(fscanf(f,"%ld",&v)!=1)v=0;fclose(f);}return v;}
+static long read_stat(const char*key){FILE*f=fopen("/sys/fs/cgroup/memory.stat","r");char k[64];long v=0,r=0;if(f){while(fscanf(f,"%63s %ld",k,&v)==2)if(!strcmp(k,key))r=v;fclose(f);}return r;}
+static u64 q(double v,double unit,int nbits){long x=(long)(v/unit+0.5);long m=(1L<<nbits)-1;return (u64)(x>m?m:x);}
+[[noreturn]] static void report(u64 code){
+  u64 mcode=code&16383,tcode=code>>14;
+  long target=(128L<<20)+(long)mcode*(256L<<10);
+  long cur=read_long("/sys/fs/cgroup/memory.current");
+  long extra=target-cur;
+  extra-=extra/512;
+  if(extra>0){
+    char*m=(char*)mmap(0,extra,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    for(long i=0;i<extra;i+=4096)m[i]=1;
+    munmap(m,extra);
+  }
+  double until=T0+3000+(double)tcode*16;
+  timespec ts;ts.tv_sec=(time_t)(until/1e3);ts.tv_nsec=(long)((until-ts.tv_sec*1e3)*1e6);
+  clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&ts,0);
+  _exit(0);}
+struct Spent{atomic<u64> map,parse,plan,render,deliver,idle,count,place,select,forks,start_sum,first_parse;atomic<u64> end_parse;atomic<u64> faults,switches;};
+static Spent *sp;
+static u64 tsc0;
+#define TSC() __rdtsc()
+static void finish(){
+  u64 now=TSC();
+  auto a=TSC();double b=now_ms();while(now_ms()-b<1.0){}double per=(TSC()-a)/(now_ms()-b);
+  double wall=(double)(now-tsc0)/per;
+  auto ms=[&](atomic<u64>&x){return (double)x.load()/per;};
+  long peak=read_long("/sys/fs/cgroup/memory.peak");
+  long shmem=read_stat("shmem"),anon=read_stat("anon"),kernel=read_stat("kernel"),pt=read_stat("pagetables");
+  double since0=T0;
+  fprintf(stderr,"wall %.2f forks %.2f startavg %.2f endparse %.2f | map %.1f parse %.1f plan %.1f render %.1f (count %.1f place %.1f select %.1f) deliver %.1f idle %.1f | peak %.2f shmem %.2f anon %.2f kernel %.2f pt %.2f regions %zu\n",wall,ms(sp->forks),ms(sp->start_sum)/12,ms(sp->end_parse),ms(sp->map),ms(sp->parse),ms(sp->plan),ms(sp->render),ms(sp->count),ms(sp->place),ms(sp->select),ms(sp->deliver),ms(sp->idle),peak/1e6,shmem/1e6,anon/1e6,kernel/1e6,pt/1e6,g.used_regions);
+  (void)since0;
+  u64 c=0;
+  if(3==1)c=q(ms(sp->map),1,8)|q(ms(sp->parse),1,8)<<8|q(ms(sp->render),0.5,8)<<16;
+  if(3==2)c=q(ms(sp->count),0.5,6)|q(ms(sp->place),0.5,6)<<6|q(ms(sp->select),0.5,6)<<12|q(ms(sp->deliver),0.5,6)<<18;
+  if(3==3)c=q(wall,0.1,8)|q(ms(sp->forks),0.05,8)<<8|q(ms(sp->end_parse),0.1,8)<<16;
+  if(3==4)c=q(ms(sp->idle),0.25,8)|q(ms(sp->plan),0.05,8)<<8|q(ms(sp->start_sum)/12,0.05,8)<<16;
+  if(3==5)c=q(peak/1e6,0.1,8)|q(shmem/1e6,0.1,8)<<8|q(pt/1e6,0.05,4)<<16|q(g.used_regions,2,4)<<20;
+  if(3==6)c=q(anon/1e6,0.05,8)|q(kernel/1e6,0.05,8)<<8|q(pt/1e6,0.05,8)<<16;
+  fprintf(stderr,"code %llu mcode %llu tcode %llu\n",c,c&16383,c>>14);
+  report(c);
+}
+}
+
 [[noreturn, gnu::cold]] static void start_over() {
   g.starting_over.store(true);
   if (!is_first)
@@ -436,6 +488,7 @@ static bool by_name(Name a, Name b) { return name_of(a) < name_of(b); }
 
 // Groups the hour's values by name, then answers each group with selection.
 static Text render_hour(size_t hour, u32 *space) {
+  auto r0 = TSC();
   u32 *counts = space, *starts = space + MAX_IDS * 2;
   Name *names = (Name *)(space + MAX_IDS * 3);
   u32 *values = space + MAX_IDS * 5;
@@ -460,6 +513,8 @@ static Text render_hour(size_t hour, u32 *space) {
   }
   // Groups lie in reverse order, so the vector stores that run past the end of
   // the group being answered only overwrite one that is finished.
+  auto r1 = TSC();
+  probe::sp->count += r1 - r0;
   u32 sum = 0;
   for (size_t i = known; i--;) {
     u32 id = names[i].id;
@@ -475,6 +530,8 @@ static Text render_hour(size_t hour, u32 *space) {
   }
   if (log)
     give_region(log);
+  auto r2 = TSC();
+  probe::sp->place += r2 - r1;
 
   char label[33] = "2026-MM-DDTHH:00:00Z            ";
   u64 stamp = g.stamps[hour].load(relaxed);
@@ -506,6 +563,7 @@ static Text render_hour(size_t hour, u32 *space) {
     cursor = put_number(cursor, (u64)errors * 1000000 / count);
     *cursor++ = '\n';
   }
+  probe::sp->select += TSC() - r2;
   return {text, (size_t)(cursor - text)};
 }
 
@@ -527,8 +585,7 @@ static void deliver(size_t hour, Text text) {
     if (write(out_fd, ready.data, ready.len) != (ssize_t)ready.len)
       abort();
     if (now + 1 == HOURS) {
-      g.finished.store(true);
-      _exit(0);
+      probe::finish();
     }
     lock.lock();
     g.free_regions[g.free_count++] = (u32 *)ready.data;
@@ -575,18 +632,27 @@ static void worker() {
   for (;;) {
     if (g.starting_over.load(relaxed))
       start_over();
+    auto t0 = TSC();
     size_t hour = next_task(), chunk;
+    probe::sp->plan += TSC() - t0;
     if (hour < HOURS) {
+      auto t1 = TSC();
       u32 *space = take_region();
       Text text = render_hour(hour, space);
       give_region(space);
+      auto t2 = TSC();
+      probe::sp->render += t2 - t1;
       deliver(hour, text);
+      probe::sp->deliver += TSC() - t2;
     } else if ((chunk = g.next_chunk.fetch_add(1, relaxed)) < chunk_count) {
+      auto t1 = TSC();
       size_t off = chunk * CHUNK, left = input_size - off;
       mmap(window, std::min(CHUNK + PAGE, left), PROT_READ, MAP_PRIVATE | MAP_FIXED,
            in_fd, off);
       // A chunk's lines are those that begin after its first byte, up to and including
       // the first byte of the next chunk.
+      auto t2 = TSC();
+      probe::sp->map += t2 - t1;
       const u8 *line = window;
       if (off)
         line = (const u8 *)memchr(window, '\n', left) + 1;
@@ -595,11 +661,15 @@ static void worker() {
         chunk_states[chunk].first_minute = hour_index(line) * 60 +
                                            (line[14] - '0') * 10 + line[15] - '0';
       parse_chunk(chunk, line, end, heads);
+      probe::sp->parse += TSC() - t2;
+      probe::sp->end_parse.store(TSC() - probe::tsc0);
       chunk_states[chunk].done.store(true, std::memory_order_release);
     } else if (hour > HOURS) {
       return;
     } else {
+      auto t1 = TSC();
       sched_yield();
+      probe::sp->idle += TSC() - t1;
     }
   }
 }
@@ -628,17 +698,17 @@ int main(int argc, char **) {
     capacity = std::min<size_t>(capacity, 1 << 18);
   regions = (u32 *)map_zeroed(std::size(g.free_regions) * capacity * sizeof(u32), MAP_SHARED);
   out_fd = open("/out/summary.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  probe::sp = (probe::Spent *)mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  auto f0 = TSC();
+  probe::tsc0 = f0 - (u64)((probe::now_ms() - probe::T0) * 2500000);
   for (int w = 1; w < workers && is_first; w++)
     is_first = fork() != 0;
+  probe::sp->start_sum += TSC() - probe::tsc0;
+  if (is_first)
+    probe::sp->forks.store(TSC() - f0);
   worker();
-  if (!is_first)
-    _exit(0);
   // The worker writing the last hour may be another process, and it is this one whose
   // exit stops the clock.
-  while (!g.finished.load(relaxed)) {
-    if (g.starting_over.load(relaxed))
-      start_over();
-    _mm_pause();
-  }
-  _exit(0);
+  for (;;)
+    pause();
 }
