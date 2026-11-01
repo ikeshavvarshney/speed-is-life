@@ -27,7 +27,10 @@ constexpr auto relaxed = std::memory_order_relaxed;
 #define INLINE [[gnu::always_inline]] inline
 
 const size_t CHUNK = 1 << 19, QUERY_CHUNK = 1 << 14, PREFETCH_AHEAD = 12;
+const size_t HUGE_PAGE = 1 << 21;
 const size_t PAGE = 1 << 12, RELEASE_STEP = 1 << 22, PROBE_RATIO = 6;
+// Setting bits costs about half as much per id as a merge.
+const size_t DENSE_LIMIT = 1 << 10;
 // A term this frequent among the queries is likely in over 1/32 of documents,
 // where a bitset is smaller than its list. The queries sample the corpus: phrases
 // are windows of documents, and boolean terms are drawn by band. More frequent
@@ -402,7 +405,16 @@ static void plan_index() {
     chunk.lengths = {};
     chunk.hashes = {};
   }
-  table = {(u64 *)calloc(draft.len, 8), draft.mask};
+  // Twice the size of the draft, which leaves few displaced terms. Every token looks
+  // here, so this alone gets a huge page, for the sake of the TLB.
+  size_t table_size = (draft.mask + 1) * 2;
+  auto raw = (size_t)reserve(HUGE_PAGE * 2 + (table_size + TABLE_PADDING) * 8);
+  table = {(u64 *)((raw + HUGE_PAGE - 1) & -HUGE_PAGE), table_size - 1};
+  prctl(PR_SET_THP_DISABLE, 0, 0, 0, 0);
+  madvise(table.slots, (table_size + TABLE_PADDING) * 8, MADV_HUGEPAGE);
+  for (size_t at = 0; at < table_size + TABLE_PADDING; at += PAGE / 8)
+    table.slots[at] = 0;
+  prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
   for (auto *terms : {&hot, &cold})
     for (u32 at : *terms)
       table.insert(draft.hashes[at].load(relaxed),
@@ -816,8 +828,7 @@ struct Evaluator {
       return;
     }
     if (op == OP_OR) {
-      // A long list of ids takes more room than a bitset.
-      if (n + nl > words * 2) {
+      if (n + nl > DENSE_LIMIT) {
         to_dense(nullptr);
         apply(op, id);
         return;
@@ -965,7 +976,7 @@ static void after_parsing() {
     for (const Hit &hit : scratch.hits)
       phrase_docs[cursors[hit.phrase]++] = hit.doc;
   phrases = {};
-  free(table.slots);
+  munmap(table.slots, HUGE_PAGE);
   munmap((void *)input, input_size + PAGE);
 }
 
@@ -1041,7 +1052,7 @@ int main() {
   threads = CPU_COUNT(&cpus);
   text = map_input("/data/queries.txt", text_size);
   find_query_chunks();
-  size_t size = std::max<size_t>(std::bit_ceil(text_size / 8 + 16), 1 << 10);
+  size_t size = std::max<size_t>(std::bit_ceil(text_size / 16 + 16), 1 << 10);
   draft.len = size + TABLE_PADDING;
   draft.mask = size - 1;
   draft.hashes = (std::atomic<u64> *)calloc(draft.len, 8);
