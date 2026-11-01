@@ -9,6 +9,7 @@
 #include <immintrin.h>
 #include <mutex>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
@@ -66,12 +67,10 @@ static const u8 *map_input(const char *path, size_t &size) {
 }
 
 // Zeroed memory on 2 MB boundaries. Lives until process exit.
-static u8 *zeroed(size_t bytes, int advice) {
+static u8 *zeroed(size_t bytes) {
   auto raw = (size_t)mmap(0, bytes + HUGE_PAGE, PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  auto aligned = (u8 *)((raw + HUGE_PAGE - 1) & -HUGE_PAGE);
-  madvise(aligned, bytes, advice);
-  return aligned;
+  return (u8 *)((raw + HUGE_PAGE - 1) & -HUGE_PAGE);
 }
 
 static const u8 *input, *regions;
@@ -182,14 +181,14 @@ INLINE u64 hash_name(const u8 *p, size_t len, __m128i key) {
 // so a hit does not branch on where the hash sits. A bucket fills in order, so a
 // thread that sees a free way has not missed its hash further along, and losing
 // the race for a way only means looking at the winner's hash.
-INLINE size_t intern(u64 hash) {
+INLINE size_t intern(atomic<u64> *table, u64 hash) {
   size_t bucket = hash >> (67 - NAME_BITS);
   v4 want = _mm256_set1_epi64x(hash);
   auto mask = [](v4 x, v4 y) -> u32 {
     return _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(x, y)));
   };
   for (;;) {
-    auto at = slots + bucket * 8;
+    auto at = table + bucket * 8;
     v4 low = _mm256_load_si256((const v4 *)at);
     v4 high = _mm256_load_si256((const v4 *)(at + 4));
     u32 hit = mask(low, want) | mask(high, want) << 4;
@@ -215,6 +214,7 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
   const __m128i three = _mm_setr_epi16(3, 0, 3, 0, 0, 0, 0, 0);
   const __m128i key = _mm_set_epi64x(0x8BB84B93962EACC9, 0x2D358DCCAA6C78A5);
   const auto table = slots;
+  const auto bits = name_bits;
   u32 marks[MAX_MARKS];
   // Number of "" pairs in the field each mark ends. It stays mostly zero.
   u32 pairs[MAX_MARKS + 1] = {};
@@ -331,16 +331,16 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
         group.min = amount;
       if (amount > group.max) [[unlikely]]
         group.max = amount;
-      size_t name = intern(rec.hash);
+      size_t name = intern(table, rec.hash);
       size_t word = ids[rec.region] * WORDS + name / 64;
-      __builtin_prefetch(name_bits + word, 1);
+      __builtin_prefetch(bits + word, 1);
       recs[r].hash = word;
       recs[r].region = name % 64;
     }
     // A set bit costs no write, and a write costs a locked instruction that
     // often has to fetch the line from another core, so it is the last step.
     for (size_t r = 0; r < n; r++) {
-      auto &word = name_bits[recs[r].hash];
+      auto &word = bits[recs[r].hash];
       u64 bit = 1ull << recs[r].region;
       if (!(word.load(relaxed) & bit))
         word.fetch_or(bit, relaxed);
@@ -426,14 +426,17 @@ int main() {
   // fault one huge page are each charged 2 MB until the race resolves, which
   // shows up in peak memory.
   size_t tables_size = NAMES_AT + (8ull << NAME_BITS);
-  by_id = zeroed(tables_size, MADV_HUGEPAGE);
+  by_id = zeroed(tables_size);
   by_id[0] = 0;
   slots = (atomic<u64> *)(by_id + NAMES_AT);
   // 241 groups fill two huge pages. Touched first, like the tables above.
-  name_bits = (atomic<u64> *)zeroed(COUNTRIES * WORDS * 8, MADV_HUGEPAGE);
+  name_bits = (atomic<u64> *)zeroed(COUNTRIES * WORDS * 8);
   for (size_t page = 0; page < 2; page++)
     *(u8 *)(name_bits + page * HUGE_PAGE / 8) = 0;
-  groups = (Group *)zeroed(threads * COUNTRIES * sizeof(Group), MADV_NOHUGEPAGE);
+  // The box has huge pages always on. From here, a first touch of a thread's stack
+  // or the groups takes 4 KB, not 2 MB.
+  prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+  groups = (Group *)zeroed(threads * COUNTRIES * sizeof(Group));
   std::barrier barrier(threads);
   for (int t = 1; t < threads; t++)
     std::thread(worker, t, &barrier).detach();
