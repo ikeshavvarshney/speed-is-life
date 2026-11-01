@@ -263,11 +263,15 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
       // A quarter of blocks hold pairs, which a branch would keep mispredicting,
       // and under 2% hold more than two. So two are counted unconditionally: with
       // no pair left, the bit is 0 and the add does nothing.
-      for (int i = 0; i < 2 || found_pairs; i++) {
+      auto count_pair = [&] {
         u64 bit = found_pairs & -found_pairs;
         pairs[filled + __builtin_popcountll(seps & (bit - 1))] += bit != 0;
         found_pairs ^= bit;
-      }
+      };
+      count_pair();
+      count_pair();
+      while (found_pairs) [[unlikely]]
+        count_pair();
       size_t k = filled;
       filled += __builtin_popcountll(seps);
       // Blocks hold about six marks. Writing eight every time beats a branch.
