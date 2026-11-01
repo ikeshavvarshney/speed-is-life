@@ -222,6 +222,9 @@ struct Walk {
 
 INLINE void parse_line(Walk &walk, size_t &lowest, v4 space_vector) {
   const u8 *line = walk.line;
+  // The buffer was just copied into the second cache level, and misses in the first
+  // stall every load on this line, so the input ahead is brought in early.
+  _mm_prefetch((const char *)line + 256, _MM_HINT_T0);
   // These bytes hold the month, day and hour. Nearly every line has the hour
   // of the line before it, as the file is the shards' chunks in arrival order.
   u64 now = load64(line + 5);
