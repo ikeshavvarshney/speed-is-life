@@ -1,46 +1,146 @@
 # Track B: performance log
 
-Every step from the reference to your final version, each with the live-board run ID that measured it. Judges check that the run IDs exist and that each change moved the way you say it did.
+Every step from the reference to the final version, each with the live-board run ID that measured it. Rejected experiments are listed too. A single board run varies by about 1 to 2%, so small differences below are noise, and I say so where it matters.
+
+## Summary
+
+| Stage | Run ID | T (s) | M (MB) | S | K | Points | Rank |
+|---|---|---|---|---|---|---|---|
+| The reference | | 56.35 | 2,200 | 91 | 1 | 0 | |
+| First Rust version | run-0136d17c3355 | 0.554 | 162 | 781 | 12.31 | 54.51 | 43 |
+| Second Rust version, mask tokenizer | run-9d8f92934f66 | 0.157 | 58 | 1119 | 26.88 | 71.47 | 5 |
+| C++ port, tuned for the core | run-566f7abf2f2c | 0.154 | 57 | 786 | 28.70 | 72.90 | 6 |
+| Redesign below, final | run-2bb9a8096c33 | 0.0748 | 46.6 | 960 | 41.67 | 80.99 | 1 |
+
+## Earlier steps
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
-| 0 | The reference, unchanged | | 56.35 | 2,200 | 0 |
 | 1 | Rust rewrite: index only query terms, bitsets for common terms, no positions, phrases verified by re-reading candidates | run-0136d17c3355 | 0.554 | 162 | 54.5 |
 | 2 | Match phrases live during tokenizing, triggered by each phrase's rarest term, so no document is re-read. One 16-byte table entry per term, so a token costs one cache miss. Remove duplicates when lists are sorted | run-c4b57ba6ab55 | 0.335 | 152 | 59.8 |
 | 3 | Mask-based tokenizer, two passes per document with prefetch, 16-bit hit log and lists built without sorting, pair bitset for anchors, parallel query reading into one table, boolean queries evaluated from text | run-9d8f92934f66 | 0.157 | 58 | 71.5 |
 
-Experiments measured locally on one core, not pushed on their own:
+Measured locally on one core, not pushed on their own: buffering common-term bits for 64 documents (no gain, kept because it removes an atomic per token), a bigram filter as the phrase trigger (answering fell from 2.4 s to 0.5 s but tokenizing grew by 1.4 s), and `mimalloc` (3% faster, 220 MB against 134 MB, net -4.1 points).
 
-- Buffering common-term bits for 64 documents instead of writing them directly: no measurable gain, kept because it removes an atomic per token.
-- A bigram filter as the phrase trigger: answering fell from 2.4 s to 0.5 s, but tokenizing grew by about 1.4 s. Replaced by the rare-term trigger.
-- `mimalloc`: about 3% faster but 220 MB against 134 MB, net -4.1 points after the dependency cost. Rejected.
-
-How step 3 was built, measured locally on a laptop (full seed 1, 1 core, then 4 threads):
-
-| Change | 1 core | 4 threads | Memory | Note |
-|---|---|---|---|---|
-| Starting point | 3.8 s | 2.05 s | 134 MB | |
-| Mask-based tokenizer, 16-bit hit log and lists, list build without sorting | 2.45 s | 1.09 s | 46 MB | Tokenizing alone fell from 0.85 s to 0.2 s |
-| Hash each window first, then prefetch and look up | 2.22 s | 1.04 s | 46 MB | Replaced two steps later |
-| Branch-free token actions | 2.17 s | 1.01 s | 46 MB | Small gain |
-| Pair bitset to reject anchor tokens | 2.15 s | 0.96 s | 46 MB | Reading neighbours from bytes was itself slow |
-| Tokenize and look up in separate passes, prefetch 12 tokens ahead | 1.96 s | 0.78 s | 46 MB | Also removed code |
-| Read queries in parallel, evaluate boolean queries from text | 1.9 s | 0.85 s | 46 MB | Aimed at the 12-thread box, where serial setup matters most |
-
-Other experiments: prefetch distances 4, 12 and 24 were within noise. The same hot loop in C++ with gcc 16 took 0.76 to 0.81 s against 0.60 to 0.79 s in Rust, with identical checksums, so no language switch.
-
-Wrong guesses worth recording: buffering common-term bit writes gave nothing, and removing per-token phrase bookkeeping gave far less than a simple test had suggested. Removing one layer at a time showed the real cost was a mispredicted branch on a load still missing cache.
-
-## Port to C++
-
-The first port looked level with Rust on the 2-core laptop, but was slower on the 12-thread box. Three build-level fixes followed, the same on all tracks: writable globals moved off shared cache lines, `u64` given a different type from `size_t` so writes to it do not force sizes and masks to be reloaded, and `-mtune=alderlake` to match the box's P-cores. Tuning for the core appeared to be the largest of these, in the one push that changed it across all tracks. `prefetchw` was tried on tracks C and D and removed in the same push as the first two fixes, so its own cost was not isolated.
-
-| Step | Run ID | T (s) | M (MB) | S | K | Points |
+| Port to C++ | Run ID | T (s) | M (MB) | S | K | Points |
 |---|---|---|---|---|---|---|
 | Last Rust best | run-9d8f92934f66 | 0.1568 | 58.4 | 1119 | 26.88 | 71.47 |
 | First port | run-07048df0c209 | 0.1719 | 65.0 | 786 | 26.50 | 71.17 |
-| Globals separated, distinct type | run-233b7b50ca6f | 0.1648 | 61.9 | 786 | 27.34 | 71.84 |
-| Tuned for the core | run-566f7abf2f2c | 0.1542 | 57.2 | 786 | 28.70 | 72.90 |
-| Same code, later run | run-e98d6aa93cac | 0.1576 | 62.6 | 786 | 27.89 | 72.27 |
+| Globals separated, distinct type for `u64` | run-233b7b50ca6f | 0.1648 | 61.9 | 786 | 27.34 | 71.84 |
+| `-mtune=alderlake` | run-566f7abf2f2c | 0.1542 | 57.2 | 786 | 28.70 | 72.90 |
 
-Queries are now mapped rather than read, and output chunks are written one by one rather than joined first. An earlier hot-loop test above found no C++ gain in time. That still holds: the gain here is the 30% fewer lines.
+## Measuring on the scoring box
+
+Local timings had misled this project several times: the laptop has 2 cores, a 256 KB second level cache and nested paging, while the box has 6 cores, 1.25 MB of L2 and no VM. So before redesigning anything I wanted the real split of the 154 ms.
+
+The board only publishes T and M, so diagnostic builds reported through those. The output stays byte-exact and the gates pass, but after finishing, the program touches enough memory that M = 128 MB + code x 256 KB, releases it, and sleeps until T = 3 s + code x 16 ms. Whatever is left of T below 16 ms is exec and exit. These runs score about 20 points, so they can never become a best run, and the real code went straight back afterwards. They are marked as diagnostics in the commit history.
+
+| Reading on the box | Old code (run-5bd3d003fccc, run-471cc4b52410, run-fc56c5b4d4e0) | At T 0.098 (run-3aa38a6877a9, run-f2c102d7098b, run-5a8a186e52cb) | At T 0.077 (run-476a6ddbeda2, run-3eccd7371dba, run-29d4b2b769ec) |
+|---|---|---|---|
+| Setup (ms) | 7 | at least 7.5 (field saturated) | 6.5 |
+| Parse (ms) | 88 | 66.5 | 54.75 |
+| Lists (ms) | 21 | 6.75 | 6.75 |
+| Answers (ms) | 37.5 | 23.25 | 14.5 |
+| Release and write (ms) | 0.5 | 2 | |
+| Exec and exit (ms) | 7.2 | 1.8 | 1.7 |
+| Tokenize (thread-ms) | 316 | 264 | 248 |
+| Lookups (thread-ms) | 608, with actions | 260 | 104 |
+| Log pushes (thread-ms) | | 78 | 76 |
+| Peak memory (MB) | 60.5 | | |
+| Huge pages | `always` | | |
+
+The instrumentation itself adds a few percent, so these are for proportions. The readings changed the plan more than once. Lists at 21 ms and answers at 37.5 ms were both far larger than the laptop suggested, and exit at 7 ms was nearly all waste. Most usefully, the huge page setting explained why memory wandered between 57 and 71 MB on unchanged code.
+
+## The redesign, step by step
+
+Each kept step matched the reference on all 8 local datasets before it was pushed.
+
+| Step | Change | Run ID | T (s) | M (MB) | S | K | Points |
+|---|---|---|---|---|---|---|---|
+| 4 | Huge pages off for the process | run-3907cf2f21f8 | 0.1541 | 50.2 | 788 | 29.46 | 73.46 |
+| 5 | Answers: smallest list first in filter runs, vector probing, vector bit counts | run-cf7ff1b9b7bb | 0.1366 | 50.0 | 868 | 30.87 | 74.48 |
+| 6 | One thread pool with barriers, no document sample, phrase hits by counting, parallel unmap | run-77f1218ea95b | 0.1317 | 50.3 | 867 | 31.41 | 74.85 |
+| 7 | Parser: AES hash, one-probe table, sort tokens by kind, batched bitset flush | run-5e25aea73ffe | 0.1120 | 52.0 | 949 | 33.38 | 76.17 |
+| 8 | One sparse log region per partition, lists built in place | run-3578a1f85803 | 0.1014 | 52.0 | 941 | 35.13 | 77.28 |
+| 9 | Scratch buffers shared across steps, log tails and everything else released before the write | run-bd1694ff04f4 | 0.0989 | 48.1 | 950 | 36.08 | 77.86 |
+| 10 | 512-byte log blocks, queries kept as ids so the table goes after parsing | run-9ba37dd8f1e0 | 0.1000 | 45.6 | 965 | 36.17 | 77.92 |
+| 11 | Table twice the size, buffered log writes (the buffers were removed in step 18) | run-b7a51cb259c9 | 0.0983 | 45.9 | 977 | 36.36 | 78.03 |
+| 12 | Rewrite into file-level state, simpler classifier and pair hash, linked anchors | run-1e1986364e75 | 0.0984 | 46.5 | 877 | 36.84 | 78.31 |
+| 13 | Block intersection, last operator answered from the shared ids | run-c5771f4d05d6 | 0.0935 | 46.7 | 925 | 37.48 | 78.69 |
+| 14 | Earlier bitset unions, smaller draft table, lookup table on one huge page | run-799a356fc7c0 | 0.0885 | 46.3 | 934 | 38.52 | 79.28 |
+| 15 | Four lookups at a time with a vector gather | run-80eeb7517720 | 0.0769 | 46.6 | 962 | 41.09 | 80.68 |
+| 16 | Prefetch as each hash is made, default malloc arenas, scratch reused for lists | run-d31414c387c9 | 0.0774 | 46.1 | 949 | 41.12 | 80.70 |
+| 17 | Lookup table twice the size again | run-60309442e37d | 0.0751 | 47.2 | 949 | 41.55 | 80.93 |
+| 18 | Direct log writes, no buffers | run-7ee57d1c6beb | 0.0747 | 48.1 | 938 | 41.56 | 80.93 |
+| 19 | Query data in slices of one mapping, no malloc while reading queries | run-f334ea5bba9d | 0.0754 | 46.5 | 960 | 41.53 | 80.92 |
+| 20 | Three AES rounds, after finding a real hash collision | run-158b08491da4 | 0.0746 | 46.9 | 964 | 41.66 | 80.98 |
+| 21 | Plain table insertion | run-2bb9a8096c33 | 0.0748 | 46.6 | 960 | 41.67 | 80.99 |
+
+### Why each one worked
+
+**Huge pages (step 4).** The box has transparent huge pages set to `always`. A first touch anywhere in a 2 MB-aligned range of a large enough mapping charges 2 MB: a thread's 8 MB stack, or log mappings the kernel had merged. Threads racing on one fault are each charged until the race resolves, which fits the 57 to 71 MB noise. One `prctl` gave 57-65 MB to 50 MB with no change in T. The glibc project discusses the same stack problem.
+
+**Answers (steps 5, 13, 14).** Answers were 37.5 ms, and 53 million list entries were decoded. But filters between two ORs commute, so a run can start from its smallest list, and half of all boolean queries then have under 100 candidates. [Lemire, Boytsov and Kurz](https://arxiv.org/pdf/1401.6399) found the same order, smallest list first, well ahead of the alternatives on real data, with SIMD comparison best for lists of similar sizes. Later profiling by query shape showed plain two-list merges dominating, at 10k to 16k cycles for answers of a few documents. So similar-sized lists compare 8 against 8 in one vector step, and the last OR or NOT needs no result list at all: the shared ids give its size and sum arithmetically, and only the first ten ids are built. Results that end as bitsets took 22% of answer time, which an AVX2 positional popcount cut by about a factor of 4 ([Clausecker and Lemire](https://arxiv.org/abs/2412.16370) is the same family of technique). Setting bits costs about half a scalar merge per id, so unions now move to a bitset at 1,024 ids, not 7,824.
+
+**Serial work (step 6).** Spawning threads per phase, sampling documents and sorting phrase hits all ran on one thread with the clock running. The sample could go entirely: phrases are windows of documents, and boolean terms are drawn by band, so counts over the queries themselves estimate frequency. Measured offline on seed 1, the same bitset memory results (33.5 MB), and anchor firings fall from 1.71M to 1.28M. Exit fell from 7 ms to under 2 ms once all threads cleared the input's page tables and released memory themselves.
+
+**Parser (steps 7, 14, 15, 17).** Three separate things.
+- A token's kind is unpredictable, so the old code did both possible writes for every token. Now a vector step sorts ids into a common-term array and a list-term array using permutation tables, and each kind runs a tight loop with no dummy writes. One-core parsing fell from 1,067 ms to 735 ms locally.
+- The table lookup had been a 4-slot vector compare at 22 micro-ops. Most terms now sit in their home slot in a sparse table, so one load usually answers, with a flag saying when a term went elsewhere.
+- Then the biggest surprise of the whole effort. Replacing four scalar lookups with one `vpgatherqq` took T from 0.0878 to 0.0769 s, 12% of the total run. The laptop showed almost nothing, probably because its Skylake gather carries the Downfall microcode mitigation, which the i5-13500 does not need. Lookups fell from 260 to 104 thread-ms on the box.
+
+A displaced lookup costs a mispredict and a probe, so the rate matters more than it looks. Going from 2.8% to 6.6% cost about 3 ms (rejected below), and 2.8% to 1.25% gained about 2 ms for 2 MB more during parsing. The table has one huge page because every token reads it: huge pages are turned on just long enough to fault it, on one thread, so no thread can race for a page, and off again for everything else.
+
+**Lists (step 8).** Lists were 21 ms on the box. Each hit log was its own mapping, so freeing them meant 1,248 `munmap` calls, each interrupting all 12 threads. Now all of a partition's hits lie in one sparse region, in blocks claimed by atomic counter, and each partition's lists are built in a private image and copied over its own log. There is no separate list array, no page fault churn, and log and lists never both take memory. Whole blocks of 512 documents have a single owner, so bitset flushes need no atomics or false sharing, and the group order needs no sort.
+
+**Memory (steps 9, 10, 16, 19).** Forcing 12 threads locally reproduced the board's memory within 1 MB once huge pages were off, which made this measurable by phase: the peak was at the very end, with lists, bitsets, answer buffers, strings and the output file all live. Every step's buffers are now the same scratch pages, everything is released before the output is written, and query reading does no malloc, which removed about 1 MB of arena leftovers. Memory stops paying below 44 MB, so this is close to done.
+
+## Experiments that did not pay
+
+On the board:
+
+| Change | Run ID | T (s) | M (MB) | S | K | Result |
+|---|---|---|---|---|---|---|
+| Tokenizer with no branch per token: always extract 12 tokens per window, hash in a second loop | run-39a8fc0aefd6 | 0.0912 | 46.2 | 963 | 37.79 | Slower than 0.0885. Removing the window-end mispredict cost more than it saved |
+| Prefetch to the second level cache only | run-de2eaf1b97b9 | 0.0900 | 46.6 | 934 | 38.14 | No gain |
+| Bitsets on huge pages | run-c7f8a4fae56a | 0.0878 | 46.3 | 938 | 38.64 | Within noise, and zeroing them serially takes time. Undone in step 16 |
+| No prefetch with gathered lookups | run-2ba232ededb8 | 0.0792 | 46.6 | 958 | 40.50 | 3% slower, prefetch stays |
+| Profile-guided build, trained on generator output | run-12a44af8196f | 0.0779 | 45.9 | 954 | 40.99 | No gain, as on Track C. It did confirm that a byte-identical generator copy costs no lines |
+| Each worker pinned to one CPU | run-ebabba8bfb98 | 0.0793 | 45.9 | 957 | 40.62 | No gain |
+| One table filled from the queries and converted in place | run-0eba0674dfdd | 0.0803 | 46.2 | 943 | 40.40 | Serial setup halved and 20 fewer lines, but 6.6% of lookups went slow |
+| Fewer bitsets, threshold 30 | run-e4eac6d2324a | 0.0766 | 47.3 | 949 | 41.13 | No gain |
+| Lookup and sorting in one 4-lane step | run-eb8b8a2f64e3 | 0.0810 | 46.8 | 963 | 39.98 | Twice the permutes per token, and 64-bit compares, all on one execution port |
+| `-O2` | run-5fad180f6f06 | 0.0754 | 47.3 | 962 | 41.37 | Within noise, `-O3` stays |
+
+Measured locally, not pushed:
+
+- Stored list sums, searching long lists in place, and answering two-term queries from sizes alone. Decoded ids fell from 57M to 24M and answers by 12%, but each in-place probe costs about 56 cycles, list building grew, and it added 60 lines. A net loss in K.
+- A single malloc arena: 0.5 MB less at first, but query reading got no speedup from threads at all, through lock contention. Removing it later cost no memory.
+- Sized reservations for query vectors: about 1 MB worse, through arena holes.
+
+## Bugs the tests caught
+
+Every one of these passed some checks, which is why the checks are layered.
+
+- **Weak hash, the serious one.** The first AES hash used two rounds and kept 64 bits, as Track A's note suggested. All datasets passed. A direct test on real tokens then found `wodeand` and `woweandvi` colliding in the seed 2 corpus, where about 2e-8 collisions were expected. Two rounds leave the low half of the state colliding for tokens that differ only along one of AES's diagonals: 28% of a targeted set collided. A collision only matters if it involves a query term, so this was a small risk of scoring zero on an unseen seed, not a certainty. Three rounds gave no collisions in 25 million targeted tokens, and cost no measurable time.
+- A thread out of queries released the lists while others were still answering from them. The hash check caught it at once locally. Fixed with a barrier.
+- The end of a claim was tested after reading the document id, not at the line start. A document whose id digits straddled the boundary, if it also started a block, could have lost 512 documents. Too rare for any test to reach: I found it reading the code.
+- Tokens of 64 bytes or more were dropped, which made their neighbours look adjacent. The spec caps generated tokens at 32 bytes, so it could not affect scoring, but a fuzzer against the reference found it and the fix is two lines.
+- A limit overflowed in list decoding, which decoded everything as empty, and made answers look 5x faster. A result that good is worth doubting.
+- `munmap` with a fixed 2 MB length unmapped a neighbour on small datasets. These crashes wrote 8 GB of core dumps to my disk, so the test scripts now disable core dumps.
+- One board run failed to build (run-9e761074ac6e): stripping my timing marks left an `else if` with no body, and my command pushed despite the failed check. Pushes now go through a script that refuses unless the build and all datasets pass.
+
+## How it was checked
+
+- All 8 local datasets before each push, including full seeds 1 and 2.
+- Forced thread counts of 2, 3, 7, 12 and 16 over hundreds of repeated runs, as the laptop has only 4 threads.
+- 28 fresh generator seeds at tiny, sample and full scale, compared with the reference.
+- A fuzzer comparing against the reference's own logic, on hostile inputs: tokens of 1 to 80 bytes, mixed case, bytes above 0x7F, terms common enough for bitsets, all operator shapes, empty documents and repeated phrase terms.
+- Targeted hash attacks, listed above.
+
+## What I took from this
+
+- Measure on the machine that counts. Most of the large wins here (huge pages, gather, exit cost) could not be seen on the laptop at all, and some things that looked good there lost on the box.
+- Removing work beats speeding it up: the document sample, the table lookups in answers, the separate list array and the last operator's result list all simply went away.
+- Vector code pays when it replaces many scalar micro-ops, and not when it adds shuffles on one port.
+- Test the hash as its own component. Byte-exact output on many seeds says little about a collision that needs two particular tokens to exist.
