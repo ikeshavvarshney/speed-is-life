@@ -11,7 +11,7 @@ docker build -q --network=none -t "$image" track-b >/dev/null
 run() {
   docker run --rm ${CPUS:+--cpuset-cpus=$CPUS} --network=none --read-only --tmpfs /tmp:rw,size=1g,exec \
     --tmpfs /out:rw,size=64m,mode=1777 --memory=8g --memory-swap=8g --pids-limit=512 \
-    --cap-drop=ALL --security-opt=no-new-privileges --user 65534:65534 -e TRACK=b \
+    --cap-drop=ALL --security-opt=no-new-privileges --ulimit core=1 --user 65534:65534 -e TRACK=b \
     --mount "type=volume,src=sd-data,dst=/data,volume-subpath=b/$1,readonly" \
     --mount "type=volume,src=sd-data,dst=/v,readonly" --entrypoint bash "$image" -c '
       TIMEFORMAT=%R
