@@ -41,6 +41,7 @@ const size_t MAX_RECORDS = MAX_MARKS / 5 + 1;
 struct alignas(64) Group {
   u64 sums[4] = {};
   int min = INT32_MAX, max = INT32_MIN;
+  u32 distinct = 0;
 };
 
 // Counters that every thread writes, away from what records read.
@@ -90,8 +91,7 @@ static cpu_set_t all_cpus;
 static atomic<u8> seen_codes[26 * 26 * 26];
 static std::mutex codes_lock;
 static std::vector<std::string> codes;
-static atomic<u32> distinct_names[COUNTRIES];
-static Counter next_region, next_chunk, next_country, next_unmap;
+static Counter next_region, next_chunk, next_unmap;
 
 // Claims pieces of regions.csv. by_id holds 1 + the country's index, and 0 for
 // anything unknown. Its last entry stays 0 and stands for every id above the
@@ -317,13 +317,12 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
       recs[r].hash = word;
       recs[r].region = name % 64;
     }
-    // A set bit costs no write, and a write costs a locked instruction that
-    // often has to fetch the line from another core, so it is the last step.
+    // About 90% of records set a new bit, so testing first would only add a
+    // branch. Whichever thread sets a bit counts that name for the country.
     for (size_t r = 0; r < n; r++) {
-      auto &word = name_bits[recs[r].hash];
       u64 bit = 1ull << recs[r].region;
-      if (!(word.load(relaxed) & bit))
-        word.fetch_or(bit, relaxed);
+      u64 old = name_bits[recs[r].hash].fetch_or(bit, relaxed);
+      mine[recs[r].hash / WORDS].distinct += !(old & bit);
     }
     if (done || start >= stop)
       return;
@@ -385,16 +384,6 @@ static void worker(int index, std::barrier<> *barrier) {
     madvise((void *)(input + off), std::min(UNMAP_STEP, input_size - off),
             MADV_DONTNEED);
   }
-
-  for (;;) {
-    size_t country = next_country.take(1);
-    if (country >= COUNTRIES)
-      return;
-    u32 distinct = 0;
-    for (size_t i = 0; i < WORDS; i++)
-      distinct += __builtin_popcountll(name_bits[country * WORDS + i].load(relaxed));
-    distinct_names[country].store(distinct, relaxed);
-  }
 }
 
 static char *money(char *out, long long cents) {
@@ -452,6 +441,7 @@ int main() {
         total.sums[i] += from.sums[i];
       total.min = std::min(total.min, from.min);
       total.max = std::max(total.max, from.max);
+      total.distinct += from.distinct;
     }
     u64 count = total.sums[2] >> 32;
     if (!count)
@@ -461,7 +451,7 @@ int main() {
     out = money(out, (long long)total.sums[1]);
     out = money(out, total.min);
     out = money(out, total.max);
-    out += sprintf(out, " %u %u %llu\n", distinct_names[country].load(relaxed),
+    out += sprintf(out, " %u %u %llu\n", total.distinct,
                    (u32)total.sums[2], (unsigned long long)total.sums[3]);
   }
   int fd = open("/out/aggregates.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
