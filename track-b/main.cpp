@@ -33,9 +33,8 @@ const size_t PAGE = 1 << 12, RELEASE_STEP = 1 << 22, PROBE_RATIO = 6;
 const size_t DENSE_LIMIT = 1 << 10;
 // A term this frequent among the queries is likely in over 1/32 of documents,
 // where a bitset is smaller than its list. The queries sample the corpus: phrases
-// are windows of documents, and boolean terms are drawn by band. More frequent
-// terms also go into the table first, from HOT_COUNT up.
-const u32 HIGH_COUNT = 25, HOT_COUNT = 4;
+// are windows of documents, and boolean terms are drawn by band.
+const u32 HIGH_COUNT = 25;
 
 // A table slot holds the high bits of the term's hash, its id and two flags.
 const int ID_BITS = 18, TAG_SHIFT = 20, PAIR_BITS = 20;
@@ -44,6 +43,7 @@ const int DISPLACED_BIT = ID_BITS + 1;
 const u64 DISPLACED = ANCHOR << 1, TAG_MASK = ~0ull << TAG_SHIFT;
 const size_t TABLE_PADDING = 1 << 10;
 const u32 OP_AND = 0, OP_OR = 1, OP_NOT = 2, OP_BITS = 2;
+const u16 IN_BOOL = 1 << 15;
 
 // A logged hit is 16 bits: a term within its partition, and a document within
 // its group of 64. A worker writes a marker naming the group when it starts one.
@@ -199,46 +199,35 @@ struct QueryChunk {
   vector<u64> hashes;
 };
 
-// Terms as they are found in the queries, by all threads at once.
-struct Draft {
-  std::atomic<u64> *hashes;
-  size_t mask, len;
+// The lookup table. While queries are read it holds whole hashes, filled by all
+// threads at once, and it is then converted in place. Nearly every token needs just
+// one load: at a low load, most terms sit in their home slot. A home slot with no
+// match answers for all other tokens, unless its flag says that a term with this
+// home went elsewhere. The hit or miss itself is unpredictable, so no branch depends
+// on it.
+struct Table {
+  std::atomic<u64> *slots;
+  size_t mask;
 
-  u32 intern(u64 hash) {
+  u32 intern(u64 hash) const {
     for (size_t at = hash & mask;; at++) {
-      u64 value = hashes[at].load(relaxed);
+      u64 value = slots[at].load(relaxed);
       if (value == hash ||
-          (!value && (hashes[at].compare_exchange_strong(value, hash, relaxed) ||
+          (!value && (slots[at].compare_exchange_strong(value, hash, relaxed) ||
                       value == hash)))
         return at;
     }
   }
-};
-
-// The lookup table. Nearly every token needs just one load: frequent terms are
-// placed first, so they sit in their home slot. A home slot with no match answers
-// for all other tokens, unless its flag says that a term with this home went
-// elsewhere. The hit or miss itself is unpredictable, so no branch depends on it.
-struct Table {
-  u64 *slots;
-  size_t mask;
-
-  void insert(u64 hash, u64 payload) {
-    size_t at = hash & mask;
-    if (slots[at])
-      slots[at] |= DISPLACED;
-    while (slots[at])
-      at++;
-    slots[at] = (hash & TAG_MASK) | payload;
-  }
 
   [[gnu::cold]] u32 find_displaced(u64 hash) const {
-    for (size_t at = (hash & mask) + 1; slots[at]; at++)
-      if (!((slots[at] ^ hash) >> TAG_SHIFT))
-        return slots[at] & (NO_ID | ANCHOR);
-    return NO_ID;
+    for (size_t at = (hash & mask) + 1;; at++) {
+      u64 value = slots[at].load(relaxed);
+      if (!value)
+        return NO_ID;
+      if (!((value ^ hash) >> TAG_SHIFT))
+        return value & (NO_ID | ANCHOR);
+    }
   }
-
 };
 
 struct Hit {
@@ -297,7 +286,6 @@ static vector<QueryChunk> query_chunks;
 static vector<u32> phrase_bases, matched, phrase_docs;
 static vector<Scratch> scratches;
 static vector<std::string> outputs;
-static Draft draft;
 static Table table;
 static Phrases phrases;
 static u8 *log_regions;
@@ -328,11 +316,11 @@ static void read_chunk(size_t c) {
     p = scan_line(p, [&](const u8 *word, u64 hash) {
       if (is_bool) {
         if (index % 2)
-          chunk.terms.push_back(draft.intern(hash) << OP_BITS | op);
+          chunk.terms.push_back(table.intern(hash) << OP_BITS | op);
         else if (index)
           op = *word == 'A' ? OP_AND : *word == 'O' ? OP_OR : OP_NOT;
       } else if (index) {
-        chunk.slots.push_back(draft.intern(hash));
+        chunk.slots.push_back(table.intern(hash));
         chunk.hashes.push_back(hash);
       }
       index++;
@@ -344,31 +332,41 @@ static void read_chunk(size_t c) {
 }
 
 // Final ids run through the common terms, then those with lists, then anchors used
-// only in phrases, so an id alone says how a token is handled. Other terms used
-// only in phrases need no table entry, as phrases compare hashes.
+// only in phrases, so an id alone says how a token is handled. Other terms used only
+// in phrases keep the id that no list uses, as phrases compare hashes.
 static void plan_index() {
-  vector<u16> phrase_seen(draft.len), bool_seen(draft.len);
+  const size_t slot_count = table.mask + 1 + TABLE_PADDING;
+  auto slots = (u64 *)table.slots;
+  vector<u16> seen(slot_count);
   size_t phrase_count = 0, term_count = 0;
   for (auto &chunk : query_chunks) {
     for (u32 at : chunk.slots)
-      phrase_seen[at]++;
-    for (u32 term : chunk.terms)
-      bool_seen[term >> OP_BITS]++;
+      seen[at]++;
+    for (u32 term : chunk.terms) {
+      u16 &count = seen[term >> OP_BITS];
+      count = (count + 1) | IN_BOOL;
+    }
     phrase_bases.push_back(phrase_count);
     phrase_count += chunk.lengths.size();
     term_count += chunk.hashes.size();
   }
-  auto seen = [&](size_t at) { return (u32)phrase_seen[at] + bool_seen[at]; };
-  for (size_t at = 0; at < draft.len; at++)
-    if (bool_seen[at])
-      (seen(at) > HIGH_COUNT ? high_terms : low_terms)++;
-  vector<u32> ids(draft.len, NO_ID), hot, cold;
+  const u32 high_from = IN_BOOL + HIGH_COUNT;
+  for (size_t at = 0; at < slot_count; at++) {
+    high_terms += seen[at] > high_from;
+    low_terms += seen[at] >= IN_BOOL && seen[at] <= high_from;
+  }
   size_t next_high = 0, next_id = high_terms;
-  for (size_t at = 0; at < draft.len; at++)
-    if (bool_seen[at]) {
-      ids[at] = seen(at) > HIGH_COUNT ? next_high++ : next_id++;
-      (seen(at) >= HOT_COUNT ? hot : cold).push_back(at);
+  for (size_t at = 0; at < slot_count; at++) {
+    u64 hash = slots[at];
+    if (hash) {
+      u32 id = seen[at] > high_from  ? next_high++
+               : seen[at] >= IN_BOOL ? next_id++
+                                     : NO_ID;
+      slots[at] = (hash & TAG_MASK) | id | (slots[at] & DISPLACED);
+      if ((hash & table.mask) != at)
+        slots[hash & table.mask] |= DISPLACED;
     }
+  }
 
   phrases.terms.reserve(term_count);
   phrases.starts.reserve(phrase_count + 1);
@@ -377,7 +375,6 @@ static void plan_index() {
   phrases.next_of_anchor.resize(phrase_count + 1);
   phrases.anchor_at.resize(phrase_count + 1);
   phrases.pairs.resize(1 << (PAIR_BITS - 6));
-  vector<bool> is_anchor(draft.len);
   for (auto &chunk : query_chunks) {
     size_t first = 0;
     for (u32 length : chunk.lengths) {
@@ -385,16 +382,15 @@ static void plan_index() {
       const u64 *hashes = chunk.hashes.data() + first;
       first += length;
       size_t at = std::min_element(list, list + length, [&](u32 a, u32 b) {
-                    return seen(a) < seen(b);
+                    return (seen[a] & ~IN_BOOL) < (seen[b] & ~IN_BOOL);
                   }) - list;
-      u32 slot = list[at], phrase = phrases.starts.size();
-      if (ids[slot] == NO_ID) {
-        ids[slot] = next_id++;
-        cold.push_back(slot);
-      }
-      is_anchor[slot] = true;
-      phrases.next_of_anchor[phrase] = phrases.first_of_anchor[ids[slot]];
-      phrases.first_of_anchor[ids[slot]] = phrase;
+      u64 &slot = slots[list[at]];
+      if ((slot & NO_ID) == NO_ID)
+        slot = (slot & ~(u64)NO_ID) | next_id++;
+      slot |= ANCHOR;
+      u32 id = slot & NO_ID, phrase = phrases.starts.size();
+      phrases.next_of_anchor[phrase] = phrases.first_of_anchor[id];
+      phrases.first_of_anchor[id] = phrase;
       phrases.anchor_at[phrase] = at;
       size_t one = at + 1 < length ? at : at - 1;
       size_t bit = pair_bit(hashes[one], hashes[one + 1]);
@@ -406,19 +402,12 @@ static void plan_index() {
 
   for (auto &chunk : query_chunks) {
     for (u32 &term : chunk.terms)
-      term = ids[term >> OP_BITS] << OP_BITS | (term & ((1 << OP_BITS) - 1));
+      term = (slots[term >> OP_BITS] & NO_ID) << OP_BITS |
+             (term & ((1 << OP_BITS) - 1));
     chunk.slots = {};
     chunk.lengths = {};
     chunk.hashes = {};
   }
-  // Twice the size of the draft, which leaves few displaced terms.
-  size_t table_size = (draft.mask + 1) * 2;
-  table = {(u64 *)huge_pages((table_size + TABLE_PADDING) * 8), table_size - 1};
-  for (auto *terms : {&hot, &cold})
-    for (u32 at : *terms)
-      table.insert(draft.hashes[at].load(relaxed),
-                   ids[at] | (is_anchor[at] ? ANCHOR : 0));
-  free(draft.hashes);
 }
 
 static v4 *claim_log_block(size_t partition) {
@@ -438,7 +427,7 @@ static void parse_docs(Scratch &scratch) {
     heads[part] = claim_log_block(part);
   u64 *tokens = scratch.tokens;
   u32 *ids = scratch.ids, *high_ids = scratch.high_ids, *low_ids = scratch.low_ids;
-  const u64 *table_slots = table.slots;
+  auto table_slots = (const u64 *)table.slots;
   const size_t table_mask = table.mask;
   const u32 high = high_terms, low = low_terms;
   const size_t row_words = words;
@@ -1018,14 +1007,8 @@ static void between_steps() noexcept {
 }
 
 static std::barrier<void (*)() noexcept> *sync_all;
-static vector<int> cpu_ids;
 
 static void work(int t) {
-  // A thread that moves leaves its second level cache behind.
-  cpu_set_t one;
-  CPU_ZERO(&one);
-  CPU_SET(cpu_ids[t], &one);
-  sched_setaffinity(0, sizeof one, &one);
   Scratch &scratch = scratches[t];
   size_t most = input_size / 2 + (1 << 16);
   scratch.tokens = (u64 *)reserve(most * 8);
@@ -1073,15 +1056,10 @@ int main() {
   cpu_set_t cpus;
   sched_getaffinity(0, sizeof cpus, &cpus);
   threads = CPU_COUNT(&cpus);
-  for (int cpu = 0; cpu < CPU_SETSIZE; cpu++)
-    if (CPU_ISSET(cpu, &cpus))
-      cpu_ids.push_back(cpu);
   text = map_input("/data/queries.txt", text_size);
   find_query_chunks();
-  size_t size = std::max<size_t>(std::bit_ceil(text_size / 16 + 16), 1 << 10);
-  draft.len = size + TABLE_PADDING;
-  draft.mask = size - 1;
-  draft.hashes = (std::atomic<u64> *)calloc(draft.len, 8);
+  size_t size = std::max<size_t>(std::bit_ceil(text_size / 8 + 16), 1 << 10);
+  table = {(std::atomic<u64> *)huge_pages((size + TABLE_PADDING) * 8), size - 1};
   query_chunks.resize(chunks);
   outputs.resize(chunks);
   input = map_input("/data/docs.txt", input_size);
