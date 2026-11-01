@@ -505,11 +505,12 @@ static void worker() {
       u32 minute = line < end ? hour_index(line) * 60 + line[14] * 10 + line[15] - 528 : 0;
       u32 lowest = parse_chunk(line, end, heads);
       chunk_states[chunk].store(DONE | lowest << 16 | minute, std::memory_order_release);
-    } else if ((off = next_clear.fetch_add(CLEAR_STEP, relaxed)) < input_size) {
-      // Exit would clear the input's page tables on one thread, with the clock running.
-      madvise((void *)(input + off), std::min(CLEAR_STEP, input_size - off), MADV_DONTNEED);
     } else if (hour > HOURS) {
-      return;
+      // All parsing is over, as the last hours need that. Exit would clear the input's
+      // page tables on one thread with the clock running, and freeing them lowers the peak.
+      if ((off = next_clear.fetch_add(CLEAR_STEP, relaxed)) >= input_size)
+        return;
+      munmap((void *)(input + off), std::min(CLEAR_STEP, input_size - off));
     } else {
       std::this_thread::yield();
     }
