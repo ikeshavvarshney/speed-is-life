@@ -24,18 +24,15 @@ constexpr auto relaxed = std::memory_order_relaxed;
 #define AES _mm_aesenc_si128
 
 // The box's hardware threads.
-const int WORKERS = 12;
+const size_t WORKERS = 12;
 const size_t CHUNK = 1 << 18, CLEAR_STEP = 1 << 23, HOURS = 72, BLOCK = 256;
-const size_t SLOTS = 1 << 13, MAX_IDS = 1 << 11;
 // A chunk that starts this many minutes into an hour shows that the hour before is
 // over, as the spec has the last upload of an hour land within 10 minutes of its end.
-const size_t HOUR_GRACE = 70;
+const size_t HOUR_GRACE = 10, SLOTS = 1 << 13, MAX_IDS = 1 << 11, NONE = -1;
 // A log entry is id << 21 | is_error << 20 | latency. A latency that does not fit,
 // on about 1% of lines, puts BIG in the entry and takes the next slot whole. An
 // all-zero entry is an unused part of a block, and id 0 is reserved to absorb it.
-const u32 BIG = (1 << 20) - 1;
-const u32 DONE = 1 << 31;
-const size_t NONE = -1;
+const u32 BIG = (1 << 20) - 1, DONE = 1u << 31;
 
 struct Name {
   u32 at;
@@ -48,10 +45,10 @@ using Text = std::string_view;
 // needs merging. With the slot that gives 60 bits of hash, which over 1,842 names
 // collide with odds of 2e-12. Ids are given out in the order names are first seen.
 alignas(64) static atomic<u64> table[SLOTS];
-// Names in the order they were found, and sorted up to `sorted_names`.
+// Names in the order they were found, and sorted up to `sorted`.
 static std::mutex names_lock;
 static Name order[MAX_IDS];
-static size_t name_count, sorted_names, name_end;
+static size_t name_count, sorted, name_end;
 alignas(64) static char name_bytes[MAX_IDS * 128];
 // Written by every thread, so kept off the lines that each line of input reads.
 alignas(64) static atomic<u64> stamps[HOURS];
@@ -61,10 +58,9 @@ alignas(64) static atomic<size_t> next_chunk, next_clear;
 // Guards the rest: how far parsing has got, which hours are over and taken, the free
 // regions and the turn to write.
 alignas(64) static std::mutex plan_lock;
-static size_t parsed_chunks, hours_over, next_hour;
-static size_t free_count, used_regions;
+static size_t parsed_chunks, hours_over, next_hour, pooled, carved;
 static bool speculating;
-static u32 *free_regions[HOURS * 3];
+static u32 *pool[HOURS * 3];
 // What the thread that parsed a chunk leaves for planning the hours: its first line's
 // minute, its lowest hour and a bit to say that it is done.
 alignas(64) static atomic<u32> chunk_states[1 << 14];
@@ -75,29 +71,28 @@ static u8 *texts[HOURS];
 alignas(64) static size_t input_size, capacity, chunk_count;
 static const u8 *input;
 static u32 *regions;
-static int out_fd;
 // A vector whose first `n` bytes are set, for n up to 128, then clear bytes.
 alignas(64) static u8 masks[192];
 // For each set of lanes, a permutation that moves them to the front, keeping order,
 // and the other lanes after them.
-static u64 lane_moves[256];
+static u64 moves[256];
 
 INLINE const u8 *low_bytes(size_t n) { return masks + 128 - n; }
 INLINE v4 load(const void *p) { return _mm256_loadu_si256((const v4 *)p); }
 INLINE v2 load2(const void *p) { return _mm_loadu_si128((const v2 *)p); }
 INLINE void store(void *p, v4 v) { _mm256_storeu_si256((v4 *)p, v); }
 
-// Zeroed memory where only touched pages are real, with nothing reserved.
+// Zeroed readable and writable memory where only touched pages are real, with nothing
+// reserved.
 static void *map_zeroed(size_t len) {
-  return mmap(0, len, PROT_READ | PROT_WRITE,
-              MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  return mmap(0, len, 3, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
 }
 
 // The spec fixes the span to Oct 30 18:00 .. Nov 2 18:00, so the day digits alone
 // identify the date: adding one and wrapping at 31 turns days 30, 31, 1, 2 into
 // 0, 1, 2, 3.
-static size_t hour_index(const u8 *line) {
-  return (line[8] * 10 + line[9] - 527) % 31 * 24 + line[11] * 10 + line[12] - 546;
+static size_t hour_index(const u8 *l) {
+  return (l[8] * 10 + l[9] - 527) % 31 * 24 + l[11] * 10 + l[12] - 546;
 }
 
 // Bit i is set when byte i is a space, for the 64 bytes at `p`. Taking both
@@ -123,7 +118,8 @@ INLINE u32 parse_latency(const u8 *&p) {
   v2 pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(10 | 1 << 8));
   v2 fours = _mm_madd_epi16(pairs, _mm_set1_epi32(100 | 1 << 16));
   fours = _mm_packus_epi32(fours, fours);
-  u64 parts = _mm_cvtsi128_si64(_mm_madd_epi16(fours, _mm_set1_epi32(10000 | 1 << 16)));
+  // 75536 is 10000 | 1 << 16, the weights of the fours.
+  u64 parts = _mm_cvtsi128_si64(_mm_madd_epi16(fours, _mm_set1_epi32(75536)));
   return (u32)parts * 100000000 + (parts >> 32);
 }
 
@@ -148,7 +144,7 @@ INLINE u64 hash_name(const u8 *p, size_t len) {
   return _mm_cvtsi128_si64(AES(AES(AES(h, seed), seed), seed));
 }
 
-[[gnu::cold, gnu::noinline]] static u32 find_name(u64 hash, const u8 *name, size_t len) {
+[[gnu::cold]] static u32 find_name(u64 hash, const u8 *name, size_t len) {
   for (size_t slot = hash;; slot++) {
     atomic<u64> &cell = table[slot % SLOTS];
     u64 seen = cell.load(relaxed);
@@ -169,7 +165,7 @@ INLINE u64 hash_name(const u8 *p, size_t len) {
 // Regions are real memory only where touched, and come back warm when reused.
 static u32 *take_region() {
   std::lock_guard guard(plan_lock);
-  return free_count ? free_regions[--free_count] : regions + used_regions++ * capacity;
+  return pooled ? pool[--pooled] : regions + carved++ * capacity;
 }
 
 // The output file grows until the end, so that is when the peak is set. Only near the
@@ -178,7 +174,7 @@ static void give_region(const void *region) {
   if (next_hour >= HOURS * 5 / 6)
     madvise((void *)region, capacity * 4, MADV_DONTNEED);
   std::lock_guard guard(plan_lock);
-  free_regions[free_count++] = (u32 *)region;
+  pool[pooled++] = (u32 *)region;
 }
 
 // Takes a block from the hour's region, to append without any sharing.
@@ -186,10 +182,8 @@ static u32 *claim_block(size_t hour) {
   u32 *base = bases[hour].load(relaxed);
   if (!base) {
     u32 *mine = take_region();
-    if (bases[hour].compare_exchange_strong(base, mine))
-      base = mine;
-    else
-      give_region(mine);
+    bases[hour].compare_exchange_strong(base, mine) ? void(base = mine)
+                                                    : give_region(mine);
   }
   u32 *at = base + cursors[hour].fetch_add(BLOCK, relaxed);
   memset(at, 0, BLOCK * 4);
@@ -234,14 +228,12 @@ INLINE void parse_line(Walk &walk, size_t &lowest) {
   u32 entry = id << 21 | (space[1] == '5') << 20;
   walk.line = space + 5;
   u32 latency = parse_latency(walk.line);
-  u32 *at = walk.at;
   // Blocks are aligned, so this finds one with no room for two slots, or no block.
-  if (((size_t)at + 4) % (BLOCK * 4) < 8)
-    at = claim_block(walk.hour);
+  if (((size_t)walk.at + 4) % (BLOCK * 4) < 8)
+    walk.at = claim_block(walk.hour);
   if (latency >= BIG)
-    *at++ = entry | BIG, entry = 0;
-  *at++ = entry | latency;
-  walk.at = at;
+    *walk.at++ = entry | BIG, entry = 0;
+  *walk.at++ = entry | latency;
 }
 
 // Where a line ends depends on the line before it, so one walk has to finish each
@@ -249,9 +241,8 @@ INLINE void parse_line(Walk &walk, size_t &lowest) {
 // work on a line from each at once.
 static size_t parse_chunk(const u8 *line, const u8 *end, u32 **heads) {
   size_t lowest = HOURS;
-  const u8 *mid = line + (end - line) / 2;
-  mid = (const u8 *)memchr(mid, '\n', end - mid);
-  mid = mid ? mid + 1 : end;
+  const u8 *mid = std::find(line + (end - line) / 2, end, '\n');
+  mid += mid < end;
   Walk a{line, heads, heads[0]}, b{mid, heads + HOURS, heads[HOURS]};
   while (a.line < mid && b.line < end) {
     parse_line(a, lowest);
@@ -276,7 +267,7 @@ template <int BLEND> INLINE v4 sort_layer(v4 v, v4 partner) {
 // Sorts up to eight values in a register, with no branches: lanes past n read as
 // UINT32_MAX, so they sort to the end. This is the optimal 19-comparator,
 // 6-layer network for eight inputs.
-INLINE void sort_lanes(const u32 *values, size_t n, u32 *sorted) {
+INLINE v4 sort_lanes(const u32 *values, size_t n) {
   v4 past = _mm256_xor_si256(load(low_bytes(n * 4)), _mm256_set1_epi32(-1));
   v4 v = _mm256_or_si256(load(values), past);
   v = sort_layer<0xCC>(v, _mm256_setr_epi32(2, 3, 0, 1, 6, 7, 4, 5));
@@ -284,8 +275,7 @@ INLINE void sort_lanes(const u32 *values, size_t n, u32 *sorted) {
   v = sort_layer<0xAA>(v, _mm256_setr_epi32(1, 0, 3, 2, 5, 4, 7, 6));
   v = sort_layer<0x30>(v, _mm256_setr_epi32(0, 1, 4, 5, 2, 3, 6, 7));
   v = sort_layer<0x50>(v, _mm256_setr_epi32(0, 4, 2, 6, 1, 5, 3, 7));
-  v = sort_layer<0x54>(v, _mm256_setr_epi32(0, 2, 1, 4, 3, 6, 5, 7));
-  store(sorted, v);
+  return sort_layer<0x54>(v, _mm256_setr_epi32(0, 2, 1, 4, 3, 6, 5, 7));
 }
 
 // Moves the values below `pivot` to the front of `values` and the others downwards
@@ -300,7 +290,7 @@ INLINE size_t partition(u32 *values, size_t n, u32 pivot, u32 *top) {
     u32 lanes = n - i < 8 ? (1u << (n - i)) - 1 : 255;
     u32 up = lanes & _mm256_movemask_ps(_mm256_castsi256_ps(
                          _mm256_cmpeq_epi32(_mm256_max_epu32(v, wall), v)));
-    v2 move = _mm_cvtsi64_si128(lane_moves[255 ^ up]);
+    v2 move = _mm_cvtsi64_si128(moves[255 ^ up]);
     v = _mm256_permutevar8x32_epi32(v, _mm256_cvtepu8_epi32(move));
     store(values + i - above, v);
     store(top - above - 8, v);
@@ -320,7 +310,7 @@ static void select_ranks(u32 *values, size_t n, size_t first, const size_t *rank
   while (ranks[0] < first + n) {
     if (n <= 8) {
       u32 sorted[8];
-      sort_lanes(values, n, sorted);
+      store(sorted, sort_lanes(values, n));
       for (int i = 0; i < 3; i++)
         found[i] = sorted[(ranks[i] - first) & 7];
       return;
@@ -351,7 +341,7 @@ INLINE u64 eight_digits(u32 value) {
   u64 merged = value / 10000 | (u64)(value % 10000) << 32;
   u64 top = ((merged * 10486) >> 20) & (0x7Full << 32 | 0x7F);
   u64 hundreds = ((merged - 100 * top) << 16) + top;
-  u64 tens = ((hundreds * 103) >> 10) & (0xFull << 48 | 0xFull << 32 | 0xFull << 16 | 0xF);
+  u64 tens = ((hundreds * 103) >> 10) & 0x000F000F000F000F;
   return tens + ((hundreds - 10 * tens) << 8);
 }
 
@@ -380,10 +370,9 @@ static void render_hour(size_t hour, u32 *space) {
   {
     // Few names are new after the first hour, so sorting them is a small job.
     std::lock_guard guard(names_lock);
-    Name *found = order + name_count;
-    std::sort(order + sorted_names, found, by_name);
-    std::inplace_merge(order, order + sorted_names, found, by_name);
-    sorted_names = known = name_count;
+    std::sort(order + sorted, order + name_count, by_name);
+    std::inplace_merge(order, order + sorted, order + name_count, by_name);
+    sorted = known = name_count;
     memcpy(names, order, known * sizeof(Name));
   }
   size_t used = cursors[hour].load(relaxed);
@@ -413,17 +402,16 @@ static void render_hour(size_t hour, u32 *space) {
   char label[33] = "2026-MM-DDTHH:00:00Z            ";
   memcpy(label + 5, &stamps[hour], 8);
   u8 *text = (u8 *)take_region(), *cursor = text;
-  size_t end = sum;
+  auto rank = [](size_t percent, size_t n) { return (percent * n + 99) / 100 - 1; };
   for (size_t i = 0; i < known; i++) {
     u32 id = names[i].id, errors = counts[id * 2 + 1];
     size_t n = counts[id * 2] + errors;
     if (!n)
       continue;
-    end -= n;
-    size_t ranks[6] = {(50 * n + 99) / 100 - 1, (95 * n + 99) / 100 - 1,
-                       (99 * n + 99) / 100 - 1, NONE, NONE, NONE};
+    sum -= n;
+    size_t ranks[6] = {rank(50, n), rank(95, n), rank(99, n), NONE, NONE, NONE};
     u32 found[6];
-    select_ranks(values + end, n, 0, ranks, found, space + capacity - 8);
+    select_ranks(values + sum, n, 0, ranks, found, space + capacity - 8);
     store(cursor, load(label));
     cursor += 21;
     Text name = name_of(names[i]);
@@ -438,7 +426,7 @@ static void render_hour(size_t hour, u32 *space) {
     *cursor++ = '\n';
   }
   texts[hour] = text;
-  text_sizes[hour].store(cursor - text + 1, std::memory_order_release);
+  text_sizes[hour] = cursor - text + 1;
 }
 
 // The file is the shards' chunks in order of arrival, so an hour's lines end soon
@@ -449,21 +437,17 @@ static void render_hour(size_t hour, u32 *space) {
 // guessing, before the last hour can be written.
 static size_t next_task() {
   std::lock_guard guard(plan_lock);
-  for (; parsed_chunks < chunk_count; parsed_chunks++) {
-    u32 state = chunk_states[parsed_chunks].load(std::memory_order_acquire);
-    if (!(state & DONE))
-      break;
+  for (u32 state; parsed_chunks < chunk_count && (state = chunk_states[parsed_chunks]) & DONE; parsed_chunks++) {
     if ((state >> 16 & 255) < hours_over) {
       execl("/proc/self/exe", "again", "again", nullptr);
       _exit(1);
     }
-    size_t minute = std::max(state & 65535, (u32)HOUR_GRACE);
-    if (speculating)
-      hours_over = std::max(hours_over, (minute - HOUR_GRACE) / 60);
+    size_t over = (std::max(state & 65535, (u32)HOUR_GRACE) - HOUR_GRACE) / 60;
+    hours_over = std::max(hours_over, speculating ? over : 0);
   }
   if (parsed_chunks == chunk_count)
     hours_over = HOURS;
-  return next_hour < hours_over ? next_hour++ : next_hour == HOURS ? HOURS + 1 : HOURS;
+  return next_hour < hours_over ? next_hour++ : HOURS + (next_hour == HOURS);
 }
 
 // Parses a chunk or clears a piece of the input, and says if there was any left.
@@ -472,20 +456,18 @@ static bool parse_or_clear(u32 **heads) {
   if (off < input_size) {
     // A chunk's lines are those that begin after its first byte, up to and including
     // the first byte of the next chunk.
-    const u8 *line = input + off;
-    if (off)
-      line = (const u8 *)memchr(line, '\n', 256) + 1;
+    const u8 *line = off ? (u8 *)memchr(input + off, '\n', 256) + 1 : input;
     const u8 *end = input + std::min(off + CHUNK + 1, input_size);
     u32 minute = line < end ? hour_index(line) * 60 + line[14] * 10 + line[15] - 528 : 0;
     u32 lowest = parse_chunk(line, end, heads);
-    chunk_states[chunk].store(DONE | lowest << 16 | minute, std::memory_order_release);
+    chunk_states[chunk] = DONE | lowest << 16 | minute;
     return true;
   }
   off = next_clear.fetch_add(CLEAR_STEP, relaxed);
   if (off >= input_size)
     return false;
   // Exit would clear the input's page tables on one thread, with the clock running.
-  madvise((void *)(input + off), std::min(CLEAR_STEP, input_size - off), MADV_DONTNEED);
+  madvise((void *)(input + off), CLEAR_STEP, MADV_DONTNEED);
   return true;
 }
 
@@ -511,9 +493,10 @@ int main(int argc, char **) {
   // thread stack or a small mapping.
   prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
   memset(masks, 255, 128);
-  for (u64 lanes = 0, all = 0x0706050403020100; lanes < 256; lanes++) {
-    u64 ones = _pdep_u64(lanes, 0x0101010101010101) * 255, half = _mm_popcnt_u64(lanes) * 4;
-    lane_moves[lanes] = _pext_u64(all, ones) | _pext_u64(all, ~ones) << half << half;
+  for (u64 m = 0, all = 0x0706050403020100; m < 256; m++) {
+    u64 ones = _pdep_u64(m, 0x0101010101010101) * 255;
+    u64 half = _mm_popcnt_u64(m) * 4;
+    moves[m] = _pext_u64(all, ones) | _pext_u64(all, ~ones) << half << half;
   }
   int fd = open("/data/requests.log", O_RDONLY);
   input_size = lseek(fd, 0, SEEK_END);
@@ -525,22 +508,21 @@ int main(int argc, char **) {
   // hour however the lines are spread. A region can hold an hour's values and the
   // scratch space for answering it, or its text, in whole pages.
   capacity = (3 * (input_size / 20 + WORKERS * 2 * BLOCK) + (1 << 17)) & -1024;
-  regions = (u32 *)map_zeroed(std::size(free_regions) * capacity * 4);
-  out_fd = open("/out/summary.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  for (int w = 1; w < WORKERS; w++)
+  regions = (u32 *)map_zeroed(std::size(pool) * capacity * 4);
+  int out = open("/out/summary.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  for (size_t w = 1; w < WORKERS; w++)
     std::thread(worker).detach();
   // This thread alone writes, in order, and parses while the next hour is not ready.
   // Writing the last hour ends the process, which needs no threads to be joined.
   u32 *heads[HOURS * 2] = {};
   for (size_t hour = 0; hour < HOURS;) {
-    u32 size = text_sizes[hour].load(std::memory_order_acquire);
+    u32 size = text_sizes[hour];
     if (size) {
-      if (write(out_fd, texts[hour], size - 1) != size - 1)
+      if (write(out, texts[hour], size - 1) != size - 1)
         _exit(1);
       give_region(texts[hour++]);
-    } else if (!parse_or_clear(heads)) {
+    } else if (!parse_or_clear(heads))
       std::this_thread::yield();
-    }
   }
   _exit(0);
 }
