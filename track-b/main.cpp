@@ -26,7 +26,7 @@ using std::vector;
 constexpr auto relaxed = std::memory_order_relaxed;
 #define INLINE [[gnu::always_inline]] inline
 
-const size_t CHUNK = 1 << 19, QUERY_CHUNK = 1 << 14, INPUT_PREFETCH = 512;
+const size_t CHUNK = 1 << 19, QUERY_CHUNK = 1 << 14;
 const size_t HUGE_PAGE = 1 << 21;
 const size_t PAGE = 1 << 12, RELEASE_STEP = 1 << 22, PROBE_RATIO = 6;
 // Setting bits costs about half as much per id as a merge.
@@ -169,8 +169,6 @@ template <class F> INLINE const u8 *scan_line(const u8 *p, F &&visit) {
                                                 _mm256_cmpgt_epi8(digit, digit_top)));
   };
   for (;;) {
-    // The hardware prefetcher stops at page ends, and while later passes run on a document.
-    _mm_prefetch(p + INPUT_PREFETCH, _MM_HINT_T0);
     v4 first = load(p), second = load(p + 32);
     u64 tokens = token_mask(first) | (u64)token_mask(second) << 32;
     v4 low = _mm256_cmpeq_epi8(first, newline);
@@ -219,11 +217,14 @@ struct alignas(64) Counter {
 
 // One chunk of the query file, in slices of address space sized by its share of the
 // file, as a term takes at least 2 bytes of it. Each line starts with how many boolean
-// terms it has, 0 for a phrase, and each term holds its operator in the low bits.
-struct QueryChunk {
+// terms it has, 0 for a phrase, and each term holds its operator in the low bits. It
+// has a cache line of its own, as neighbouring chunks are on different threads, and
+// every term read and every piece of output written changes it.
+struct alignas(64) QueryChunk {
   u32 *lines, *slots, *lengths;
   u64 *hashes;
   size_t line_words, slot_count, phrase_count;
+  std::string out;
 };
 
 // Terms as they are found in the queries, by all threads at once.
@@ -309,7 +310,7 @@ struct Phrases {
 // One thread's buffers, used by every step, so pages are only touched once. One
 // document can hold at most half its bytes as tokens, and a list at most all
 // documents, so these never need to grow.
-struct Scratch {
+struct alignas(64) Scratch {
   u64 *tokens;
   u32 *ids, *high_ids, *low_ids;
   size_t highs, lows;
@@ -326,7 +327,6 @@ static u32 *query_lines, *query_slots, *query_lengths;
 static u64 *query_hashes;
 static vector<u32> phrase_bases, matched, phrase_docs;
 static vector<Scratch> scratches;
-static vector<std::string> outputs;
 static Draft draft;
 static Table table;
 static Phrases phrases;
@@ -998,10 +998,10 @@ struct Evaluator {
 static void answer_queries(Scratch &scratch) {
   Evaluator evaluator{scratch.ids, scratch.high_ids, scratch.low_ids, scratch.tokens};
   for (size_t c; (c = next_answer.take()) < chunks;) {
-    std::string &out = outputs[c];
+    QueryChunk &chunk = query_chunks[c];
+    std::string &out = chunk.out;
     out.reserve(bounds[c + 1] - bounds[c]);
     size_t phrase = phrase_bases[c];
-    QueryChunk &chunk = query_chunks[c];
     for (size_t i = 0; i < chunk.line_words; i++) {
       u32 size = chunk.lines[i];
       if (size) {
@@ -1057,8 +1057,8 @@ static void after_parsing() {
 
 static void write_output() {
   int fd = open("/out/results.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  for (auto &out : outputs)
-    if (write(fd, out.data(), out.size()) != (ssize_t)out.size())
+  for (auto &chunk : query_chunks)
+    if (write(fd, chunk.out.data(), chunk.out.size()) != (ssize_t)chunk.out.size())
       abort();
   _exit(0);
 }
@@ -1136,7 +1136,6 @@ int main() {
   query_slots = (u32 *)reserve(text_size * 2);
   query_lengths = (u32 *)reserve(text_size * 2);
   query_hashes = (u64 *)reserve(text_size * 4);
-  outputs.resize(chunks);
   input = map_input("/data/docs.txt", input_size);
   if (input_size) {
     const u8 *last = input + input_size - 1;
