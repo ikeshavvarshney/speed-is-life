@@ -61,14 +61,16 @@ alignas(64) static atomic<size_t> next_chunk, next_clear;
 // Guards the rest: how far parsing has got, which hours are over and taken, the free
 // regions and the turn to write.
 alignas(64) static std::mutex plan_lock;
-static size_t parsed_chunks, hours_over, next_hour, next_output;
+static size_t parsed_chunks, hours_over, next_hour;
 static size_t free_count, used_regions;
-static bool writing, speculating;
-static Text waiting[HOURS];
+static bool speculating;
 static u32 *free_regions[HOURS * 3];
 // What the thread that parsed a chunk leaves for planning the hours: its first line's
 // minute, its lowest hour and a bit to say that it is done.
 alignas(64) static atomic<u32> chunk_states[1 << 14];
+// Each hour's text and one more than its size, which also says that it is ready.
+alignas(64) static atomic<u32> text_sizes[HOURS];
+static u8 *texts[HOURS];
 
 alignas(64) static size_t input_size, capacity, chunk_count;
 static const u8 *input;
@@ -370,7 +372,7 @@ static Text name_of(Name name) { return {name_bytes + name.at, name.len}; }
 static bool by_name(Name a, Name b) { return name_of(a) < name_of(b); }
 
 // Groups the hour's values by name, then answers each group with selection.
-static Text render_hour(size_t hour, u32 *space) {
+static void render_hour(size_t hour, u32 *space) {
   u32 *counts = space, *starts = space + MAX_IDS * 2;
   Name *names = (Name *)(space + MAX_IDS * 3);
   u32 *values = space + MAX_IDS * 5;
@@ -435,30 +437,8 @@ static Text render_hour(size_t hour, u32 *space) {
     cursor = put_number(cursor, errors * 1000000ull / n);
     *cursor++ = '\n';
   }
-  return {(char *)text, (size_t)(cursor - text)};
-}
-
-// Hands over an hour's text. One thread at a time writes whatever is next in
-// order, while the others carry on, and hours finish out of order because their
-// sizes differ, so finished ones wait here for their turn. The thread that writes
-// the last hour ends the process, which needs no threads to be joined.
-static void deliver(size_t hour, Text text) {
-  std::unique_lock lock(plan_lock);
-  waiting[hour] = text;
-  if (writing)
-    return;
-  writing = true;
-  while (next_output < HOURS && waiting[next_output].data()) {
-    Text ready = waiting[next_output++];
-    lock.unlock();
-    if (write(out_fd, ready.data(), ready.size()) != (ssize_t)ready.size())
-      _exit(1);
-    if (next_output == HOURS)
-      _exit(0);
-    give_region(ready.data());
-    lock.lock();
-  }
-  writing = false;
+  texts[hour] = text;
+  text_sizes[hour].store(cursor - text + 1, std::memory_order_release);
 }
 
 // The file is the shards' chunks in order of arrival, so an hour's lines end soon
@@ -486,31 +466,40 @@ static size_t next_task() {
   return next_hour < hours_over ? next_hour++ : next_hour == HOURS ? HOURS + 1 : HOURS;
 }
 
+// Parses a chunk or clears a piece of the input, and says if there was any left.
+static bool parse_or_clear(u32 **heads) {
+  size_t chunk = next_chunk.fetch_add(1, relaxed), off = chunk * CHUNK;
+  if (off < input_size) {
+    // A chunk's lines are those that begin after its first byte, up to and including
+    // the first byte of the next chunk.
+    const u8 *line = input + off;
+    if (off)
+      line = (const u8 *)memchr(line, '\n', 256) + 1;
+    const u8 *end = input + std::min(off + CHUNK + 1, input_size);
+    u32 minute = line < end ? hour_index(line) * 60 + line[14] * 10 + line[15] - 528 : 0;
+    u32 lowest = parse_chunk(line, end, heads);
+    chunk_states[chunk].store(DONE | lowest << 16 | minute, std::memory_order_release);
+    return true;
+  }
+  off = next_clear.fetch_add(CLEAR_STEP, relaxed);
+  if (off >= input_size)
+    return false;
+  // Exit would clear the input's page tables on one thread, with the clock running.
+  madvise((void *)(input + off), std::min(CLEAR_STEP, input_size - off), MADV_DONTNEED);
+  return true;
+}
+
 static void worker() {
   u32 *heads[HOURS * 2] = {};
   for (;;) {
-    size_t hour = next_task(), chunk, off;
+    size_t hour = next_task();
     if (hour < HOURS) {
       u32 *space = take_region();
-      Text text = render_hour(hour, space);
+      render_hour(hour, space);
       give_region(space);
-      deliver(hour, text);
-    } else if ((off = (chunk = next_chunk.fetch_add(1, relaxed)) * CHUNK) < input_size) {
-      // A chunk's lines are those that begin after its first byte, up to and including
-      // the first byte of the next chunk.
-      const u8 *line = input + off;
-      if (off)
-        line = (const u8 *)memchr(line, '\n', 256) + 1;
-      const u8 *end = input + std::min(off + CHUNK + 1, input_size);
-      u32 minute = line < end ? hour_index(line) * 60 + line[14] * 10 + line[15] - 528 : 0;
-      u32 lowest = parse_chunk(line, end, heads);
-      chunk_states[chunk].store(DONE | lowest << 16 | minute, std::memory_order_release);
-    } else if ((off = next_clear.fetch_add(CLEAR_STEP, relaxed)) < input_size) {
-      // Exit would clear the input's page tables on one thread, with the clock running.
-      madvise((void *)(input + off), std::min(CLEAR_STEP, input_size - off), MADV_DONTNEED);
-    } else if (hour > HOURS) {
-      return;
-    } else {
+    } else if (!parse_or_clear(heads)) {
+      if (hour > HOURS)
+        return;
       std::this_thread::yield();
     }
   }
@@ -540,8 +529,18 @@ int main(int argc, char **) {
   out_fd = open("/out/summary.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
   for (int w = 1; w < WORKERS; w++)
     std::thread(worker).detach();
-  worker();
-  // The thread writing the last hour ends the process, so this one just waits.
-  for (;;)
-    pause();
+  // This thread alone writes, in order, and parses while the next hour is not ready.
+  // Writing the last hour ends the process, which needs no threads to be joined.
+  u32 *heads[HOURS * 2] = {};
+  for (size_t hour = 0; hour < HOURS;) {
+    u32 size = text_sizes[hour].load(std::memory_order_acquire);
+    if (size) {
+      if (write(out_fd, texts[hour], size - 1) != size - 1)
+        _exit(1);
+      give_region(texts[hour++]);
+    } else if (!parse_or_clear(heads)) {
+      std::this_thread::yield();
+    }
+  }
+  _exit(0);
 }
