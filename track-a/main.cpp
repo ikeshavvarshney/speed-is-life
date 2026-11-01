@@ -201,7 +201,7 @@ struct Walk {
 INLINE void parse_line(Walk &walk, size_t &lowest) {
   const u8 *line = walk.line;
   // The hardware prefetcher stops at page boundaries.
-  _mm_prefetch((const char *)line + 2048, _MM_HINT_T0);
+  _mm_prefetch((const char *)line + 1024, _MM_HINT_T0);
   // These bytes hold the month, day and hour. Nearly every line has the hour
   // of the line before it, as the file is the shards' chunks in arrival order.
   u64 now = _mm_cvtsi128_si64(load2(line + 5));
@@ -379,6 +379,8 @@ static void render_hour(size_t hour, u32 *space) {
   u32 *log = bases[hour].load(relaxed);
   memset(counts, 0, MAX_IDS * 8);
   for (size_t i = 0; i < used; i++) {
+    // Other cores wrote these entries, so each new line takes long to arrive.
+    _mm_prefetch((const char *)(log + i + 64), _MM_HINT_T0);
     counts[log[i] >> 20]++;
     i += (log[i] & BIG) == BIG;
   }
