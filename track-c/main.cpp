@@ -106,16 +106,12 @@ static void load_regions() {
         id = id * 10 + regions[i] - '0';
       const u8 *c = regions + i + 1;
       int key = (c[0] - 'A') * 676 + (c[1] - 'A') * 26 + c[2] - 'A';
-      u8 country = seen_codes[key].load(relaxed);
-      if (!country) {
+      if (!seen_codes[key].load(relaxed)) {
         std::lock_guard guard(codes_lock);
-        country = seen_codes[key].load(relaxed);
-        if (!country) {
-          country = ++code_count;
-          seen_codes[key].store(country, relaxed);
-        }
+        if (!seen_codes[key].load(relaxed))
+          seen_codes[key].store(++code_count, relaxed);
       }
-      by_id[id] = country;
+      by_id[id] = seen_codes[key].load(relaxed);
       i += 5;
     }
   }
@@ -349,16 +345,12 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
       return;
     // Under five marks remain, and the mark after them may already have pairs
     // waiting for it. Fixed moves cost less than calls to copy so little.
-    auto left_marks = (const __m128i *)(marks + whole * 5);
-    auto left_pairs = (const __m128i *)(pairs + whole * 5);
-    __m128i kept_marks = _mm_loadu_si128(left_marks);
-    __m128i kept_pairs = _mm_loadu_si128(left_pairs);
-    u32 last_pair = pairs[whole * 5 + 4];
+    u32 kept_pairs[5];
+    __builtin_memcpy(kept_pairs, pairs + whole * 5, 20);
+    __builtin_memcpy(marks, marks + whole * 5, 16);
     for (size_t i = 0; i <= filled; i += 8)
       _mm256_storeu_si256((v4 *)(pairs + i), _mm256_setzero_si256());
-    _mm_storeu_si128((__m128i *)marks, kept_marks);
-    _mm_storeu_si128((__m128i *)pairs, kept_pairs);
-    pairs[4] = last_pair;
+    __builtin_memcpy(pairs, kept_pairs, 20);
     filled -= whole * 5;
   }
 }
@@ -367,12 +359,10 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
 // or BOM. Newlines inside notes are always followed by a lowercase word or a
 // quote (spec section 2.2).
 static size_t first_record(size_t off) {
-  for (size_t i = off - 1; i + 1 < input_size; i++) {
-    u8 next = input[i + 1];
-    if (input[i] == '\n' && ((next >= '0' && next <= '9') || next == 0xEF))
-      return i + 1;
-  }
-  return input_size;
+  size_t i = off;
+  while (i < input_size && !(input[i - 1] == '\n' && (u8(input[i] - '0') < 10 || input[i] == 0xEF)))
+    i++;
+  return i;
 }
 
 static void worker(int index, std::barrier<> *barrier) {
@@ -416,9 +406,8 @@ static void worker(int index, std::barrier<> *barrier) {
 }
 
 static char *money(char *out, long long cents) {
-  auto abs = (unsigned long long)(cents < 0 ? -cents : cents);
-  return out + sprintf(out, " %s%llu.%02llu", cents < 0 ? "-" : "", abs / 100,
-                       abs % 100);
+  u64 abs = cents < 0 ? -cents : cents;
+  return out + sprintf(out, " %s%llu.%02llu", cents < 0 ? "-" : "", abs / 100, abs % 100);
 }
 
 int main() {
@@ -468,14 +457,12 @@ int main() {
     u64 count = total.sums[2] >> 32;
     if (!count)
       continue;
-    out += sprintf(out, "%s %llu %llu", code < CODES ? key : "_UNMATCHED",
-                   (unsigned long long)count,
-                   (unsigned long long)total.sums[0]);
-    out = money(out, (long long)total.sums[1]);
+    out += sprintf(out, "%s %llu %llu", code < CODES ? key : "_UNMATCHED", count, total.sums[0]);
+    out = money(out, total.sums[1]);
     out = money(out, total.min);
     out = money(out, total.max);
     out += sprintf(out, " %u %u %llu\n", distinct_names[country].load(relaxed),
-                   (u32)total.sums[2], (unsigned long long)total.sums[3]);
+                   (u32)total.sums[2], total.sums[3]);
   }
   int fd = open("/out/aggregates.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (write(fd, text, out - text) != out - text)
