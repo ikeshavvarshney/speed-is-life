@@ -28,7 +28,7 @@ constexpr auto relaxed = std::memory_order_relaxed;
 #define LOW _mm256_castsi256_si128
 #define HIGH(v) _mm256_extracti128_si256(v, 1)
 
-const size_t CHUNK = 1 << 20, PAGE = 4096, HOURS = 72, BLOCK = 256, RENDER_LIMIT = 4;
+const size_t CHUNK = 1 << 18, PAGE = 4096, HOURS = 72, BLOCK = 256, RENDER_LIMIT = 4;
 // A chunk that starts this many minutes into an hour shows that the hour before is
 // over, as the spec has the last upload of an hour land within 10 minutes of its end.
 const size_t HOUR_GRACE = 10;
