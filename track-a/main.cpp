@@ -187,10 +187,10 @@ static u32 *take_region() {
                     : regions + used_regions++ * capacity;
 }
 
-// The output file grows until the end, so that is when the peak is set, and from
-// mid-run memory left in a free region is worth more to the score than saved faults.
+// The output file grows until the end, so that is when the peak is set. Only near the
+// end is memory left in a free region worth more to the score than the saved faults.
 static void give_region(void *region) {
-  if (next_hour >= HOURS / 2)
+  if (next_hour >= HOURS * 5 / 6)
     madvise(region, capacity * sizeof(u32), MADV_DONTNEED);
   std::lock_guard guard(plan_lock);
   free_regions[free_count++] = (u32 *)region;
