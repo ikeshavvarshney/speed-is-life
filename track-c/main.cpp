@@ -8,12 +8,10 @@
 #include <fcntl.h>
 #include <immintrin.h>
 #include <mutex>
-#include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
-#include <vector>
 
 using u8 = uint8_t;
 using u32 = uint32_t;
@@ -26,6 +24,11 @@ constexpr auto relaxed = std::memory_order_relaxed;
 
 const size_t CHUNK = 1 << 18, REGION_CHUNK = 1 << 16, UNMAP_STEP = 1 << 23;
 const size_t COUNTRIES = 256, HUGE_PAGE = 1 << 21;
+// Region ids stop below this at every scale (spec section 2.3). Its own entry
+// stays 0 and stands for every id above the table.
+const u32 REGION_END = 1000000;
+const size_t NAMES_AT = REGION_END + 64;
+const size_t CODES = 26 * 26 * 26;
 // The generator's pool of 100,000 names, plus the few that edge-case blocks
 // add, fits at 77% load.
 const int NAME_BITS = 17;
@@ -41,12 +44,6 @@ const size_t MAX_RECORDS = MAX_MARKS / 5 + 1;
 struct alignas(64) Group {
   u64 sums[4] = {};
   int min = INT32_MAX, max = INT32_MIN;
-};
-
-// Counters that every thread writes, away from what records read.
-struct alignas(64) Counter {
-  atomic<size_t> value{0};
-  size_t take(size_t n) { return value.fetch_add(n, relaxed); }
 };
 
 struct Rec {
@@ -80,23 +77,25 @@ static u8 *zeroed(size_t bytes, int advice) {
 static const u8 *input, *regions;
 static size_t input_size, regions_size;
 static u8 *by_id;
-static u32 last_region;
 static atomic<u64> *slots;
 static atomic<u64> *name_bits;
 static Group *groups;
 static int threads;
-static atomic<u8> seen_codes[26 * 26 * 26];
+static atomic<u8> seen_codes[CODES];
 static std::mutex codes_lock;
-static std::vector<std::string> codes;
+static int code_count;
 static atomic<u32> distinct_names[COUNTRIES];
-static Counter next_region, next_chunk, next_country, next_unmap;
+// Written by every thread, so kept away from what records read.
+alignas(64) static atomic<size_t> next_region{1}; // The first piece holds the header.
+alignas(64) static atomic<size_t> next_chunk;
+alignas(64) static atomic<size_t> next_country;
+alignas(64) static atomic<size_t> next_unmap;
 
 // Claims pieces of regions.csv. by_id holds 1 + the country's index, and 0 for
-// anything unknown. Its last entry stays 0 and stands for every id above the
-// table. Ids are unique, so each byte has one writer.
+// anything unknown. Ids are unique, so each byte has one writer.
 static void load_regions() {
   for (;;) {
-    size_t off = next_region.take(REGION_CHUNK);
+    size_t off = next_region.fetch_add(REGION_CHUNK, relaxed);
     if (off >= regions_size)
       return;
     size_t stop = std::min(off + REGION_CHUNK, regions_size), i = off;
@@ -113,8 +112,7 @@ static void load_regions() {
         std::lock_guard guard(codes_lock);
         country = seen_codes[key].load(relaxed);
         if (!country) {
-          codes.emplace_back((const char *)c, 3);
-          country = codes.size();
+          country = ++code_count;
           seen_codes[key].store(country, relaxed);
         }
       }
@@ -124,17 +122,12 @@ static void load_regions() {
   }
 }
 
-INLINE u64 load64(const u8 *p) {
-  u64 word;
-  __builtin_memcpy(&word, p, 8);
-  return word;
-}
-
 // The bytes of up to eight digits ending just before `end`, with leading
 // positions zeroed. Field lengths are known from the structural masks, so
 // nothing branches on the number of digits.
 INLINE u64 digit_word(const u8 *end, size_t len) {
-  return load64(end - 8) & (~0ull << (-(len * 8) & 63));
+  auto word = _mm_loadl_epi64((const __m128i *)(end - 8));
+  return _mm_cvtsi128_si64(word) & (~0ull << (-(len * 8) & 63));
 }
 
 // Converts three words of eight digits together. Each step merges pairs: digits
@@ -190,7 +183,7 @@ INLINE u64 hash_name(const u8 *p, size_t len, __m128i key) {
 // thread that sees a free way has not missed its hash further along, and losing
 // the race for a way only means looking at the winner's hash.
 INLINE size_t intern(u64 hash) {
-  size_t bucket = hash >> (67 - NAME_BITS), probes = 0;
+  size_t bucket = hash >> (67 - NAME_BITS);
   v4 want = _mm256_set1_epi64x(hash);
   auto mask = [](v4 x, v4 y) -> u32 {
     return _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(x, y)));
@@ -205,9 +198,6 @@ INLINE size_t intern(u64 hash) {
     v4 zero = _mm256_setzero_si256();
     u32 free = mask(low, zero) | mask(high, zero) << 4;
     if (!free) {
-      // The generator's pool is a constant: this only guards against hanging.
-      if (++probes >> (NAME_BITS - 3))
-        abort();
       bucket = (bucket + 1) & ((1 << (NAME_BITS - 3)) - 1);
       continue;
     }
@@ -221,7 +211,7 @@ INLINE size_t intern(u64 hash) {
 static void parse_chunk(size_t first, size_t stop, Group *mine) {
   const u8 *base = input;
   const u8 *ids = by_id;
-  const __m128i top = _mm_set1_epi32(last_region);
+  const __m128i top = _mm_set1_epi32(REGION_END);
   const __m128i three = _mm_setr_epi16(3, 0, 3, 0, 0, 0, 0, 0);
   const __m128i key = _mm_set_epi64x(0x8BB84B93962EACC9, 0x2D358DCCAA6C78A5);
   const auto table = slots;
@@ -384,7 +374,7 @@ static void worker(int index, std::barrier<> *barrier) {
   Group *mine = groups + index * COUNTRIES;
   std::uninitialized_default_construct_n(mine, COUNTRIES);
   for (;;) {
-    size_t off = next_chunk.take(CHUNK);
+    size_t off = next_chunk.fetch_add(CHUNK, relaxed);
     if (off >= input_size)
       break;
     size_t first = off ? first_record(off)
@@ -399,7 +389,7 @@ static void worker(int index, std::barrier<> *barrier) {
   // while the clock runs. Clearing the page tables now, on all threads, removes
   // most of that cost.
   for (;;) {
-    size_t off = next_unmap.take(UNMAP_STEP);
+    size_t off = next_unmap.fetch_add(UNMAP_STEP, relaxed);
     if (off >= input_size)
       break;
     madvise((void *)(input + off), std::min(UNMAP_STEP, input_size - off),
@@ -407,14 +397,15 @@ static void worker(int index, std::barrier<> *barrier) {
   }
 
   for (;;) {
-    size_t country = next_country.take(1);
+    size_t country = next_country.fetch_add(1, relaxed);
     if (country >= COUNTRIES)
-      return;
+      break;
     u32 distinct = 0;
     for (size_t i = 0; i < WORDS; i++)
       distinct += __builtin_popcountll(name_bits[country * WORDS + i].load(relaxed));
     distinct_names[country].store(distinct, relaxed);
   }
+  barrier->arrive_and_wait();
 }
 
 static char *money(char *out, long long cents) {
@@ -430,42 +421,32 @@ int main() {
   threads = CPU_COUNT(&cpus);
   regions = map_input("/data/regions.csv", regions_size);
   input = map_input("/data/records.csv", input_size);
-  size_t line = regions_size - 1;
-  while (regions[line - 1] != '\n')
-    line--;
-  for (; regions[line] != ','; line++)
-    last_region = last_region * 10 + regions[line] - '0';
-  last_region++;
   // The randomly accessed tables share a huge page, which avoids a TLB miss on
   // most records. They are touched before the workers start: threads racing to
   // fault one huge page are each charged 2 MB until the race resolves, which
   // shows up in peak memory.
-  size_t names_at = (last_region + 64) & -64ull;
-  size_t tables_size = names_at + (8ull << NAME_BITS);
+  size_t tables_size = NAMES_AT + (8ull << NAME_BITS);
   by_id = zeroed(tables_size, MADV_HUGEPAGE);
-  for (size_t page = 0; page < tables_size; page += HUGE_PAGE)
-    by_id[page] = 0;
-  slots = (atomic<u64> *)(by_id + names_at);
+  by_id[0] = 0;
+  slots = (atomic<u64> *)(by_id + NAMES_AT);
   // 241 groups fill two huge pages. Touched first, like the tables above.
   name_bits = (atomic<u64> *)zeroed(COUNTRIES * WORDS * 8, MADV_HUGEPAGE);
   for (size_t page = 0; page < 2; page++)
     *(u8 *)(name_bits + page * HUGE_PAGE / 8) = 0;
   groups = (Group *)zeroed(threads * COUNTRIES * sizeof(Group), MADV_NOHUGEPAGE);
-  next_region.value = 1; // The first piece starts after the header.
   std::barrier barrier(threads);
-  std::vector<std::thread> pool;
   for (int t = 1; t < threads; t++)
-    pool.emplace_back(worker, t, &barrier);
+    std::thread(worker, t, &barrier).detach();
   worker(0, &barrier);
-  for (auto &thread : pool)
-    thread.join();
 
-  std::vector<std::pair<std::string, int>> keys{{"_UNMATCHED", 0}};
-  for (size_t i = 0; i < codes.size(); i++)
-    keys.push_back({codes[i], i + 1});
-  std::sort(keys.begin(), keys.end());
+  // Countries in code order are already sorted, and _UNMATCHED sorts last.
   char text[32768], *out = text;
-  for (auto &[key, country] : keys) {
+  for (size_t code = 0; code <= CODES; code++) {
+    int country = code < CODES ? seen_codes[code].load(relaxed) : 0;
+    if (!country && code < CODES)
+      continue;
+    char key[] = {char('A' + code / 676), char('A' + code / 26 % 26),
+                  char('A' + code % 26), 0};
     Group total;
     for (int t = 0; t < threads; t++) {
       const Group &from = groups[t * COUNTRIES + country];
@@ -477,7 +458,8 @@ int main() {
     u64 count = total.sums[2] >> 32;
     if (!count)
       continue;
-    out += sprintf(out, "%s %llu %llu", key.c_str(), (unsigned long long)count,
+    out += sprintf(out, "%s %llu %llu", code < CODES ? key : "_UNMATCHED",
+                   (unsigned long long)count,
                    (unsigned long long)total.sums[0]);
     out = money(out, (long long)total.sums[1]);
     out = money(out, total.min);
