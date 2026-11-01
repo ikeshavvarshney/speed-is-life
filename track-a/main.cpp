@@ -29,7 +29,10 @@ constexpr auto relaxed = std::memory_order_relaxed;
 #define LOW _mm256_castsi256_si128
 #define HIGH(v) _mm256_extracti128_si256(v, 1)
 
-const size_t CHUNK = 1 << 20, HOURS = 72, BLOCK = 256;
+const size_t CHUNK = 1 << 16, HOURS = 72, BLOCK = 256;
+// The longest line in the spec's grammar is under this, so reading this much more
+// than a chunk gives every line that starts in it.
+const size_t LONGEST_LINE = 256;
 // A chunk that starts this many minutes into an hour shows that the hour before is
 // over, as the spec has the last upload of an hour land within 10 minutes of its end.
 const size_t HOUR_GRACE = 10;
@@ -84,7 +87,7 @@ alignas(64) static size_t input_size, capacity, chunk_count;
 static atomic<u32> *chunk_states;
 const u32 DONE = 1 << 31;
 static u32 *regions;
-static int input_fd, out_fd;
+static int out_fd;
 
 // A vector whose first `n` bytes are set, for n up to 128, then clear bytes.
 alignas(64) static u8 masks[192];
@@ -214,7 +217,6 @@ static size_t parse_chunk(const u8 *line, const u8 *end, u32 **heads) {
   u32 *at = heads[0];
   const v4 space_vector = _mm256_set1_epi8(' ');
   while (line < end) {
-    _mm_prefetch((const char *)line + 1024, _MM_HINT_T0);
     // These bytes hold the month, day and hour. Nearly every line has the hour
     // of the line before it, as the file is the shards' chunks in arrival order.
     u64 now = load64(line + 5);
@@ -506,14 +508,11 @@ static size_t next_task() {
 
 static void worker() {
   u32 *heads[HOURS] = {};
-  // Each thread maps the file for itself, as threads faulting pages of one mapping
-  // bounce the same locks between them. This way nothing is shared, and nothing needs
-  // unmapping while others run. A file ending on a page boundary would fault on the
-  // vector loads near its end, so it lies over a slightly larger area of zeroed bytes.
-  auto *input = (const u8 *)map_zeroed(input_size + 4096);
-  if (input_size)
-    mmap((void *)input, input_size, PROT_READ, MAP_PRIVATE | MAP_FIXED, input_fd, 0);
-  bool mapped = true;
+  // Reading costs less than faulting the file in from one mapping that all threads
+  // share, which then also has to be unmapped page by page. Each thread has its own
+  // open file so that they don't share its reference count.
+  alignas(64) u8 buffer[CHUNK + LONGEST_LINE + 128];
+  int fd = open("/data/requests.log", O_RDONLY);
   for (;;) {
     size_t hour = next_task(), chunk;
     if (hour < HOURS) {
@@ -522,23 +521,19 @@ static void worker() {
       give_region(space);
       deliver(hour, text);
     } else if ((chunk = next_chunk.fetch_add(1, relaxed)) < chunk_count) {
+      size_t off = chunk * CHUNK;
+      ssize_t got = pread(fd, buffer, CHUNK + LONGEST_LINE, off);
       // A chunk's lines are those that begin after its first byte, up to and including
       // the first byte of the next chunk.
-      size_t off = chunk * CHUNK;
-      const u8 *line = input + off;
+      const u8 *line = buffer;
       if (off)
-        line = (const u8 *)memchr(line, '\n', input_size - off) + 1;
-      const u8 *end = input + std::min(off + CHUNK + 1, input_size);
+        line = (const u8 *)memchr(buffer, '\n', got) + 1;
+      const u8 *end = buffer + std::min<size_t>(CHUNK + 1, got);
       u32 minute = 0;
       if (line < end)
         minute = hour_index(line) * 60 + line[14] * 10 + line[15] - 528;
       size_t lowest = parse_chunk(line, end, heads);
       chunk_states[chunk].store(DONE | lowest << 16 | minute, std::memory_order_release);
-    } else if (mapped) {
-      // Process exit would otherwise unmap every page of the input on one thread, while
-      // the clock runs.
-      madvise((void *)input, input_size, MADV_DONTNEED);
-      mapped = false;
     } else if (hour > HOURS) {
       return;
     } else {
@@ -553,8 +548,7 @@ int main(int argc, char **) {
   // thread stack or a small mapping.
   prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
   memset(masks, 255, 128);
-  input_fd = open("/data/requests.log", O_RDONLY);
-  input_size = lseek(input_fd, 0, SEEK_END);
+  input_size = lseek(open("/data/requests.log", O_RDONLY), 0, SEEK_END);
   cpu_set_t cpus;
   sched_getaffinity(0, sizeof cpus, &cpus);
   int workers = CPU_COUNT(&cpus);
