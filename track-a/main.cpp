@@ -59,7 +59,7 @@ struct Text {
 // hash, which over 1,842 names collide with odds of 2e-6.
 #include <stdio.h>
 #include <time.h>
-constexpr int DIAG_PUSH = 1;
+constexpr int DIAG_PUSH = 2;
 static double now_ms(){timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1e3+t.tv_nsec/1e6;}
 static double T0=now_ms(), t_spawned, t_parsed, t_rendered_last;
 static long read_long(const char*p){FILE*f=fopen(p,"r");long v=0;if(f){if(fscanf(f,"%ld",&v)!=1)v=0;fclose(f);}return v;}
