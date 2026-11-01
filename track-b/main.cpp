@@ -26,7 +26,7 @@ using std::vector;
 constexpr auto relaxed = std::memory_order_relaxed;
 #define INLINE [[gnu::always_inline]] inline
 
-const size_t CHUNK = 1 << 19, QUERY_CHUNK = 1 << 14, PREFETCH_AHEAD = 12;
+const size_t CHUNK = 1 << 19, QUERY_CHUNK = 1 << 14;
 const size_t HUGE_PAGE = 1 << 21;
 const size_t PAGE = 1 << 12, RELEASE_STEP = 1 << 22, PROBE_RATIO = 6;
 // Setting bits costs about half as much per id as a merge.
@@ -239,14 +239,6 @@ struct Table {
     return NO_ID;
   }
 
-  // The term's id with its anchor flag, or an id no list or bitset uses.
-  INLINE u32 find(u64 hash) const {
-    u64 value = slots[hash & mask];
-    bool same = !((value ^ hash) >> TAG_SHIFT);
-    if (__builtin_expect(!same && (value & DISPLACED), 0))
-      return find_displaced(hash);
-    return same ? value & (NO_ID | ANCHOR) : NO_ID;
-  }
 };
 
 struct Hit {
@@ -294,7 +286,6 @@ struct Scratch {
   u64 *tokens;
   u32 *ids, *high_ids, *low_ids;
   vector<Hit> hits;
-  vector<u32> runs, order, group_starts;
 };
 
 static int threads;
@@ -517,9 +508,9 @@ static void parse_docs(Scratch &scratch) {
       u32 position = doc & (GROUP_DOCS - 1);
       u64 bit = 1ull << position;
       u64 *line = lines + (doc >> GROUP_BITS) % LINE_WORDS;
-      // Tokenizing, lookups and actions are separate passes. Lookups are prefetched
-      // far enough ahead for memory to arrive in time. Actions run per kind of
-      // token after a vector step sorts ids by kind, as a token's kind is
+      // Tokenizing, lookups and actions are separate passes. Each lookup is prefetched
+      // as soon as its hash is known, so memory arrives in time. Actions run per kind
+      // of token after a vector step sorts ids by kind, as a token's kind is
       // unpredictable and a branch on it would be mispredicted constantly.
       tokens[0] = 0;
       u64 *token = tokens + 1;
@@ -528,10 +519,10 @@ static void parse_docs(Scratch &scratch) {
         *token++ = hash;
       });
       size_t count = token - tokens - 1;
-      for (size_t i = 0; i <= PREFETCH_AHEAD; i++)
-        token[i] = 0;
-      // Four lookups in one vector step. A displaced term or a token sharing its home
-      // slot takes another look, about 3% of tokens.
+      *token = 0;
+      // Four lookups in one vector step: an id with its anchor flag, or an id no list
+      // or bitset uses. A displaced term, or a token sharing its home slot with one,
+      // takes another look, about 3% of tokens.
       for (size_t at = 1; at <= count; at += 4) {
         v4 hash = load(tokens + at);
         v4 value = _mm256_i64gather_epi64((const long long *)table_slots,
@@ -594,13 +585,12 @@ static void parse_docs(Scratch &scratch) {
 static void build_lists(size_t p, Scratch &scratch) {
   auto log = (u16 *)(log_regions + p * log_span);
   auto image = (u16 *)scratch.tokens;
-  vector<u32> &runs = scratch.runs, &order = scratch.order;
-  vector<u32> &group_starts = scratch.group_starts;
+  u32 *runs = scratch.ids, *order = scratch.high_ids;
+  u32 *group_starts = scratch.low_ids;
   size_t used = next_log_block[p].value.load(relaxed) * LOG_BLOCK;
-  size_t groups = docs / GROUP_DOCS + 1;
+  size_t groups = docs / GROUP_DOCS + 1, run_count = 0;
   u32 counts[PARTITION_TERMS] = {};
-  runs.clear();
-  group_starts.assign(groups + 2, 0);
+  memset(group_starts, 0, (groups + 2) * 4);
   for (size_t i = 0; i < used / 2; i++) {
     u16 entry = log[i];
     if (entry < MARKER) {
@@ -608,15 +598,14 @@ static void build_lists(size_t p, Scratch &scratch) {
     } else if (entry == LOG_END) {
       i |= LOG_BLOCK / 2 - 1;
     } else {
-      runs.push_back(i);
+      runs[run_count++] = i;
       group_starts[(entry & ~MARKER) + 2]++;
     }
   }
   for (size_t g = 2; g < groups + 2; g++)
     group_starts[g] += group_starts[g - 1];
-  order.resize(runs.size());
-  for (u32 run : runs)
-    order[group_starts[(log[run] & ~MARKER) + 1]++] = run;
+  for (size_t i = 0; i < run_count; i++)
+    order[group_starts[(log[runs[i]] & ~MARKER) + 1]++] = runs[i];
 
   u32 cursors[PARTITION_TERMS], sum = 0;
   for (size_t term = 0; term < PARTITION_TERMS; term++) {
@@ -633,8 +622,8 @@ static void build_lists(size_t p, Scratch &scratch) {
   size_t block = 0;
   u32 last[PARTITION_TERMS];
   memset(last, 255, sizeof last);
-  for (u32 run : order) {
-    u32 group = log[run] & ~MARKER;
+  for (size_t r = 0; r < run_count; r++) {
+    u32 run = order[r], group = log[run] & ~MARKER;
     size_t run_block = group >> GROUPS_PER_BLOCK_BITS;
     while (block < run_block) {
       mark(++block);
@@ -981,7 +970,7 @@ static void answer_queries(Scratch &scratch) {
 // Each run on one thread once all threads have arrived at the barrier.
 static void after_queries() {
   plan_index();
-  high_bits = (u64 *)huge_pages(high_terms * words * 8 + 64);
+  high_bits = (u64 *)reserve(high_terms * words * 8 + 64);
   partitions = low_terms / PARTITION_TERMS + 1;
   // A token takes at least 2 bytes of input, and 2 bytes here.
   log_span = (input_size + (1 << 24)) & -PAGE;
@@ -1070,7 +1059,6 @@ int main() {
   // of a sparse region or a thread stack, and more when threads race to fault one.
   prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
   mallopt(M_MMAP_THRESHOLD, 1 << 16);
-  mallopt(M_ARENA_MAX, 1);
   memset(low_bytes, 255, 32);
   for (u32 mask = 0; mask < 256; mask++)
     for (u64 lane = 0, used = 0; lane < 8; lane++)
