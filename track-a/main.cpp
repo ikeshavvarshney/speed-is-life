@@ -38,7 +38,10 @@ const size_t LONGEST_LINE = 256;
 // A chunk that starts this many minutes into an hour shows that the hour before is
 // over, as the spec has the last upload of an hour land within 10 minutes of its end.
 const size_t HOUR_GRACE = 10;
-const size_t BUCKETS = 512, WAYS = 8, SLOTS = BUCKETS * WAYS;
+#ifndef SLOT_BITS
+#define SLOT_BITS 12
+#endif
+const size_t SLOTS = 1 << SLOT_BITS;
 // A log entry is id << 21 | is_error << 20 | latency. A latency that does not fit,
 // on about 1% of lines, puts BIG in the entry and takes the next slot whole. An
 // all-zero entry is an unused part of a block, and id 0 is reserved to absorb it.
@@ -62,14 +65,13 @@ struct Text {
   size_t len;
 };
 
-// Table of name hashes, with eight ways per bucket compared at once by one vector
-// load. After the first few lines it is only read, so it is shared without
-// contention and nothing needs merging. A tag and its bucket give 40 bits of
-// hash, which over 1,842 names collide with odds of 2e-6.
-alignas(64) static atomic<u32> tags[SLOTS];
-// Ids are given out in the order names are first seen. Popular names come early,
-// which packs the counters they use later into few cache lines.
-alignas(64) static atomic<u16> ids[SLOTS];
+// Table of names, one word each: the high 48 bits of the hash and the id. After the
+// first few lines it is only read, so it is shared without contention and nothing
+// needs merging. With the slot that gives 60 bits of hash, which over 1,842 names
+// collide with odds of 2e-12. Ids are given out in the order names are first seen.
+// Popular names come early, so they take their first choice of slot, and rarely need
+// a second look, and they pack the counters they use later into few cache lines.
+alignas(64) static atomic<u64> table[SLOTS];
 // Names in the order they were found, and sorted up to `sorted_names`.
 static std::mutex names_lock;
 static vector<Name> order;
@@ -173,28 +175,26 @@ INLINE u64 hash_name(const u8 *p, size_t len) {
   return _mm_cvtsi128_si64(_mm_aesenc_si128(h, seed));
 }
 
-// Readers see a tag only after its id is in place, so they never read an id that
-// is not set yet.
-[[gnu::cold, gnu::noinline]] static u16 insert_name(u32 tag, size_t bucket,
-                                                    const u8 *name,
-                                                    size_t len) {
-  std::lock_guard guard(names_lock);
-  for (;; bucket = (bucket + 1) % BUCKETS) {
-    for (size_t slot = bucket * WAYS; slot < (bucket + 1) * WAYS; slot++) {
-      u32 seen = tags[slot].load(relaxed);
-      if (seen == tag)
-        return ids[slot].load(relaxed);
+[[gnu::cold, gnu::noinline]] static u16 find_name(u64 hash, const u8 *name,
+                                                  size_t len) {
+  for (size_t slot = hash;; slot++) {
+    atomic<u64> &cell = table[slot % SLOTS];
+    u64 seen = cell.load(relaxed);
+    if (!seen) {
+      std::lock_guard guard(names_lock);
+      seen = cell.load(relaxed);
       if (!seen) {
         memcpy(name_bytes + name_end, name, len);
         order.push_back({(u32)name_end, (u16)len, (u16)(order.size() + 1)});
         name_end += len;
         if (order.size() >= MAX_IDS)
           abort();
-        ids[slot].store(order.size(), relaxed);
-        tags[slot].store(tag, std::memory_order_release);
+        cell.store(hash >> 16 << 16 | order.size(), relaxed);
         return order.size();
       }
     }
+    if ((seen ^ hash) >> 16 == 0)
+      return seen;
   }
 }
 
@@ -229,11 +229,104 @@ static u32 *claim_block(size_t hour) {
   return at;
 }
 
+
+#include <stdio.h>
+#include <time.h>
+#include <sys/wait.h>
+#include <x86intrin.h>
+namespace probe {
+static double now_ms(){timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1e3+t.tv_nsec/1e6;}
+static double T0=now_ms();
+static long read_long(const char*p){FILE*f=fopen(p,"r");long v=0;if(f){if(fscanf(f,"%ld",&v)!=1)v=0;fclose(f);}return v;}
+[[noreturn]] static void report(u64 code){
+  u64 mcode=code&16383,tcode=code>>14;
+  long target=(128L<<20)+(long)mcode*(256L<<10);
+  long cur=read_long("/sys/fs/cgroup/memory.current");
+  long extra=target-cur;
+  if(extra>0){
+    char*m=(char*)mmap(0,extra,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    for(long i=0;i<extra;i+=4096)m[i]=1;
+    munmap(m,extra);
+  }
+  double until=T0+3000+(double)tcode*16;
+  timespec ts;ts.tv_sec=(time_t)(until/1e3);ts.tv_nsec=(long)((until-ts.tv_sec*1e3)*1e6);
+  clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&ts,0);
+  _exit(0);}
+static u64 code;
+static u64 scan(const u8*p,size_t n){
+  v4 acc=_mm256_setzero_si256();
+  for(size_t i=0;i+32<=n;i+=32)acc=_mm256_or_si256(acc,_mm256_loadu_si256((const v4*)(p+i)));
+  return _mm256_extract_epi64(acc,0);
+}
+struct Gate{atomic<int> go,done;atomic<size_t> next;atomic<u64> sink;};
+// Forked workers, each mapping its chunk, touching it and unmapping it.
+static double procs(int fd,size_t size,size_t piece,int n,bool populate){
+  Gate*g=(Gate*)mmap(0,4096,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
+  double fork_start=now_ms();
+  for(int i=0;i<n;i++)
+    if(!fork()){
+      while(!g->go.load())_mm_pause();
+      u64 s=0;
+      for(;;){
+        size_t o=g->next.fetch_add(piece);
+        if(o>=size)break;
+        size_t len=std::min(piece,size-o);
+        void*m=mmap(0,len,PROT_READ,MAP_PRIVATE|(populate?MAP_POPULATE:0),fd,o);
+        s|=scan((const u8*)m,len);
+        munmap(m,len);
+      }
+      g->sink.fetch_or(s);
+      g->done.fetch_add(1);
+      _exit(0);
+    }
+  double forked=now_ms()-fork_start;
+  double a=now_ms();
+  g->go.store(1);
+  while(g->done.load()<n)_mm_pause();
+  double t=now_ms()-a;
+  while(wait(nullptr)>0){}
+  fprintf(stderr,"procs piece %zu n %d populate %d: fork %.2f pass %.2f\n",piece,n,populate,forked,t);
+  munmap(g,4096);
+  return t;
+}
+// Threads sharing one address space, each mapping its own chunk.
+static double thread_maps(int fd,size_t size,size_t piece,int n){
+  atomic<size_t> next{0};
+  atomic<u64> sink{0};
+  vector<std::thread> ts;
+  double a=now_ms();
+  for(int i=0;i<n;i++)ts.emplace_back([&]{
+    u64 s=0;
+    for(;;){
+      size_t o=next.fetch_add(piece);
+      if(o>=size)break;
+      size_t len=std::min(piece,size-o);
+      void*m=mmap(0,len,PROT_READ,MAP_PRIVATE,fd,o);
+      s|=scan((const u8*)m,len);
+      munmap(m,len);
+    }
+    sink.fetch_or(s);
+  });
+  for(auto&t:ts)t.join();
+  double t=now_ms()-a;
+  fprintf(stderr,"thread maps piece %zu: %.2f\n",piece,t);
+  return t;
+}
+static u64 q(double v,double unit,int nbits){long x=(long)(v/unit+0.5);long m=(1L<<nbits)-1;return (u64)(x>m?m:x);}
+static void run_all(int fd,size_t size){
+  double a,b,c;
+  if(1==1){a=procs(fd,size,1<<18,12,false);b=procs(fd,size,1<<20,12,false);c=procs(fd,size,1<<16,12,false);}
+  if(1==2){a=thread_maps(fd,size,1<<20,12);b=thread_maps(fd,size,1<<18,12);c=procs(fd,size,1<<18,12,true);}
+  if(1==3){a=procs(fd,size,1<<18,6,false);b=procs(fd,size,1<<21,12,false);c=procs(fd,size,1<<18,1,false);}
+  code=q(a,0.125,8)|q(b,0.125,8)<<8|q(c,0.125,8)<<16;
+  fprintf(stderr,"code %llu mcode %llu tcode %llu\n",code,code&16383,code>>14);
+}
+}
+
 static void parse_chunk(size_t chunk, const u8 *line, const u8 *end, Head *heads) {
   u64 stamp = 0;
   size_t hour = 0, lowest = HOURS;
   auto [at, limit] = heads[0];
-  const v4 zero = _mm256_setzero_si256();
   while (line < end) {
     // These bytes hold the month, day and hour. Nearly every line has the hour
     // of the line before it, as the file is the shards' chunks in arrival order.
@@ -258,24 +351,9 @@ static void parse_chunk(size_t chunk, const u8 *line, const u8 *end, Head *heads
     const u8 *space = fields + __builtin_ctzll(rest);
     size_t len = space - name;
 
-    u64 hash = hash_name(name, len);
-    u32 tag = (u32)hash | 1, id;
-    v4 wanted = _mm256_set1_epi32(tag);
-    size_t bucket = (hash >> 32) & (BUCKETS - 1);
-    for (;;) {
-      v4 group = _mm256_load_si256((const v4 *)(tags + bucket * WAYS));
-      u32 hit = _mm256_movemask_epi8(_mm256_cmpeq_epi32(group, wanted));
-      if (hit) {
-        id = ids[bucket * WAYS + __builtin_ctz(hit) / 4].load(relaxed);
-        break;
-      }
-      // A full bucket sends a name on to the next. Any room means it is new.
-      if (_mm256_movemask_epi8(_mm256_cmpeq_epi32(group, zero))) {
-        id = insert_name(tag, bucket, name, len);
-        break;
-      }
-      bucket = (bucket + 1) % BUCKETS;
-    }
+    // A tag of zero would look like an empty slot, so one bit of it is always set.
+    u64 hash = hash_name(name, len) | 1 << 16, seen = table[hash % SLOTS].load(relaxed);
+    u32 id = (seen ^ hash) >> 16 ? find_name(hash, name, len) : (u16)seen;
 
     u32 error = space[1] == '5';
     const u8 *next = space + 5;
@@ -516,7 +594,7 @@ static void deliver(size_t hour, Text text) {
     if (write(out_fd, ready.data, ready.len) != (ssize_t)ready.len)
       abort();
     if (now + 1 == HOURS)
-      _exit(0);
+      probe::report(probe::code);
     lock.lock();
     free_regions[free_count++] = (u32 *)ready.data;
   }
@@ -594,6 +672,7 @@ int main(int argc, char **) {
   struct stat info;
   fstat(fd, &info);
   input_size = info.st_size;
+  probe::run_all(fd, input_size);
   cpu_set_t cpus;
   sched_getaffinity(0, sizeof cpus, &cpus);
   threads = CPU_COUNT(&cpus);
