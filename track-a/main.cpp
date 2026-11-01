@@ -2,6 +2,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <immintrin.h>
@@ -10,7 +11,6 @@
 #include <string_view>
 #include <sys/mman.h>
 #include <sys/prctl.h>
-#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -24,21 +24,15 @@ using v2 = __m128i;
 using std::atomic;
 constexpr auto relaxed = std::memory_order_relaxed;
 #define INLINE [[gnu::always_inline]] inline
+#define AES _mm_aesenc_si128
+#define LOW _mm256_castsi256_si128
+#define HIGH(v) _mm256_extracti128_si256(v, 1)
 
-#ifndef CHUNK_BITS
-#define CHUNK_BITS 20
-#endif
-const size_t CHUNK = 1 << CHUNK_BITS, PAGE = 4096, HOURS = 72, BLOCK = 256;
+const size_t CHUNK = 1 << 20, PAGE = 4096, HOURS = 72, BLOCK = 256, RENDER_LIMIT = 4;
 // A chunk that starts this many minutes into an hour shows that the hour before is
 // over, as the spec has the last upload of an hour land within 10 minutes of its end.
 const size_t HOUR_GRACE = 10;
-#ifndef RENDER_LIMIT
-#define RENDER_LIMIT 4
-#endif
-#ifndef SLOT_BITS
-#define SLOT_BITS 12
-#endif
-const size_t SLOTS = 1 << SLOT_BITS;
+const size_t SLOTS = 1 << 13;
 // A log entry is id << 21 | is_error << 20 | latency. A latency that does not fit,
 // on about 1% of lines, puts BIG in the entry and takes the next slot whole. An
 // all-zero entry is an unused part of a block, and id 0 is reserved to absorb it.
@@ -46,6 +40,7 @@ const int LATENCY_BITS = 20;
 const u32 BIG = (1 << LATENCY_BITS) - 1;
 const size_t MAX_IDS = 1 << 11;
 const u64 DIGITS = 0x3030303030303030;
+const size_t NO_RANK = -1;
 
 // Held for a few instructions, with no more threads than CPUs, so waiting in the
 // kernel would cost far more than spinning.
@@ -109,12 +104,12 @@ static struct alignas(4096) {
 alignas(64) static size_t input_size, capacity, chunk_count;
 static ChunkState *chunk_states;
 static u32 *regions;
-static int workers, in_fd, out_fd;
+static int in_fd, out_fd;
 static bool speculating, is_first = true;
 
-// A vector whose first `n` bytes are set, for n up to 64, then clear bytes.
-alignas(64) static u8 masks[128];
-INLINE const u8 *low_bytes(size_t n) { return masks + 64 - n; }
+// A vector whose first `n` bytes are set, for n up to 128, then clear bytes.
+alignas(64) static u8 masks[192];
+INLINE const u8 *low_bytes(size_t n) { return masks + 128 - n; }
 INLINE v4 load(const void *p) { return _mm256_loadu_si256((const v4 *)p); }
 INLINE void store(void *p, v4 v) { _mm256_storeu_si256((v4 *)p, v); }
 INLINE u64 load64(const u8 *p) {
@@ -152,8 +147,7 @@ static size_t hour_index(const u8 *line) {
 // Bit i is set when byte i is a space, for the 64 bytes at `p`. Taking both
 // vectors every time avoids a branch on the endpoint's length, which half the
 // lines would mispredict.
-INLINE u64 spaces(const u8 *p) {
-  v4 space = _mm256_set1_epi8(' ');
+INLINE u64 spaces(const u8 *p, v4 space) {
   u32 low = _mm256_movemask_epi8(_mm256_cmpeq_epi8(load(p), space));
   u32 high = _mm256_movemask_epi8(_mm256_cmpeq_epi8(load(p + 32), space));
   return low | (u64)high << 32;
@@ -178,28 +172,23 @@ INLINE u32 parse_latency(const u8 *&p) {
   return ((quads & 0x0000FFFF0000FFFF) * 42949672960001) >> 32;
 }
 
-// Mixes the whole name at a fixed cost for up to 64 bytes, masking off what
-// follows it.
-INLINE u64 hash_name(const u8 *p, size_t len) {
-  const u8 *cut = low_bytes(std::min<size_t>(len, 64));
+// Mixes up to 64 bytes of a name at a fixed cost, masking off what follows it.
+INLINE v2 mix_name(const u8 *p, size_t len, v2 h) {
+  const u8 *cut = low_bytes(len);
   v4 a = _mm256_and_si256(load(p), load(cut));
   v4 b = _mm256_and_si256(load(p + 32), load(cut + 32));
+  return AES(AES(_mm_xor_si128(LOW(a), h), HIGH(a)), AES(LOW(b), HIGH(b)));
+}
+
+// Two rounds after the last input would spread each byte everywhere, but half of the
+// state can still collide for names differing only along one of AES's diagonals. It
+// takes three.
+INLINE u64 hash_name(const u8 *p, size_t len) {
   v2 seed = _mm_set_epi64x(0x2D358DCCAA6C78A5, 0x8BB84B93962EACC9);
-  v2 first = _mm_aesenc_si128(
-      _mm_xor_si128(_mm256_castsi256_si128(a), seed),
-      _mm256_extracti128_si256(a, 1));
-  v2 h = _mm_aesenc_si128(
-      first, _mm_aesenc_si128(_mm256_castsi256_si128(b),
-                              _mm256_extracti128_si256(b, 1)));
-  for (size_t i = 64; i < len; i += 16) {
-    auto tail = (const v2 *)low_bytes(std::min<size_t>(len - i, 16));
-    h = _mm_aesenc_si128(h, _mm_and_si128(_mm_loadu_si128((const v2 *)(p + i)),
-                                          _mm_loadu_si128(tail)));
-  }
-  // Two rounds would spread each byte everywhere, but half of the state can still
-  // collide for names differing only along one of AES's diagonals. It takes three.
-  h = _mm_aesenc_si128(_mm_aesenc_si128(h, seed), seed);
-  return _mm_cvtsi128_si64(_mm_aesenc_si128(h, seed));
+  v2 h = mix_name(p, len, seed);
+  if (len > 64)
+    h = mix_name(p + 64, len - 64, h);
+  return _mm_cvtsi128_si64(AES(AES(AES(h, seed), seed), seed));
 }
 
 [[gnu::cold, gnu::noinline]] static u16 find_name(u64 hash, const u8 *name,
@@ -225,10 +214,6 @@ INLINE u64 hash_name(const u8 *p, size_t len) {
       return seen;
   }
 }
-
-struct Head {
-  u32 *at, *limit;
-};
 
 // Regions are real memory only where touched, and come back warm when reused.
 static u32 *take_region() {
@@ -260,47 +245,45 @@ static u32 *claim_block(size_t hour) {
   return at;
 }
 
-static void parse_chunk(size_t chunk, const u8 *line, const u8 *end, Head *heads) {
+static void parse_chunk(size_t chunk, const u8 *line, const u8 *end, u32 **heads) {
   u64 stamp = 0;
   size_t hour = 0, lowest = HOURS;
-  auto [at, limit] = heads[0];
+  u32 *at = heads[0];
+  const v4 space_vector = _mm256_set1_epi8(' ');
   while (line < end) {
     _mm_prefetch((const char *)line + 1024, _MM_HINT_T0);
     // These bytes hold the month, day and hour. Nearly every line has the hour
     // of the line before it, as the file is the shards' chunks in arrival order.
     u64 now = load64(line + 5);
     if (now != stamp) {
-      heads[hour] = {at, limit};
+      heads[hour] = at;
       stamp = now;
       hour = hour_index(line);
       lowest = std::min(lowest, hour);
       g.stamps[hour].store(now, relaxed);
-      at = heads[hour].at;
-      limit = heads[hour].limit;
+      at = heads[hour];
     }
     const u8 *fields = line + 28;
-    u64 mask = spaces(fields);
+    u64 mask = spaces(fields, space_vector);
     const u8 *name = fields + __builtin_ctzll(mask) + 1;
     u64 rest = mask & (mask - 1);
     while (!rest) {
       fields += 64;
-      rest = spaces(fields);
+      rest = spaces(fields, space_vector);
     }
     const u8 *space = fields + __builtin_ctzll(rest);
     size_t len = space - name;
 
-    // A tag of zero would look like an empty slot, so one bit of it is always set.
-    u64 hash = hash_name(name, len) | 1 << 16, seen = g.table[hash % SLOTS].load(relaxed);
+    u64 hash = hash_name(name, len), seen = g.table[hash % SLOTS].load(relaxed);
     u32 id = (seen ^ hash) >> 16 ? find_name(hash, name, len) : (u16)seen;
 
     u32 error = space[1] == '5';
     const u8 *next = space + 5;
     u32 latency = parse_latency(next);
     u32 entry = id << (LATENCY_BITS + 1) | error << LATENCY_BITS;
-    if (limit - at < 2) {
+    // Blocks are aligned, so this finds one with no room for two slots, or no block.
+    if (((size_t)at + 4) % (BLOCK * 4) < 8)
       at = claim_block(hour);
-      limit = at + BLOCK;
-    }
     if (latency >= BIG) {
       *at++ = entry | BIG;
       entry = 0;
@@ -308,7 +291,7 @@ static void parse_chunk(size_t chunk, const u8 *line, const u8 *end, Head *heads
     *at++ = entry | latency;
     line = next;
   }
-  heads[hour] = {at, limit};
+  heads[hour] = at;
   chunk_states[chunk].lowest_hour = lowest;
 }
 
@@ -343,7 +326,7 @@ INLINE v4 front_lanes(u32 mask) {
 }
 
 // Moves the values below `pivot` to `low` and the others to `high`, returning the
-// count below. Either target may be the source, as g.writing never overtakes
+// count below. Either target may be the source, as writing never overtakes
 // reading. Vector stores can write up to seven lanes past what they keep.
 INLINE size_t partition(const u32 *from, size_t n, u32 pivot, u32 *low,
                         u32 *high) {
@@ -364,23 +347,28 @@ INLINE size_t partition(const u32 *from, size_t n, u32 pivot, u32 *low,
 }
 
 // Sets found[i] to the value of rank ranks[i], for ascending ranks among the n
-// values at `values`, whose first value has rank `first` in the whole group.
-// `spare` is scratch memory.
+// values at `values`, whose first value has rank `first` in the whole group. The
+// ranks are followed by three of NO_RANK, so finding how many fall on each side takes
+// no branch, and it is the same for what is written: a call writes three answers, and
+// any that are not its own are written again by the calls for higher ranks. `spare`
+// is scratch memory.
 static void select_ranks(u32 *values, size_t n, size_t first,
-                         const size_t *ranks, size_t count, u32 *found,
-                         u32 *spare) {
-  if (!count)
+                         const size_t *ranks, u32 *found, u32 *spare) {
+  if (ranks[0] >= first + n)
     return;
   if (n <= 8) {
     u32 sorted[8];
     sort_lanes(values, n, sorted);
-    for (size_t i = 0; i < count; i++)
-      found[i] = sorted[ranks[i] - first];
+    for (int i = 0; i < 3; i++)
+      found[i] = sorted[(ranks[i] - first) & 7];
     return;
   }
   u32 a = values[0], b = values[n / 2], c = values[n - 1];
   u32 pivot = std::min(std::max(a, b), std::max(std::min(a, b), c));
   size_t below = partition(values, n, pivot, values, spare);
+  auto below_rank = [&](size_t rank) {
+    return (ranks[0] < rank) + (ranks[1] < rank) + (ranks[2] < rank);
+  };
   if (!below) {
     // The pivot is the smallest value, and with many equal values this would
     // never end. Its copies are all the same answer, so they are split off and
@@ -388,19 +376,17 @@ static void select_ranks(u32 *values, size_t n, size_t first,
     size_t copies = pivot == UINT32_MAX
                         ? n
                         : partition(spare, n, pivot + 1, values, spare);
-    size_t split =
-        std::lower_bound(ranks, ranks + count, first + copies) - ranks;
-    std::fill(found, found + split, pivot);
-    select_ranks(spare, n - copies, first + copies, ranks + split,
-                 count - split, found + split, values);
+    found[0] = found[1] = found[2] = pivot;
+    size_t split = below_rank(first + copies);
+    select_ranks(spare, n - copies, first + copies, ranks + split, found + split,
+                 values);
     return;
   }
   // Each side uses what the other leaves free, so `spare` never needs more room than
   // the first call's values.
-  size_t split = std::lower_bound(ranks, ranks + count, first + below) - ranks;
-  select_ranks(values, below, first, ranks, split, found, spare + n - below);
-  select_ranks(spare, n - below, first + below, ranks + split, count - split,
-               found + split, values);
+  size_t split = below_rank(first + below);
+  select_ranks(values, below, first, ranks, found, spare + n - below);
+  select_ranks(spare, n - below, first + below, ranks + split, found + split, values);
 }
 
 // Turns a value below 10^8 into eight digit bytes, most significant first in
@@ -415,26 +401,17 @@ INLINE u64 eight_digits(u32 value) {
   return tens + ((hundreds - 10 * tens) << 8);
 }
 
-static u8 *put_long(u8 *out, u32 value);
-
 // Writes a space and the value with no branch on its length. The caller reserved
 // the room.
 INLINE u8 *put_number(u8 *out, u32 value) {
-  if (value >= 100000000)
-    return put_long(out, value);
+  if (value >= 100000000) [[unlikely]]
+    return out + sprintf((char *)out, " %u", value);
   u64 digits = eight_digits(value);
   int skip = __builtin_ctzll(digits | 1ull << 56) / 8;
   u64 word = digits >> (skip * 8) | DIGITS;
   *out = ' ';
   memcpy(out + 1, &word, 8);
   return out + 9 - skip;
-}
-
-[[gnu::cold, gnu::noinline]] static u8 *put_long(u8 *out, u32 value) {
-  out = put_number(out, value / 100000000);
-  u64 word = eight_digits(value % 100000000) | DIGITS;
-  memcpy(out, &word, 8);
-  return out + 8;
 }
 
 static std::string_view name_of(Name name) {
@@ -494,15 +471,14 @@ static Text render_hour(size_t hour, u32 *space) {
   for (size_t i = 0; i < known; i++) {
     std::string_view name = name_of(names[i]);
     u32 id = names[i].id, errors = counts[id * 2 + 1];
-    u32 count = counts[id * 2] + errors;
-    if (!count)
+    size_t n = counts[id * 2] + errors;
+    if (!n)
       continue;
-    size_t n = count;
     end -= n;
-    size_t ranks[3] = {(50 * n + 99) / 100 - 1, (95 * n + 99) / 100 - 1,
-                       (99 * n + 99) / 100 - 1};
-    u32 found[3];
-    select_ranks(values + end, n, 0, ranks, 3, found, spare);
+    size_t ranks[6] = {(50 * n + 99) / 100 - 1, (95 * n + 99) / 100 - 1,
+                       (99 * n + 99) / 100 - 1, NO_RANK, NO_RANK, NO_RANK};
+    u32 found[6];
+    select_ranks(values + end, n, 0, ranks, found, spare);
     store(cursor, load(label));
     cursor += 21;
     store(cursor, load(name.data()));
@@ -510,9 +486,9 @@ static Text render_hour(size_t hour, u32 *space) {
     if (name.size() > 64)
       memcpy(cursor, name.data(), name.size());
     cursor += name.size();
-    for (u32 value : {count, found[0], found[1], found[2], errors})
+    for (u32 value : {(u32)n, found[0], found[1], found[2], errors})
       cursor = put_number(cursor, value);
-    cursor = put_number(cursor, (u64)errors * 1000000 / count);
+    cursor = put_number(cursor, errors * 1000000ull / n);
     *cursor++ = '\n';
   }
   return {text, (size_t)(cursor - text)};
@@ -577,10 +553,13 @@ static size_t next_task() {
 }
 
 static void worker() {
-  Head heads[HOURS] = {};
+  u32 *heads[HOURS] = {};
   // Each chunk replaces the last in the same place, which also leaves the bytes just
-  // past the end of the file safe to read. The kernel frees the page tables with it.
-  u8 *window = (u8 *)map_zeroed(CHUNK + 2 * PAGE, MAP_PRIVATE);
+  // past the end of the file safe to read. The place lies inside one 2 MB area with
+  // mappings on both sides, as that makes the kernel keep its page table. A table
+  // that was freed stays charged until a grace period has passed, which is too late.
+  size_t area = 1 << 21;
+  u8 *window = (u8 *)(((size_t)map_zeroed(area * 2, MAP_PRIVATE) + area - 1) & -area);
   for (;;) {
     if (g.starting_over.load(relaxed))
       start_over();
@@ -618,14 +597,12 @@ int main(int argc, char **) {
   // The box has huge pages set to always, which charges 2 MB for a first touch of a
   // stack or a small mapping.
   prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
-  memset(masks, 255, 64);
+  memset(masks, 255, 128);
   in_fd = open("/data/requests.log", O_RDONLY);
-  struct stat info;
-  fstat(in_fd, &info);
-  input_size = info.st_size;
+  input_size = lseek(in_fd, 0, SEEK_END);
   cpu_set_t cpus;
   sched_getaffinity(0, sizeof cpus, &cpus);
-  workers = CPU_COUNT(&cpus);
+  int workers = CPU_COUNT(&cpus);
   mmap(&g, sizeof g, PROT_READ | PROT_WRITE,
        MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
   chunk_count = (input_size + CHUNK - 1) / CHUNK;
@@ -634,7 +611,7 @@ int main(int argc, char **) {
   // hour however the lines are spread. A region can hold an hour's values and the
   // scratch space for answering it, or its text. Every worker needs page tables for
   // the regions it touches, so while lines arrive as expected they sit close together.
-  capacity = 3 * (input_size / 20 + workers * BLOCK) + (1 << 17);
+  capacity = (3 * (input_size / 20 + workers * BLOCK) + (1 << 17)) & -1024;
   if (speculating)
     capacity = std::min<size_t>(capacity, 1 << 18);
   regions = (u32 *)map_zeroed(std::size(g.free_regions) * capacity * sizeof(u32), MAP_SHARED);
