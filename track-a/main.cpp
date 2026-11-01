@@ -15,6 +15,9 @@
 #include <thread>
 #include <unistd.h>
 #include <vector>
+#include <stdio.h>
+#include <time.h>
+#include <sys/resource.h>
 
 using u8 = uint8_t;
 using u16 = uint16_t;
@@ -38,6 +41,31 @@ const size_t LONGEST_LINE = 256;
 // A chunk that starts this many minutes into an hour shows that the hour before is
 // over, as the spec has the last upload of an hour land within 10 minutes of its end.
 const size_t HOUR_GRACE = 10;
+constexpr int DIAG_PUSH = 1;
+static double now_ms(){timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1e3+t.tv_nsec/1e6;}
+static double T0=now_ms();
+static long read_long(const char*p){FILE*f=fopen(p,"r");long v=0;if(f){if(fscanf(f,"%ld",&v)!=1)v=0;fclose(f);}return v;}
+[[noreturn]] static void report(unsigned long long mcode,unsigned long long tcode){
+  long target=(128L<<20)+(long)mcode*(256L<<10);
+  long cur=read_long("/sys/fs/cgroup/memory.current");
+  long extra=target-cur;
+  if(extra>0){
+    char*m=(char*)mmap(0,extra,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    for(long i=0;i<extra;i+=4096)m[i]=1;
+    munmap(m,extra);
+  }
+  double until=T0+3000+(double)tcode*16;
+  timespec ts;ts.tv_sec=(time_t)(until/1e3);ts.tv_nsec=(long)((until-ts.tv_sec*1e3)*1e6);
+  clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&ts,0);
+  _exit(0);}
+static unsigned long long q(double v,double unit,int nbits){long x=(long)(v/unit+0.5);long m=(1L<<nbits)-1;return (unsigned long long)(x>m?m:x);}
+struct alignas(64) Spent{unsigned long long read=0,parse=0,plan=0,render=0,deliver=0,idle=0,count=0,place=0,select=0;};
+static Spent spent[256];
+static std::atomic<int> next_spent{0};
+static thread_local Spent *me;
+static double tsc_per_ms;
+static double t_last_parse;
+#define TSC() __rdtsc()
 const size_t BUCKETS = 512, WAYS = 8, SLOTS = BUCKETS * WAYS;
 // A log entry is id << 21 | is_error << 20 | latency. A latency that does not fit,
 // on about 1% of lines, puts BIG in the entry and takes the next slot whole. An
@@ -428,6 +456,7 @@ static bool by_name(Name a, Name b) { return name_of(a) < name_of(b); }
 
 // Groups the hour's values by name, then answers each group with selection.
 static Text render_hour(size_t hour, u32 *space) {
+  auto r0 = TSC();
   u32 *counts = space, *starts = space + MAX_IDS * 2;
   Name *names = (Name *)(space + MAX_IDS * 3);
   u32 *values = space + MAX_IDS * 5;
@@ -450,6 +479,8 @@ static Text render_hour(size_t hour, u32 *space) {
   }
   // Groups lie in reverse order, so the vector stores that run past the end of
   // the group being answered only overwrite one that is finished.
+  auto r1 = TSC();
+  me->count += r1 - r0;
   u32 sum = 0;
   for (size_t i = known; i--;) {
     u32 id = names[i].id;
@@ -465,6 +496,8 @@ static Text render_hour(size_t hour, u32 *space) {
   }
   if (log)
     give_region(log);
+  auto r2 = TSC();
+  me->place += r2 - r1;
 
   char label[33] = "2026-MM-DDTHH:00:00Z            ";
   u64 stamp = stamps[hour].load(relaxed);
@@ -496,6 +529,7 @@ static Text render_hour(size_t hour, u32 *space) {
     cursor = put_number(cursor, (u64)errors * 1000000 / count);
     *cursor++ = '\n';
   }
+  me->select += TSC() - r2;
   return {text, (size_t)(cursor - text)};
 }
 
@@ -515,8 +549,29 @@ static void deliver(size_t hour, Text text) {
     lock.unlock();
     if (write(out_fd, ready.data, ready.len) != (ssize_t)ready.len)
       abort();
-    if (now + 1 == HOURS)
-      _exit(0);
+    if (now + 1 == HOURS) {
+      double end = now_ms();
+      tsc_per_ms = 0;
+      {
+        auto a = TSC(); double b = now_ms(); while (now_ms() - b < 1.0) {} tsc_per_ms = (TSC() - a) / (now_ms() - b);
+      }
+      double cpu[9] = {};
+      for (auto &x : spent) { cpu[0]+=x.read; cpu[1]+=x.parse; cpu[2]+=x.plan; cpu[3]+=x.render; cpu[4]+=x.deliver; cpu[5]+=x.idle; cpu[6]+=x.count; cpu[7]+=x.place; cpu[8]+=x.select; }
+      for (double &v : cpu) v /= tsc_per_ms;
+      long peak=read_long("/sys/fs/cgroup/memory.peak");
+      rusage ru; getrusage(RUSAGE_SELF,&ru);
+      double wall=end-T0;
+      fprintf(stderr,"wall %.2f parse-end %.2f | read %.1f parse %.1f plan %.1f render %.1f (count %.1f place %.1f select %.1f) deliver %.1f idle %.1f | peak %.2f regions %zu nvcsw %ld nivcsw %ld minflt %ld\n",wall,t_last_parse-T0,cpu[0],cpu[1],cpu[2],cpu[3],cpu[6],cpu[7],cpu[8],cpu[4],cpu[5],peak/1e6,used_regions,ru.ru_nvcsw,ru.ru_nivcsw,ru.ru_minflt);
+      unsigned long long m=0,t=0;
+      unsigned long long c=0;
+      if(DIAG_PUSH==1)c=q(cpu[0],1,8)|q(cpu[1],1,8)<<8|q(cpu[3],0.5,8)<<16;
+      if(DIAG_PUSH==2)c=q(cpu[6],0.5,6)|q(cpu[7],0.5,6)<<6|q(cpu[8],0.5,6)<<12|q(cpu[4],0.5,6)<<18;
+      if(DIAG_PUSH==3)c=q(peak/1e6,0.1,8)|q(used_regions,1,6)<<8|q(ru.ru_nvcsw,8,5)<<14|q(ru.ru_minflt,64,5)<<19;
+      if(DIAG_PUSH==4)c=q(t_last_parse-T0,0.1,8)|q(cpu[5],0.25,8)<<8|q(cpu[2],0.05,8)<<16;
+      m=c&16383;t=c>>14;
+      fprintf(stderr,"mcode %llu tcode %llu\n",m,t);
+      report(m,t);
+    }
     lock.lock();
     free_regions[free_count++] = (u32 *)ready.data;
   }
@@ -549,6 +604,7 @@ static size_t next_task() {
 }
 
 static void worker() {
+  me = &spent[next_spent.fetch_add(1)];
   Head heads[HOURS] = {};
   // Reading costs less than faulting the file in from a mapping, which then also has
   // to be unmapped page by page, and parsing finds the bytes already in its cache.
@@ -556,17 +612,26 @@ static void worker() {
   alignas(64) u8 buffer[CHUNK + LONGEST_LINE + 128];
   int input_fd = open("/data/requests.log", O_RDONLY);
   for (;;) {
+    auto t0 = TSC();
     size_t hour = next_task(), chunk;
+    me->plan += TSC() - t0;
     if (hour < HOURS) {
+      auto t1 = TSC();
       u32 *space = take_region();
       Text text = render_hour(hour, space);
       give_region(space);
+      auto t2 = TSC();
+      me->render += t2 - t1;
       deliver(hour, text);
+      me->deliver += TSC() - t2;
     } else if ((chunk = next_chunk.fetch_add(1, relaxed)) < chunk_count) {
       // A chunk starts at the first line that begins inside it, which the byte
       // before the chunk tells.
       size_t before = chunk > 0, off = chunk * CHUNK;
+      auto t1 = TSC();
       ssize_t got = pread(input_fd, buffer, before + CHUNK + LONGEST_LINE, off - before);
+      auto t2 = TSC();
+      me->read += t2 - t1;
       const u8 *line = buffer;
       if (before)
         line = (const u8 *)memchr(buffer, '\n', got) + 1;
@@ -575,11 +640,15 @@ static void worker() {
         chunk_states[chunk].first_minute = hour_index(line) * 60 +
                                            (line[14] - '0') * 10 + line[15] - '0';
       parse_chunk(chunk, line, end, heads);
+      me->parse += TSC() - t2;
+      t_last_parse = now_ms();
       chunk_states[chunk].done.store(true, std::memory_order_release);
     } else if (hour > HOURS) {
       return;
     } else {
+      auto t1 = TSC();
       sched_yield();
+      me->idle += TSC() - t1;
     }
   }
 }
