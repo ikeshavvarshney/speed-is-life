@@ -530,9 +530,6 @@ static void parse_docs(Scratch &scratch) {
       // Four lookups in one vector step. A displaced term or a token sharing its home
       // slot takes another look, about 3% of tokens.
       for (size_t at = 1; at <= count; at += 4) {
-        for (size_t i = 0; i < 4; i++)
-          _mm_prefetch(table_slots + (tokens[at + i + PREFETCH_AHEAD] & table_mask),
-                       _MM_HINT_T0);
         v4 hash = load(tokens + at);
         v4 value = _mm256_i64gather_epi64((const long long *)table_slots,
                                           _mm256_and_si256(hash, slot_mask), 8);
