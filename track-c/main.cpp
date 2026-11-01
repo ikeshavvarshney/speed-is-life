@@ -317,12 +317,14 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
       recs[r].hash = word;
       recs[r].region = name % 64;
     }
-    // About 90% of records set a new bit, so testing first would only add a
-    // branch. Whichever thread sets a bit counts that name for the country.
+    // A set bit costs no write, and a write costs a locked instruction that
+    // often has to fetch the line from another core, so it is the last step.
+    // Whichever thread sets a bit counts that name for the country.
     for (size_t r = 0; r < n; r++) {
+      auto &word = name_bits[recs[r].hash];
       u64 bit = 1ull << recs[r].region;
-      u64 old = name_bits[recs[r].hash].fetch_or(bit, relaxed);
-      mine[recs[r].hash / WORDS].distinct += !(old & bit);
+      if (!(word.load(relaxed) & bit))
+        mine[recs[r].hash / WORDS].distinct += !(word.fetch_or(bit, relaxed) & bit);
     }
     if (done || start >= stop)
       return;
