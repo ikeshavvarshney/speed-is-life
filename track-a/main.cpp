@@ -170,13 +170,7 @@ static u32 *take_region() {
   return pooled ? pool[--pooled] : regions + carved++ * capacity;
 }
 
-// The output file grows until the end, so that is when the peak is set. Near the end a
-// region is released if enough warm ones are free, so no worker has to fault one again.
 static void give_region(const void *region) {
-  if (next_hour >= HOURS * 5 / 6 && pooled >= 3) {
-    madvise((void *)region, capacity * 4, MADV_DONTNEED);
-    return;
-  }
   std::lock_guard guard(plan_lock);
   pool[pooled++] = (u32 *)region;
 }
@@ -515,7 +509,7 @@ int main(int argc, char **) {
   // hour however the lines are spread. A region can hold an hour's values and the
   // scratch space for answering it, or its text, in whole pages.
   capacity = (3 * (input_size / 20 + WORKERS * 2 * BLOCK) + (1 << 17)) & -1024;
-  regions = (u32 *)map_zeroed(2 * std::size(pool) * capacity * 4);
+  regions = (u32 *)map_zeroed(std::size(pool) * capacity * 4);
   name_bytes = (char *)map_zeroed(MAX_IDS * 128);
   char *stacks = (char *)map_zeroed(WORKERS * STACK);
   // Each CPU that charges memory keeps up to 256 KB charged in reserve, which counts
@@ -523,8 +517,10 @@ int main(int argc, char **) {
   extern char __data_start, _end;
   madvise((void *)((size_t)&__data_start & -4096), &_end - &__data_start, MADV_POPULATE_WRITE);
   madvise(name_bytes, 1 << 17, MADV_POPULATE_WRITE);
-  for (size_t r = 0; r < 2; r++)
+  for (size_t r = 0; r < 6; r++)
     madvise(regions + r * capacity, WARM, MADV_POPULATE_WRITE);
+  for (size_t at = 0; at < std::min(input_size, size_t(32) << 20); at += 1 << 21)
+    *(volatile const u8 *)(input + at);
   int out = open("/out/summary.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
   pthread_attr_t attr;
   pthread_attr_init(&attr);
@@ -536,7 +532,7 @@ int main(int argc, char **) {
   }
   for (size_t at = 0; at < input_size; at += 1 << 21)
     *(volatile const u8 *)(input + at);
-  for (size_t r = 2; r < POOL; r++)
+  for (size_t r = 6; r < POOL; r++)
     madvise(regions + r * capacity, WARM, MADV_POPULATE_WRITE);
   // This thread alone writes, in order, and parses while the next hour is not ready.
   // Writing the last hour ends the process, which needs no threads to be joined.
