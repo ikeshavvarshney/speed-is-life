@@ -448,6 +448,10 @@ static size_t next_task() {
 
 // Parses a chunk or clears a piece of the input, and says if there was any left.
 static bool parse_or_clear(u32 **heads) {
+  // No hour can be answered until every chunk before it is done, so if a thread stalls
+  // the others would only pile up logs, and peak memory is the worst of five runs.
+  if (next_chunk.load(relaxed) > parsed_chunks + 48 && hours_over < HOURS)
+    return false;
   size_t chunk = next_chunk.fetch_add(1, relaxed), off = chunk * CHUNK;
   if (off < input_size) {
     // A chunk's lines are those that begin after its first byte, up to and including
