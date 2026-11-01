@@ -28,10 +28,7 @@ constexpr auto relaxed = std::memory_order_relaxed;
 #define LOW _mm256_castsi256_si128
 #define HIGH(v) _mm256_extracti128_si256(v, 1)
 
-const size_t CHUNK = 1 << 16, HOURS = 72, BLOCK = 256;
-// The longest line in the spec's grammar is under this, so reading this much more
-// than a chunk gives every line that starts in it.
-const size_t LONGEST_LINE = 256;
+const size_t CHUNK = 1 << 18, UNMAP_STEP = 1 << 23, HOURS = 72, BLOCK = 256;
 // A chunk that starts this many minutes into an hour shows that the hour before is
 // over, as the spec has the last upload of an hour land within 10 minutes of its end.
 const size_t HOUR_GRACE = 10;
@@ -87,7 +84,7 @@ alignas(64) static char name_bytes[MAX_IDS * 128];
 alignas(64) static atomic<u64> stamps[HOURS];
 alignas(64) static atomic<size_t> cursors[HOURS];
 alignas(64) static atomic<u32 *> bases[HOURS];
-alignas(64) static atomic<size_t> next_chunk;
+alignas(64) static atomic<size_t> next_chunk, next_unmap;
 // Guards the rest: how far parsing has got, which hours are over and taken, the free
 // regions and the turn to write.
 alignas(64) static SpinLock plan_lock;
@@ -97,7 +94,8 @@ static bool writing, speculating;
 static Text waiting[HOURS];
 static u32 *free_regions[HOURS * 3];
 
-alignas(64) static size_t input_size, capacity, chunk_count;
+alignas(64) static const u8 *input;
+static size_t input_size, capacity, chunk_count;
 static ChunkState *chunk_states;
 static u32 *regions;
 static int out_fd;
@@ -235,6 +233,7 @@ static void parse_chunk(size_t chunk, const u8 *line, const u8 *end, u32 **heads
   u32 *at = heads[0];
   const v4 space_vector = _mm256_set1_epi8(' ');
   while (line < end) {
+    _mm_prefetch((const char *)line + 1024, _MM_HINT_T0);
     // These bytes hold the month, day and hour. Nearly every line has the hour
     // of the line before it, as the file is the shards' chunks in arrival order.
     u64 now = load64(line + 5);
@@ -526,11 +525,6 @@ static size_t next_task() {
 
 static void worker() {
   u32 *heads[HOURS] = {};
-  // Reading costs less than faulting the file in from one mapping that all threads
-  // share, which then also has to be unmapped page by page. Each thread has its own
-  // open file so that they don't share its reference count.
-  alignas(64) u8 buffer[CHUNK + LONGEST_LINE + 128];
-  int fd = open("/data/requests.log", O_RDONLY);
   for (;;) {
     size_t hour = next_task(), chunk;
     if (hour < HOURS) {
@@ -539,14 +533,13 @@ static void worker() {
       give_region(space);
       deliver(hour, text);
     } else if ((chunk = next_chunk.fetch_add(1, relaxed)) < chunk_count) {
-      size_t off = chunk * CHUNK;
-      ssize_t got = pread(fd, buffer, CHUNK + LONGEST_LINE, off);
       // A chunk's lines are those that begin after its first byte, up to and including
       // the first byte of the next chunk.
-      const u8 *line = buffer;
+      size_t off = chunk * CHUNK;
+      const u8 *line = input + off;
       if (off)
-        line = (const u8 *)memchr(buffer, '\n', got) + 1;
-      const u8 *end = buffer + std::min<size_t>(CHUNK + 1, got);
+        line = (const u8 *)memchr(line, '\n', input_size - off) + 1;
+      const u8 *end = input + std::min(off + CHUNK + 1, input_size);
       if (line < end)
         chunk_states[chunk].first_minute = hour_index(line) * 60 +
                                            (line[14] - '0') * 10 + line[15] - '0';
@@ -555,7 +548,15 @@ static void worker() {
     } else if (hour > HOURS) {
       return;
     } else {
-      sched_yield();
+      // Process exit would otherwise unmap every page of the input on one thread,
+      // while the clock runs. Clearing the page tables in pieces now, on all threads,
+      // removes most of that cost.
+      size_t off = next_unmap.fetch_add(UNMAP_STEP, relaxed);
+      if (off < input_size)
+        madvise((void *)(input + off), std::min(UNMAP_STEP, input_size - off),
+                MADV_DONTNEED);
+      else
+        sched_yield();
     }
   }
 }
@@ -566,7 +567,8 @@ int main(int argc, char **) {
   // thread stack or a small mapping.
   prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
   memset(masks, 255, 128);
-  input_size = lseek(open("/data/requests.log", O_RDONLY), 0, SEEK_END);
+  int fd = open("/data/requests.log", O_RDONLY);
+  input_size = lseek(fd, 0, SEEK_END);
   cpu_set_t cpus;
   sched_getaffinity(0, sizeof cpus, &cpus);
   int workers = CPU_COUNT(&cpus);
@@ -577,9 +579,18 @@ int main(int argc, char **) {
   // scratch space for answering it, or its text, in whole pages.
   capacity = (3 * (input_size / 20 + workers * BLOCK) + (1 << 17)) & -1024;
   regions = (u32 *)map_zeroed(std::size(free_regions) * capacity * sizeof(u32));
+  // A file ending on a page boundary would fault on the vector loads near its end, so
+  // the file is mapped over a slightly larger area of zeroed bytes.
+  void *base = map_zeroed(input_size + 4096);
+  if (input_size)
+    mmap(base, input_size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
+  input = (const u8 *)base;
   out_fd = open("/out/summary.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
   for (int w = 1; w < workers; w++)
     std::thread(worker).detach();
+  // Threads faulting pages of one mapping bounce the same locks between them, so one
+  // thread maps the file ahead of the others, which is faster than they read it.
+  madvise(base, input_size, MADV_POPULATE_READ);
   worker();
   // The thread writing the last hour ends the process, so this one just waits.
   for (;;)
