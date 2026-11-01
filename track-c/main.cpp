@@ -24,7 +24,7 @@ using std::atomic;
 constexpr auto relaxed = std::memory_order_relaxed;
 #define INLINE [[gnu::always_inline]] inline
 
-const size_t CHUNK = 1 << 18, REGION_CHUNK = 1 << 16, UNMAP_STEP = 1 << 23;
+const size_t CHUNK = 1 << 16, REGION_CHUNK = 1 << 16;
 const size_t COUNTRIES = 256, HUGE_PAGE = 1 << 21;
 // The generator's pool of 100,000 names, plus the few that edge-case blocks
 // add, fits at 77% load.
@@ -33,6 +33,10 @@ const int NAME_BITS = 17;
 const size_t WORDS = (1 << NAME_BITS) / 64;
 const size_t BLOCKS = 16, MAX_MARKS = BLOCKS * 64 + 64;
 const size_t MAX_RECORDS = MAX_MARKS / 5 + 1;
+// A worker's buffer holds a chunk plus room around it: number loads reach before
+// a record, the last record may run past the chunk, and block loads run past that.
+const size_t BEFORE = 64, AFTER = 1024;
+const size_t BUFFER = (BEFORE + 1 + CHUNK + AFTER + BLOCKS * 64 * 2 + 4095) & -4096;
 
 // One worker's running values for one country, on one cache line. `sums` is
 // added to as one vector: id sum, amount sum, count << 32 | name bytes, note
@@ -78,7 +82,9 @@ static u8 *zeroed(size_t bytes, int advice) {
   return aligned;
 }
 
-static const u8 *input, *regions;
+static const u8 *regions;
+static u8 *buffers;
+static int input_fd;
 static size_t input_size, regions_size;
 static u8 *by_id;
 static u32 last_region;
@@ -90,7 +96,7 @@ static atomic<u8> seen_codes[26 * 26 * 26];
 static std::mutex codes_lock;
 static std::vector<std::string> codes;
 static atomic<u32> distinct_names[COUNTRIES];
-static Counter next_region, next_chunk, next_country, next_unmap;
+static Counter next_region, next_chunk, next_country;
 
 // Claims pieces of regions.csv. by_id holds 1 + the country's index, and 0 for
 // anything unknown. Its last entry stays 0 and stands for every id above the
@@ -211,8 +217,8 @@ INLINE size_t intern(u64 hash) {
   }
 }
 
-static void parse_chunk(size_t first, size_t stop, Group *mine) {
-  const u8 *base = input;
+static void parse_chunk(const u8 *base, size_t first, size_t stop, size_t limit,
+                        Group *mine) {
   const u8 *ids = by_id;
   const u32 top = last_region;
   u32 marks[MAX_MARKS];
@@ -324,8 +330,12 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
       if (!(word.load(relaxed) & bit))
         word.fetch_or(bit, relaxed);
     }
-    if (done || start >= stop)
+    if (done || start >= stop) {
+      // A record this long would have been cut short by the end of the read.
+      if (start > limit)
+        abort();
       return;
+    }
     size_t left = filled - whole * 5;
     std::copy(marks + whole * 5, marks + filled, marks);
     // The mark after the last one found may already have pairs waiting for it.
@@ -338,13 +348,12 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
 // Past a chunk's start, the next record starts after an LF followed by a digit
 // or BOM. Newlines inside notes are always followed by a lowercase word or a
 // quote (spec section 2.2).
-static size_t first_record(size_t off) {
-  for (size_t i = off - 1; i + 1 < input_size; i++) {
-    u8 next = input[i + 1];
-    if (input[i] == '\n' && ((next >= '0' && next <= '9') || next == 0xEF))
+static size_t first_record(const u8 *text, size_t len) {
+  for (size_t i = 0; i + 1 < len; i++)
+    if (text[i] == '\n' && ((text[i + 1] >= '0' && text[i + 1] <= '9') ||
+                            text[i + 1] == 0xEF))
       return i + 1;
-  }
-  return input_size;
+  return len;
 }
 
 static void worker(int index, std::barrier<> *barrier) {
@@ -352,29 +361,24 @@ static void worker(int index, std::barrier<> *barrier) {
   barrier->arrive_and_wait();
   Group *mine = groups + index * COUNTRIES;
   std::uninitialized_default_construct_n(mine, COUNTRIES);
+  // Chunks are copied rather than mapped: the copy costs less than the page
+  // faults, and parsing then runs on cache lines the copy just brought in.
+  u8 *buffer = buffers + index * BUFFER, *text = buffer + BEFORE;
   for (;;) {
     size_t off = next_chunk.take(CHUNK);
     if (off >= input_size)
       break;
-    size_t first = off ? first_record(off)
-                       : (const u8 *)memchr(input, '\n', input_size) - input + 1;
-    size_t stop = std::min(off + CHUNK, input_size);
-    madvise((void *)(input + off), stop - off, 22); // MADV_POPULATE_READ
+    size_t from = off ? off - 1 : 0;
+    size_t len = std::min(off + CHUNK + AFTER, input_size) - from;
+    if (pread(input_fd, text, len, from) != (ssize_t)len)
+      abort();
+    size_t first = off ? first_record(text, len)
+                       : (const u8 *)memchr(text, '\n', len) - text + 1;
+    size_t stop = std::min(off + CHUNK, input_size) - from;
     if (first < stop)
-      parse_chunk(first, stop, mine);
+      parse_chunk(buffer, BEFORE + first, BEFORE + stop, BEFORE + len, mine);
   }
   barrier->arrive_and_wait();
-
-  // Process exit would otherwise unmap every page of the input on one thread,
-  // while the clock runs. Clearing the page tables now, on all threads, removes
-  // most of that cost.
-  for (;;) {
-    size_t off = next_unmap.take(UNMAP_STEP);
-    if (off >= input_size)
-      break;
-    madvise((void *)(input + off), std::min(UNMAP_STEP, input_size - off),
-            MADV_DONTNEED);
-  }
 
   for (;;) {
     size_t country = next_country.take(1);
@@ -399,7 +403,11 @@ int main() {
   sched_getaffinity(0, sizeof cpus, &cpus);
   threads = CPU_COUNT(&cpus);
   regions = map_input("/data/regions.csv", regions_size);
-  input = map_input("/data/records.csv", input_size);
+  input_fd = open("/data/records.csv", O_RDONLY);
+  struct stat info;
+  fstat(input_fd, &info);
+  input_size = info.st_size;
+  buffers = zeroed(threads * BUFFER, MADV_NOHUGEPAGE);
   size_t line = regions_size - 1;
   while (regions[line - 1] != '\n')
     line--;
