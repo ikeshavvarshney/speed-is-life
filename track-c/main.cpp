@@ -337,7 +337,7 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
       auto &word = bits[recs[r].hash];
       u64 bit = 1ull << recs[r].region;
       if (!(word.load(relaxed) & bit))
-        word.store(word.load(relaxed) | bit, relaxed);
+        word.fetch_or(bit, relaxed);
     }
     if (start >= stop)
       return;
