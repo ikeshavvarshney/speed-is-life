@@ -35,7 +35,7 @@ const size_t CODES = 26 * 26 * 26;
 const int NAME_BITS = 17;
 // Words of one country's bitset over name ids.
 const size_t WORDS = (1 << NAME_BITS) / 64;
-const size_t BLOCKS = 16, MAX_MARKS = BLOCKS * 64 + 64;
+const size_t BLOCKS = 8, MAX_MARKS = BLOCKS * 64 + 64;
 const size_t MAX_RECORDS = MAX_MARKS / 5 + 1;
 
 // One worker's running values for one country, on one cache line. `sums` is
@@ -402,6 +402,7 @@ static void worker(int index, std::barrier<> *barrier) {
       distinct += __builtin_popcountll(name_bits[country * WORDS + i].load(relaxed));
     distinct_names[country].store(distinct, relaxed);
   }
+  barrier->arrive_and_wait();
 }
 
 static char *money(char *out, long long cents) {
@@ -433,12 +434,9 @@ int main() {
   prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
   groups = (Group *)zeroed(threads * COUNTRIES * sizeof(Group));
   std::barrier barrier(threads);
-  std::thread pool[threads];
   for (int t = 1; t < threads; t++)
-    pool[t] = std::thread(worker, t, &barrier);
+    std::thread(worker, t, &barrier).detach();
   worker(0, &barrier);
-  for (int t = 1; t < threads; t++)
-    pool[t].join();
 
   // Countries in code order are already sorted, and _UNMATCHED sorts last.
   char text[32768], *out = text;
