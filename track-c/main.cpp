@@ -217,7 +217,7 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
   const auto bits = name_bits;
   u32 marks[MAX_MARKS];
   // Number of "" pairs in the field each mark ends. It stays mostly zero.
-  u32 pairs[MAX_MARKS + 1] = {};
+  u32 pairs[MAX_MARKS + 8] = {};
   alignas(32) Rec recs[MAX_RECORDS];
   const v4 finder = _mm256_setr_epi8(
       -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 10, -1, 44, -1, -1, -1, //
@@ -264,9 +264,9 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
         count_pair();
       size_t k = filled;
       filled += __builtin_popcountll(seps);
-      // Blocks hold about five marks. Writing six every time beats a branch.
+      // Blocks hold about six marks. Writing eight every time beats a branch.
       do {
-        for (int i = 0; i < 6; i++, k++, seps &= seps - 1)
+        for (int i = 0; i < 8; i++, k++, seps &= seps - 1)
           marks[k] = block + _tzcnt_u64(seps);
       } while (seps);
     }
@@ -347,12 +347,19 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
     }
     if (done || start >= stop)
       return;
-    size_t left = filled - whole * 5;
-    std::copy(marks + whole * 5, marks + filled, marks);
-    // The mark after the last one found may already have pairs waiting for it.
-    std::copy(pairs + whole * 5, pairs + filled + 1, pairs);
-    std::fill(pairs + left + 1, pairs + filled + 1, 0);
-    filled = left;
+    // Under five marks remain, and the mark after them may already have pairs
+    // waiting for it. Fixed moves cost less than calls to copy so little.
+    auto left_marks = (const __m128i *)(marks + whole * 5);
+    auto left_pairs = (const __m128i *)(pairs + whole * 5);
+    __m128i kept_marks = _mm_loadu_si128(left_marks);
+    __m128i kept_pairs = _mm_loadu_si128(left_pairs);
+    u32 last_pair = pairs[whole * 5 + 4];
+    for (size_t i = 0; i <= filled; i += 8)
+      _mm256_storeu_si256((v4 *)(pairs + i), _mm256_setzero_si256());
+    _mm_storeu_si128((__m128i *)marks, kept_marks);
+    _mm_storeu_si128((__m128i *)pairs, kept_pairs);
+    pairs[4] = last_pair;
+    filled -= whole * 5;
   }
 }
 
