@@ -365,29 +365,6 @@ static size_t first_record(size_t off) {
   return i;
 }
 
-#include <cstdlib>
-#include <time.h>
-static long cg[6];
-static long read_cg(const char *path, const char *key) {
-  static char buf[8192];
-  int fd = open(path, O_RDONLY);
-  if (fd < 0) return 0;
-  long n = read(fd, buf, sizeof buf - 1);
-  close(fd);
-  if (n <= 0) return 0;
-  buf[n] = 0;
-  if (!key) return atol(buf);
-  const char *q = strstr(buf, key);
-  return q ? atol(q + strlen(key)) : 0;
-}
-static void snap() {
-  cg[0] = read_cg("/sys/fs/cgroup/memory.current", 0);
-  cg[1] = read_cg("/sys/fs/cgroup/memory.peak", 0);
-  cg[2] = read_cg("/sys/fs/cgroup/memory.stat", "anon ");
-  cg[3] = read_cg("/sys/fs/cgroup/memory.stat", "pagetables ");
-  cg[4] = read_cg("/sys/fs/cgroup/memory.stat", "kernel ");
-  cg[5] = read_cg("/sys/fs/cgroup/memory.stat", "file ");
-}
 static void worker(int index, std::barrier<> *barrier) {
   load_regions();
   barrier->arrive_and_wait();
@@ -404,7 +381,6 @@ static void worker(int index, std::barrier<> *barrier) {
       parse_chunk(first, stop, mine);
   }
   barrier->arrive_and_wait();
-  if (!index) snap();
 
   // Process exit would otherwise unmap every page of the input on one thread,
   // while the clock runs. Clearing the page tables now, on all threads, removes
@@ -491,24 +467,5 @@ int main() {
   int fd = open("/out/aggregates.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (write(fd, text, out - text) != out - text)
     abort();
-  fprintf(stderr, "current %ld peak %ld anon %ld pt %ld kernel %ld file %ld\n", cg[0], cg[1], cg[2], cg[3], cg[4], cg[5]);
-  if (threads == 12) {
-    long final_peak = read_cg("/sys/fs/cgroup/memory.peak", 0);
-    int c = cg[0] / 131072, d = final_peak / 131072;
-    int a = cg[2] / 262144, b = cg[3] / 65536;
-    if (c > 99) c = 99;
-    if (d > 99) d = 99;
-    if (a > 99) a = 99;
-    if (b > 99) b = 99;
-    long want = (128l << 20) + (a * 100l + b) * (256l << 10);
-    long now = read_cg("/sys/fs/cgroup/memory.current", 0);
-    long len = want - now;
-    void *m = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
-    munmap(m, len);
-    timespec ts;
-    ts.tv_sec = 3 + (c * 100 + d) * 2 / 1000;
-    ts.tv_nsec = ((c * 100 + d) * 2 % 1000) * 1000000l;
-    nanosleep(&ts, 0);
-  }
   _exit(0);
 }
