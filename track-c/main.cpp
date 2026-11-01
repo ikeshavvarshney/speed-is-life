@@ -370,24 +370,10 @@ static size_t first_record(size_t off) {
   return i;
 }
 
-#include <cstdlib>
-#include <time.h>
-static long pts[4];
-static long cur() {
-  char buf[64];
-  int fd = open("/sys/fs/cgroup/memory.current", O_RDONLY);
-  if (fd < 0) return 0;
-  long n = read(fd, buf, sizeof buf - 1);
-  close(fd);
-  if (n <= 0) return 0;
-  buf[n] = 0;
-  return atol(buf);
-}
 static void *worker(void *arg) {
   size_t index = (size_t)arg;
   load_regions();
   barrier->arrive_and_wait();
-  if (!index) pts[2] = cur();
   Group *mine = groups + index * COUNTRIES;
   for (;;) {
     size_t off = next_chunk.fetch_add(CHUNK, relaxed);
@@ -400,7 +386,6 @@ static void *worker(void *arg) {
       parse_chunk(first, stop, mine);
   }
   barrier->arrive_and_wait();
-  if (!index) pts[3] = cur();
 
   // Process exit would otherwise unmap every page of the input on one thread,
   // while the clock runs. Clearing the page tables now, on all threads, removes
@@ -432,7 +417,6 @@ static char *money(char *out, long long cents) {
 }
 
 int main() {
-  pts[0] = cur();
   // The first memory charge on a CPU reserves 256 KB for that CPU, and peak memory
   // counts the reserve. So this thread faults everything the workers will write,
   // and their CPUs never charge: globals here, then tables, page tables, groups
@@ -463,7 +447,6 @@ int main() {
   prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
   groups = (Group *)zeroed(threads * COUNTRIES * sizeof(Group));
   std::uninitialized_default_construct_n(groups, threads * COUNTRIES);
-  pts[1] = cur();
   std::barrier all(threads);
   barrier = &all;
   u8 *stacks = zeroed(threads * STACK);
@@ -508,21 +491,5 @@ int main() {
   int fd = open("/out/aggregates.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (write(fd, text, out - text) != out - text)
     abort();
-  fprintf(stderr, "start %ld spawn %ld regions %ld parse %ld\n", pts[0], pts[1], pts[2], pts[3]);
-  if (threads == 12) {
-    int c = pts[0] / 131072, d = pts[1] / 131072, a = pts[2] / 131072, b = pts[3] / 131072;
-    if (c > 99) c = 99;
-    if (d > 99) d = 99;
-    if (a > 99) a = 99;
-    if (b > 99) b = 99;
-    long want = (128l << 20) + (a * 100l + b) * (256l << 10);
-    long len = want - cur();
-    void *m = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
-    munmap(m, len);
-    timespec ts;
-    ts.tv_sec = 3 + (c * 100 + d) * 2 / 1000;
-    ts.tv_nsec = ((c * 100 + d) * 2 % 1000) * 1000000l;
-    nanosleep(&ts, 0);
-  }
   _exit(0);
 }
