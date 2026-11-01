@@ -35,7 +35,7 @@ const size_t DENSE_LIMIT = 1 << 10;
 // where a bitset is smaller than its list. The queries sample the corpus: phrases
 // are windows of documents, and boolean terms are drawn by band. More frequent
 // terms also go into the table first, from HOT_COUNT up.
-const u32 HIGH_COUNT = 30, HOT_COUNT = 4;
+const u32 HIGH_COUNT = 25, HOT_COUNT = 4;
 
 // A table slot holds the high bits of the term's hash, its id and two flags.
 const int ID_BITS = 18, TAG_SHIFT = 20, PAIR_BITS = 20;
@@ -52,7 +52,7 @@ const u32 OP_AND = 0, OP_OR = 1, OP_NOT = 2, OP_BITS = 2;
 const int GROUP_BITS = 6, PARTITION_BITS = 9;
 const u32 GROUP_DOCS = 1 << GROUP_BITS, PARTITION_TERMS = 1 << PARTITION_BITS;
 const u16 MARKER = 1 << 15, LOG_END = UINT16_MAX;
-const size_t LOG_BLOCK = 1 << 9, LOG_UNIT = 16;
+const size_t LOG_BLOCK = 1 << 9;
 
 // Common terms gather one cache line per term, 512 documents, before it is written
 // to the shared bitset, and each thread owns whole blocks of 512 documents.
@@ -421,19 +421,13 @@ static void plan_index() {
   free(draft.hashes);
 }
 
-static v4 *claim_log_block(size_t partition) {
-  return (v4 *)(log_regions + partition * log_span +
-                next_log_block[partition].take() * LOG_BLOCK);
+static u16 *claim_log_block(size_t partition) {
+  return (u16 *)(log_regions + partition * log_span +
+                 next_log_block[partition].take() * LOG_BLOCK);
 }
 
 static void parse_docs(Scratch &scratch) {
-  // Each partition's next hits wait in a small buffer, all of them in a few cache
-  // lines on one page, and go to the log 32 bytes at a time. Writing directly would
-  // touch one page and one cache line per partition, far more than the first-level
-  // TLB holds.
-  vector<v4 *> heads(partitions);
-  vector<u32> filled(partitions);
-  auto waiting = (u16 *)aligned_alloc(64, partitions * LOG_UNIT * 2);
+  vector<u16 *> heads(partitions);
   for (size_t part = 0; part < partitions; part++)
     heads[part] = claim_log_block(part);
   u64 *tokens = scratch.tokens;
@@ -460,20 +454,14 @@ static void parse_docs(Scratch &scratch) {
     }
   };
   auto push = [&](size_t part, u16 entry) {
-    u32 k = filled[part];
-    waiting[part * LOG_UNIT + k++] = entry;
-    if (k == LOG_UNIT) {
-      k = 0;
-      v4 *head = heads[part];
-      store(head++, load(waiting + part * LOG_UNIT));
-      // Every block starts with a marker.
-      if (!((size_t)head & (LOG_BLOCK - 1))) {
-        head = claim_log_block(part);
-        waiting[part * LOG_UNIT + k++] = MARKER | group;
-      }
-      heads[part] = head;
+    u16 *head = heads[part];
+    *head++ = entry;
+    // Every block starts with a marker.
+    if (!((size_t)head & (LOG_BLOCK - 1))) {
+      head = claim_log_block(part);
+      *head++ = MARKER | group;
     }
-    filled[part] = k;
+    heads[part] = head;
   };
   const v4 slot_mask = _mm256_set1_epi64x(table_mask), zero = _mm256_setzero_si256();
   const v4 miss = _mm256_set1_epi64x(NO_ID);
@@ -570,12 +558,9 @@ static void parse_docs(Scratch &scratch) {
         flush(doc);
     }
   }
-  for (size_t part = 0; part < partitions; part++) {
-    waiting[part * LOG_UNIT + filled[part]] = LOG_END;
-    store(heads[part], load(waiting + part * LOG_UNIT));
-  }
+  for (u16 *head : heads)
+    *head = LOG_END;
   free(lines);
-  free(waiting);
 }
 
 // Turns a partition's log into its lists. Runs of hits are visited by group, so
