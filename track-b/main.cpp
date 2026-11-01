@@ -112,29 +112,36 @@ static u8 *huge_pages(size_t bytes) {
 
 alignas(64) static u8 low_bytes[64];
 
-// The tail joins in early enough to reach every byte of the result.
+INLINE u64 mix_rounds(v2 state) {
+  state = _mm_aesenc_si128(state, _mm_set_epi64x(0x2D358DCCAA6C78A5, 0x8BB84B93));
+  state = _mm_aesenc_si128(state, _mm_set_epi64x(0x4B33A62ED433D4A3, 0xC2B2AE3D));
+  return _mm_cvtsi128_si64(
+      _mm_aesenc_si128(state, _mm_set_epi64x(0x9E3779B97F4A7C15, 0xBF58476D)));
+}
+
+// Up to 32 bytes are all covered by the first and last 16, and longer tokens differ
+// from any term by their length.
 [[gnu::cold]] static u64 long_token_hash(const u8 *start, size_t len) {
   v2 head = _mm_loadu_si128((const v2 *)start);
   v2 tail = _mm_loadu_si128((const v2 *)(start + len - 16));
-  v2 lower = _mm_set1_epi8(0x20), length = _mm_set1_epi64x(len);
-  v2 mixed = _mm_aesenc_si128(_mm_or_si128(head, lower), _mm_or_si128(tail, lower));
-  return _mm_cvtsi128_si64(
-      _mm_aesenc_si128(_mm_aesenc_si128(mixed, length), lower));
+  v2 lower = _mm_set1_epi8(0x20);
+  head = _mm_aesenc_si128(_mm_or_si128(head, lower), _mm_or_si128(tail, lower));
+  return mix_rounds(_mm_xor_si128(head, _mm_set1_epi64x(len)));
 }
 
-// Hashes a token where it lies. Token bytes are letters and digits, so OR-ing
-// 0x20 lowercases them, and masking removes whatever follows. Two AES rounds spread
-// every byte over the whole state in far fewer micro-ops than a wide multiply. The
+// Hashes a token where it lies. Token bytes are letters and digits, so OR-ing 0x20
+// lowercases them, and masking removes whatever follows. AES spreads every byte in far
+// fewer micro-ops than a wide multiply, but it takes three rounds. After two, half of
+// the state still collides for tokens differing only along one of AES's diagonals:
+// `wodeand` and `woweandvi` both occur in the seed 2 corpus, and had the same hash. The
 // hash stands in for the bytes: with about 600,000 distinct tokens and 76,000 terms,
-// the chance of any collision is about 1 in 10 million.
+// the chance of any collision is about 1 in 100 million.
 INLINE u64 token_hash(const u8 *start, size_t len) {
   if (len > 16)
     return long_token_hash(start, len);
   v2 bytes = _mm_or_si128(_mm_loadu_si128((const v2 *)start), _mm_set1_epi8(0x20));
-  v2 kept = _mm_and_si128(bytes, _mm_loadu_si128((const v2 *)(low_bytes + 32 - len)));
-  v2 mixed = _mm_aesenc_si128(kept, _mm_set_epi64x(0x2D358DCCAA6C78A5, 0x8BB84B93));
-  return _mm_cvtsi128_si64(
-      _mm_aesenc_si128(mixed, _mm_set_epi64x(0x4B33A62ED433D4A3, 0xC2B2AE3D)));
+  return mix_rounds(
+      _mm_and_si128(bytes, _mm_loadu_si128((const v2 *)(low_bytes + 32 - len))));
 }
 
 // Adding moves each range to the top of the signed bytes, where one compare finds
