@@ -315,9 +315,9 @@ static double thread_maps(int fd,size_t size,size_t piece,int n){
 static u64 q(double v,double unit,int nbits){long x=(long)(v/unit+0.5);long m=(1L<<nbits)-1;return (u64)(x>m?m:x);}
 static void run_all(int fd,size_t size){
   double a,b,c;
-  if(1==1){a=procs(fd,size,1<<18,12,false);b=procs(fd,size,1<<20,12,false);c=procs(fd,size,1<<16,12,false);}
-  if(1==2){a=thread_maps(fd,size,1<<20,12);b=thread_maps(fd,size,1<<18,12);c=procs(fd,size,1<<18,12,true);}
-  if(1==3){a=procs(fd,size,1<<18,6,false);b=procs(fd,size,1<<21,12,false);c=procs(fd,size,1<<18,1,false);}
+  if(2==1){a=procs(fd,size,1<<18,12,false);b=procs(fd,size,1<<20,12,false);c=procs(fd,size,1<<16,12,false);}
+  if(2==2){a=thread_maps(fd,size,1<<20,12);b=thread_maps(fd,size,1<<18,12);c=procs(fd,size,1<<18,12,true);}
+  if(2==3){a=procs(fd,size,1<<18,6,false);b=procs(fd,size,1<<21,12,false);c=procs(fd,size,1<<18,1,false);}
   code=q(a,0.125,8)|q(b,0.125,8)<<8|q(c,0.125,8)<<16;
   fprintf(stderr,"code %llu mcode %llu tcode %llu\n",code,code&16383,code>>14);
 }
