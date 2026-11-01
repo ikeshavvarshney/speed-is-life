@@ -442,7 +442,7 @@ static void run_all(int fd, size_t size) {
   int shift = 0;
   auto a = __rdtsc(); double b = now_ms(); while (now_ms() - b < 2.0) {} double per_ms = (__rdtsc() - a) / (now_ms() - b);
   fprintf(stderr, "tsc per ms %.0f\n", per_ms);
-  for (const char *want : {"full12", "split12", "two12"}) {
+  for (const char *want : {"full12c16", "fetch192", "full6"}) {
     for (const Case &c : table_of_cases)
       if (!strcmp(c.name, want)) {
         double v = measure(c, fd, size);
