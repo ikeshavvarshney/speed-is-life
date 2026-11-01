@@ -30,7 +30,7 @@ const size_t CHUNK = 1 << 18, CLEAR_STEP = 1 << 23, HOURS = 72, BLOCK = 256;
 const size_t SLOTS = 1 << 13, MAX_IDS = 1 << 11, NONE = -1;
 // The stack each thread gets, of which the top is real from the start. A pool of this
 // many regions of this size covers what the last hours need together.
-const size_t STACK = 1 << 16, STACK_TOUCHED = 1 << 14, POOL = 13, WARM = 376 << 10;
+const size_t STACK = 1 << 16, STACK_TOUCHED = 1 << 14, POOL = 20, WARM = 376 << 10;
 // A log entry is id << 21 | is_error << 20 | latency. A latency that does not fit,
 // on about 1% of lines, puts BIG in the entry and takes the next slot whole. An
 // all-zero entry is an unused part of a block, and id 0 is reserved to absorb it.
