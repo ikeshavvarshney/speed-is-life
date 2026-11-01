@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <barrier>
 #include <bit>
 #include <charconv>
 #include <cstring>
@@ -1025,21 +1026,7 @@ static void between_steps() noexcept {
   step++;
 }
 
-// Steps follow each other closely, so a thread that spins is ready at once, where
-// one that slept would have to be woken by the kernel.
-static Counter waiting_threads, next_step;
-
-static void all_arrive() {
-  size_t step = next_step.value.load(std::memory_order_acquire);
-  if (waiting_threads.take() + 1 == (size_t)threads) {
-    waiting_threads.value.store(0, relaxed);
-    between_steps();
-    next_step.value.store(step + 1, std::memory_order_release);
-  } else {
-    while (next_step.value.load(std::memory_order_acquire) == step)
-      _mm_pause();
-  }
-}
+static std::barrier<void (*)() noexcept> *sync_all;
 
 static void work(int t) {
   Scratch &scratch = scratches[t];
@@ -1050,21 +1037,21 @@ static void work(int t) {
   scratch.low_ids = (u32 *)reserve(most * 4);
   for (size_t c; (c = next_query.take()) < chunks;)
     read_chunk(c);
-  all_arrive();
+  sync_all->arrive_and_wait();
   parse_docs(scratch);
   // Exit would otherwise clear the input's page tables page by page on one
   // thread, with the clock still running.
   for (size_t off; (off = next_unmap.take(RELEASE_STEP)) < input_size;)
     madvise((void *)(input + off), std::min(RELEASE_STEP, input_size - off),
             MADV_DONTNEED);
-  all_arrive();
+  sync_all->arrive_and_wait();
   for (size_t p; (p = next_partition.take()) < partitions;)
     build_lists(p, scratch);
   // Bitsets take over these pages while answering.
   madvise(scratch.tokens, most * 8, MADV_DONTNEED);
-  all_arrive();
+  sync_all->arrive_and_wait();
   answer_queries(scratch);
-  all_arrive();
+  sync_all->arrive_and_wait();
   // Nothing but the answers is needed now. Giving it all back here, on all threads,
   // lowers the peak as the output grows, and leaves exit almost nothing to do.
   for (size_t p; (p = next_release.take()) <= partitions;)
@@ -1073,7 +1060,7 @@ static void work(int t) {
     else
       madvise(log_regions + p * log_span,
               next_log_block[p].value.load(relaxed) * LOG_BLOCK, MADV_DONTNEED);
-  all_arrive();
+  sync_all->arrive_and_wait();
 }
 
 int main() {
@@ -1112,6 +1099,8 @@ int main() {
   blocks = (docs >> BLOCK_BITS) + 1;
   words = (docs / 64 | (LINE_WORDS - 1)) + 1;
   scratches.resize(threads);
+  std::barrier<void (*)() noexcept> barrier(threads, between_steps);
+  sync_all = &barrier;
   vector<std::thread> pool;
   for (int t = 1; t < threads; t++)
     pool.emplace_back(work, t);

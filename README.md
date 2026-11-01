@@ -1,11 +1,11 @@
 # Speed Demon 2026: team another ello
 
-Our entry for [Speed Demon 2026](https://speeddemon.dev), all four tracks in Rust with zero dependencies. Each `track-*` folder has a `README.md` describing the approach and a `PERF.md` logging each optimisation step with its board run ID.
+Our entry for [Speed Demon 2026](https://speeddemon.dev), all four tracks in C++ with zero dependencies. Each `track-*` folder has a `README.md` describing the approach and a `PERF.md` logging each optimisation step with its board run ID.
 
 | Folder | Task | Key ideas |
 |---|---|---|
 | `track-a` | Aggregate log lines per hour and endpoint | Fixed-offset timestamp parsing, per-hour logs with no atomics, percentiles by selection |
-| `track-b` | Boolean and phrase search | Index only query terms, live phrase matching on rare anchor terms, bitsets for common terms |
+| `track-b` | Boolean and phrase search | Index only query terms, live phrase matching on rare anchor terms, gathered table lookups, lists built in place, smallest list first |
 | `track-c` | Join a hostile CSV | Parse in place, shared name table with per-country bitsets, prefetch pipeline |
 | `track-d` | Shortest paths | Parallel bucketed graph build, bidirectional Dijkstra with small hash tables |
 

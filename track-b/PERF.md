@@ -111,6 +111,7 @@ On the board:
 | Fewer bitsets, threshold 30 | run-e4eac6d2324a | 0.0766 | 47.3 | 949 | 41.13 | No gain |
 | Lookup and sorting in one 4-lane step | run-eb8b8a2f64e3 | 0.0810 | 46.8 | 963 | 39.98 | Twice the permutes per token, and 64-bit compares, all on one execution port |
 | `-O2` | run-5fad180f6f06 | 0.0754 | 47.3 | 962 | 41.37 | Within noise, `-O3` stays |
+| Spinning barrier in place of `std::barrier` | run-5ce5b7f2fadd | 0.0774 | 46.9 | 968 | 40.86 | Slower. Threads spinning through the serial plan take resources from the sibling doing it |
 
 Measured locally, not pushed:
 
