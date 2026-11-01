@@ -1,12 +1,10 @@
 #include <algorithm>
 #include <atomic>
-#include <cstdint>
 #include <cstring>
 #include <fcntl.h>
 #include <immintrin.h>
 #include <sched.h>
 #include <sys/mman.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 using u8 = uint8_t;
@@ -17,8 +15,9 @@ using v4 = __m256i;
 using std::atomic;
 constexpr auto relaxed = std::memory_order_relaxed;
 #define INLINE [[gnu::always_inline]] inline
+#define LOAD(p) _mm_loadu_si128((const __m128i *)(p))
 
-const size_t CHUNK = 1 << 18, REGION_CHUNK = 1 << 16, UNMAP_STEP = 1 << 23;
+const size_t CHUNK = 1 << 18, REGION_CHUNK = 1 << 16, UNMAP = 1 << 23;
 // 240 countries at every scale (spec section 2.3), plus _UNMATCHED. The box has 12
 // threads, and more than that would only cost time.
 const size_t COUNTRIES = 241, HUGE_PAGE = 1 << 21, MAX_THREADS = 12;
@@ -55,9 +54,7 @@ struct Rec {
 // the file stay readable.
 static const u8 *map_input(const char *path, size_t &size) {
   int fd = open(path, O_RDONLY);
-  struct stat info;
-  fstat(fd, &info);
-  size = info.st_size;
+  size = lseek(fd, 0, SEEK_END);
   void *base =
       mmap(0, size + 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   mmap(base, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
@@ -70,8 +67,7 @@ static const u8 *map_input(const char *path, size_t &size) {
 // Work split into pieces that threads claim as they become free. Threads wait by
 // spinning, as they do so for microseconds, and waking from a futex takes longer.
 struct Job {
-  alignas(64) atomic<size_t> next;
-  alignas(64) atomic<size_t> done;
+  alignas(64) atomic<size_t> next, done;
 };
 
 // One mapping at a fixed address, so its addresses are constants and take no
@@ -83,37 +79,33 @@ struct Job {
 // rest takes 4 KB pages.
 struct Memory {
   u8 by_id[NAMES_AT];
-  atomic<u64> slots[1 << NAME_BITS];
-  atomic<u64> name_bits[COUNTRIES * WORDS];
+  atomic<u64> slots[1 << NAME_BITS], name_bits[COUNTRIES * WORDS];
   Group groups[MAX_THREADS * COUNTRIES];
   u8 stacks[MAX_THREADS][STACK];
+  alignas(4096) u8 lengths[COUNTRIES];
   Job region_job, chunk_job, country_job;
-  atomic<u8> seen_codes[CODES];
-  u32 code_of[COUNTRIES];
-  u8 lengths[COUNTRIES];
-  char lines[COUNTRIES][LINE];
-  char text[COUNTRIES * LINE];
+  // One more than there are codes, so the last entry stands for _UNMATCHED.
+  atomic<u8> seen_codes[CODES + 1];
+  char code_of[COUNTRIES][3], lines[COUNTRIES][LINE], text[COUNTRIES * LINE];
 };
 #define mem (*(Memory *)0x60000000)
 
 static const u8 *input, *regions;
-static size_t input_size, regions_size;
-static size_t threads;
+static size_t input_size, regions_size, threads;
 static std::atomic_flag codes_lock;
 static int code_count;
 
-template <class F> INLINE void run(Job &job, size_t size, size_t step, F piece) {
-  for (size_t off; (off = job.next.fetch_add(step, relaxed)) < size;
-       job.done.fetch_add(step))
-    piece(off);
-  while (job.done.load() < size)
+template <class F> INLINE void run(Job &job, size_t size, size_t step, F f) {
+  for (size_t i; (i = job.next.fetch_add(step, relaxed)) < size; job.done += step)
+    f(i);
+  while (job.done < size)
     _mm_pause();
 }
 
 // One piece of regions.csv. by_id holds 1 + the country's index, and 0 for
 // anything unknown. Ids are unique, so each byte has one writer.
 static void load_regions(size_t off) {
-  size_t stop = std::min(off + REGION_CHUNK, regions_size), i = off;
+  size_t i = off + 1, stop = std::min(i + REGION_CHUNK, regions_size);
   while (regions[i - 1] != '\n')
     i++;
   while (i < stop) {
@@ -126,7 +118,7 @@ static void load_regions(size_t off) {
       while (codes_lock.test_and_set(std::memory_order_acquire))
         _mm_pause();
       if (!mem.seen_codes[key].load(relaxed)) {
-        mem.code_of[++code_count] = key;
+        memcpy(mem.code_of[++code_count], c, 3);
         mem.seen_codes[key].store(code_count, relaxed);
       }
       codes_lock.clear(std::memory_order_release);
@@ -149,12 +141,10 @@ INLINE u64 digit_word(const u8 *end, size_t len) {
 // one multiply port.
 INLINE v4 decode(u64 a, u64 b, u64 c) {
   // In the amount's lane, `ddddd.cc` loses its dot, which leaves plain cents.
-  const v4 drop_dot = _mm256_setr_epi8(
-      0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, //
-      -1, 0, 1, 2, 3, 4, 6, 7, -1, -1, -1, -1, -1, -1, -1, -1);
+  const v4 drop_dot = _mm256_set_epi64x(-1, 0x07060403020100FF, 0x0F0E0D0C0B0A0908,
+                                        0x0706050403020100);
   v4 digits = _mm256_shuffle_epi8(
-      _mm256_and_si256(_mm256_set_epi64x(0, c, b, a), _mm256_set1_epi8(15)),
-      drop_dot);
+      _mm256_set_epi64x(0, c, b, a) & _mm256_set1_epi8(15), drop_dot);
   v4 x = _mm256_maddubs_epi16(digits, _mm256_set1_epi16(0x010A));
   x = _mm256_madd_epi16(x, _mm256_set1_epi32(0x00010064));
   x = _mm256_packus_epi32(x, x);
@@ -175,15 +165,12 @@ INLINE u64 hash_name(const u8 *p, size_t len, __m128i key) {
   auto mask = (const v4 *)(LOW_BYTES + 32 - len);
   if (len > 32) [[unlikely]]
     mask = (const v4 *)LOW_BYTES;
-  bytes = _mm256_and_si256(bytes, _mm256_loadu_si256(mask));
-  __m128i state = _mm_aesenc_si128(
-      _mm_xor_si128(_mm256_castsi256_si128(bytes), key),
-      _mm256_extracti128_si256(bytes, 1));
+  bytes &= _mm256_loadu_si256(mask);
+  __m128i state = _mm_aesenc_si128(_mm256_castsi256_si128(bytes) ^ key,
+                                   _mm256_extracti128_si256(bytes, 1));
   for (size_t i = 32; i < len; i += 16) [[unlikely]] {
     auto tail = LOW_BYTES + 32 - std::min<size_t>(len - i, 16);
-    state = _mm_aesenc_si128(
-        state, _mm_and_si128(_mm_loadu_si128((const __m128i *)(p + i)),
-                             _mm_loadu_si128((const __m128i *)tail)));
+    state = _mm_aesenc_si128(state, LOAD(p + i) & LOAD(tail));
   }
   state = _mm_aesenc_si128(_mm_aesenc_si128(state, key), key);
   return _mm_cvtsi128_si64(_mm_aesenc_si128(state, key)) | 1;
@@ -223,20 +210,18 @@ INLINE size_t intern(atomic<u64> *table, u64 hash) {
 }
 
 static void parse_chunk(size_t first, size_t stop, Group *mine) {
-  const u8 *base = input;
-  const u8 *ids = mem.by_id;
+  const u8 *base = input, *ids = mem.by_id;
   const __m128i top = _mm_set1_epi32(REGION_END);
   const __m128i three = _mm_setr_epi16(3, 0, 3, 0, 0, 0, 0, 0);
   const __m128i key = _mm_set_epi64x(0x8BB84B93962EACC9, 0x2D358DCCAA6C78A5);
-  const auto table = mem.slots;
-  const auto bits = mem.name_bits;
+  const auto table = mem.slots, bits = mem.name_bits;
   u32 marks[MAX_MARKS];
   // Number of "" pairs in the field each mark ends. It stays mostly zero.
   u32 pairs[MAX_MARKS + 8] = {};
   alignas(32) Rec recs[MAX_RECORDS];
-  const v4 finder = _mm256_setr_epi8(
-      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 10, -1, 44, -1, -1, -1, //
-      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 10, -1, 44, -1, -1, -1);
+  // Indexed by a byte's low bits, this returns the byte itself only for LF and comma.
+  const long long lf_comma = 0xFFFFFF2CFF0AFFFF;
+  const v4 finder = _mm256_set_epi64x(lf_comma, -1, lf_comma, -1);
   const v4 quote = _mm256_set1_epi8('"');
   const v4 one_count = _mm256_set_epi64x(0, 1ll << 32, 0, 0);
   auto mask = [](v4 x, v4 y) -> u64 {
@@ -256,10 +241,9 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
       u64 quotes = mask(x, quote) | mask(y, quote) << 32;
       u64 seps = mask(_mm256_shuffle_epi8(finder, x), x) |
                  mask(_mm256_shuffle_epi8(finder, y), y) << 32;
-      __m128i q = _mm_cvtsi64_si128(quotes);
-      u64 running =
-          _mm_cvtsi128_si64(_mm_clmulepi64_si128(q, _mm_set1_epi8(-1), 0)) ^
-          inside;
+      __m128i q = _mm_clmulepi64_si128(_mm_cvtsi64_si128(quotes),
+                                       _mm_set1_epi8(-1), 0);
+      u64 running = _mm_cvtsi128_si64(q) ^ inside;
       inside = (long long)running >> 63;
       u64 closers = quotes & ~running;
       u64 found_pairs = quotes & running & (closers << 1 | closed);
@@ -287,11 +271,9 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
     }
     // The hardware prefetcher stops at each 4 KB page, so without this the first
     // lines of every page are demand misses to memory.
-    if ((block & 4095) >= 4096 - BLOCKS * 64) {
-      auto next = (const char *)base + (block | 4095) + 1;
-      for (int i = 0; i < 6; i++)
-        _mm_prefetch(next + i * 64, _MM_HINT_T0);
-    }
+    if ((block & 4095) >= 4096 - BLOCKS * 64)
+      for (int i = 1; i <= 6; i++)
+        _mm_prefetch(base + (block | 4095) + i * 64, _MM_HINT_T0);
     size_t whole = filled / 5, n = 0;
     for (size_t r = 0; r < whole && start < stop; r++) {
       const u32 *m = marks + r * 5;
@@ -299,10 +281,8 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
       // One subtraction gives every field's length plus one. Taking 3 saturating
       // removes a separator and two quotes, and leaves an empty field at 0.
       // Fields are far below 64 KB, so 16 bits are enough here.
-      __m128i raw = _mm_subs_epu16(
-          _mm_sub_epi32(_mm_loadu_si128((const __m128i *)(m + 1)),
-                        _mm_loadu_si128((const __m128i *)m)),
-          three);
+      __m128i raw =
+          _mm_subs_epu16(_mm_sub_epi32(LOAD(m + 1), LOAD(m)), three);
       // Rare enough for a branch to cost less than a calculation every time.
       if (base[start] == 0xEF) [[unlikely]]
         start += 3;
@@ -320,16 +300,12 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
       int amount = (_mm256_extract_epi32(numbers, 4) ^ sign) - sign;
       u32 region_id = _mm_cvtsi128_si32(region);
       u64 hash = hash_name(base + c1 + 2, (u32)_mm_cvtsi128_si32(raw), key);
-      _mm_prefetch((const char *)(ids + region_id), _MM_HINT_T0);
-      _mm_prefetch((const char *)(table + (hash >> (67 - NAME_BITS)) * 8),
-                   _MM_HINT_T0);
+      _mm_prefetch(ids + region_id, _MM_HINT_T0);
+      _mm_prefetch(table + (hash >> (67 - NAME_BITS)) * 8, _MM_HINT_T0);
       // `raw` less the "" pairs is the two text lengths.
-      __m128i texts = _mm_sub_epi32(
-          raw, _mm_loadu_si128((const __m128i *)(pairs + r * 5 + 1)));
-      recs[n].values =
-          _mm_unpacklo_epi64(_mm_insert_epi32(low, amount, 1), texts);
-      recs[n].hash = hash;
-      recs[n++].region = region_id;
+      __m128i texts = _mm_sub_epi32(raw, LOAD(pairs + r * 5 + 1));
+      recs[n++] = {_mm_unpacklo_epi64(_mm_insert_epi32(low, amount, 1), texts),
+                   hash, region_id};
       start = lf + 1;
     }
     // Group prefetching: this pass touches only what the pass above prefetched,
@@ -339,9 +315,7 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
       Group &group = mine[ids[rec.region]];
       auto sums = (v4 *)group.sums;
       // Every value but the amount is positive, so sign extending suits them all.
-      _mm256_store_si256(
-          sums, _mm256_add_epi64(*sums, _mm256_add_epi64(one_count,
-                                        _mm256_cvtepi32_epi64(rec.values))));
+      *sums += one_count + _mm256_cvtepi32_epi64(rec.values);
       int amount = _mm_extract_epi32(rec.values, 1);
       // A new extreme is rare, so this avoids two writes per record.
       if (amount < group.min) [[unlikely]]
@@ -386,21 +360,16 @@ static size_t first_record(size_t off) {
   return i;
 }
 
-// Digits of `value` written backward, ending just before `p`.
-static char *digits(char *p, u64 value) {
-  do
-    *--p = '0' + value % 10;
-  while (value /= 10);
-  return p;
-}
-
-static char *money(char *p, long long cents) {
-  u64 abs = cents < 0 ? -cents : cents;
-  *--p = '0' + abs % 10;
-  *--p = '0' + abs / 10 % 10;
-  *--p = '.';
-  p = digits(p, abs / 100);
-  if (cents < 0)
+// A space and a number written backward, ending just before `p`. With `dot` set
+// to 2, the number is cents and prints as money, always with three digits.
+static char *field(char *p, long long value, int dot = -1) {
+  u64 left = value < 0 ? -value : value;
+  for (int i = 0; left || i <= dot || !i; i++, left /= 10) {
+    if (i == dot)
+      *--p = '.';
+    *--p = '0' + left % 10;
+  }
+  if (value < 0)
     *--p = '-';
   *--p = ' ';
   return p;
@@ -414,15 +383,13 @@ static void finish_country(size_t country) {
   // most of that cost. The first turns also take one piece of it each. Each call
   // interrupts every thread to flush its TLB, so calls must be few.
   // A call must stop at the end of the file, or it clears what is mapped above.
-  size_t off = country * UNMAP_STEP;
+  size_t off = country * UNMAP;
   if (off < input_size)
-    madvise((void *)(input + off), std::min(UNMAP_STEP, input_size - off),
-            MADV_DONTNEED);
+    madvise((u8 *)input + off, std::min(UNMAP, input_size - off), MADV_DONTNEED);
   Group total{{}, INT32_MAX, INT32_MIN};
   for (size_t t = 0; t < threads; t++) {
     const Group &from = mem.groups[t * COUNTRIES + country];
-    for (int i = 0; i < 4; i++)
-      total.sums[i] += from.sums[i];
+    *(v4 *)total.sums += *(const v4 *)from.sums;
     total.min = std::min(total.min, from.min);
     total.max = std::max(total.max, from.max);
   }
@@ -430,41 +397,26 @@ static void finish_country(size_t country) {
   if (!count)
     return;
   for (size_t i = 0; i < WORDS; i++)
-    distinct += __builtin_popcountll(
-        mem.name_bits[country * WORDS + i].load(relaxed));
+    distinct += __builtin_popcountll(mem.name_bits[country * WORDS + i]);
   char *end = mem.lines[country] + LINE, *p = end - 1;
   *p = '\n';
-  p = digits(p, total.sums[3]);
-  *--p = ' ';
-  p = digits(p, (u32)total.sums[2]);
-  *--p = ' ';
-  p = digits(p, distinct);
-  *--p = ' ';
-  p = money(p, total.max);
-  p = money(p, total.min);
-  p = money(p, total.sums[1]);
-  p = digits(p, total.sums[0]);
-  *--p = ' ';
-  p = digits(p, count);
-  *--p = ' ';
-  if (country) {
-    u32 code = mem.code_of[country];
-    p -= 3;
-    p[0] = 'A' + code / 676;
-    p[1] = 'A' + code / 26 % 26;
-    p[2] = 'A' + code % 26;
-  } else {
-    p -= 10;
-    memcpy(p, "_UNMATCHED", 10);
-  }
+  p = field(p, total.sums[3]);
+  p = field(p, (u32)total.sums[2]);
+  p = field(p, distinct);
+  p = field(p, total.max, 2);
+  p = field(p, total.min, 2);
+  p = field(p, total.sums[1], 2);
+  p = field(p, total.sums[0]);
+  p = field(p, count);
+  size_t key = country ? 3 : 10;
+  memcpy(p -= key, country ? mem.code_of[country] : "_UNMATCHED", key);
   mem.lengths[country] = end - p;
 }
 
 // Runs on a thread with no state of its own in libc, so it may call only what
 // keeps none. Returning ends the thread with no stack to unmap or free.
 static int worker(void *index) {
-  run(mem.region_job, regions_size - 1, REGION_CHUNK,
-      [](size_t off) { load_regions(off + 1); });
+  run(mem.region_job, regions_size - 1, REGION_CHUNK, load_regions);
   // See the note in main. The other threads start at the file's start, and this
   // moves far faster than they do, so it stays ahead of them.
   if (!index)
@@ -472,9 +424,8 @@ static int worker(void *index) {
       *(volatile const u8 *)(input + off);
   Group *mine = mem.groups + (size_t)index * COUNTRIES;
   run(mem.chunk_job, input_size, CHUNK, [=](size_t off) {
-    size_t first =
-        off ? first_record(off)
-            : (const u8 *)memchr(input, '\n', input_size) - input + 1;
+    // The first search skips the header, as it starts with no LF before it.
+    size_t first = first_record(off + !off);
     size_t stop = std::min(off + CHUNK, input_size);
     if (first < stop)
       parse_chunk(first, stop, mine);
@@ -499,31 +450,23 @@ int main() {
   // for the input, of which thread 0 makes the rest as they start on it.
   for (size_t page = 0; page < 3; page++)
     ((volatile u8 *)&mem)[page * HUGE_PAGE] = 0;
-  madvise((void *)((size_t)&mem.region_job & -4096),
-          (char *)mem.text - (char *)&mem.region_job + 4096,
-          MADV_POPULATE_WRITE);
+  madvise(mem.lengths, 1 << 16, MADV_POPULATE_WRITE);
   // Here and not in the workers, as a late one must not be merged half made.
-  for (size_t i = 0; i < threads * COUNTRIES; i++) {
-    mem.groups[i].min = INT32_MAX;
-    mem.groups[i].max = INT32_MIN;
-  }
+  for (Group &group : mem.groups)
+    group.min = INT32_MAX, group.max = INT32_MIN;
   for (size_t t = 1; t < threads; t++)
     clone(worker, mem.stacks[t] + STACK,
-          CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD |
-              CLONE_SYSVSEM,
+          CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD,
           (void *)t);
   worker(0);
 
   // Countries in code order are already sorted, and _UNMATCHED sorts last.
   char *out = mem.text;
-  for (size_t code = 0; code <= CODES; code++) {
-    int country = code < CODES ? mem.seen_codes[code].load(relaxed) : 0;
-    if (!country && code < CODES)
-      continue;
-    size_t length = mem.lengths[country];
-    memcpy(out, mem.lines[country] + LINE - length, length);
-    out += length;
-  }
+  for (size_t code = 0; code <= CODES; code++)
+    if (int c = mem.seen_codes[code]; c || code == CODES) {
+      memcpy(out, mem.lines[c] + LINE - mem.lengths[c], mem.lengths[c]);
+      out += mem.lengths[c];
+    }
   int fd = open("/out/aggregates.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (write(fd, mem.text, out - mem.text) != out - mem.text)
     abort();
