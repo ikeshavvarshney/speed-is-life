@@ -332,8 +332,11 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
           sums, _mm256_add_epi64(*sums, _mm256_add_epi64(one_count,
                                         _mm256_cvtepi32_epi64(rec.values))));
       int amount = _mm_extract_epi32(rec.values, 1);
-      group.min = std::min(group.min, amount);
-      group.max = std::max(group.max, amount);
+      // A new extreme is rare, so this avoids two writes per record.
+      if (amount < group.min) [[unlikely]]
+        group.min = amount;
+      if (amount > group.max) [[unlikely]]
+        group.max = amount;
       size_t name = intern(rec.hash);
       size_t word = ids[rec.region] * WORDS + name / 64;
       __builtin_prefetch(name_bits + word, 1);
