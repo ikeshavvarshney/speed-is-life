@@ -264,9 +264,9 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
         count_pair();
       size_t k = filled;
       filled += __builtin_popcountll(seps);
-      // Blocks hold about six marks. Writing eight every time beats a branch.
+      // Blocks hold about five marks. Writing six every time beats a branch.
       do {
-        for (int i = 0; i < 8; i++, k++, seps &= seps - 1)
+        for (int i = 0; i < 6; i++, k++, seps &= seps - 1)
           marks[k] = block + _tzcnt_u64(seps);
       } while (seps);
     }
