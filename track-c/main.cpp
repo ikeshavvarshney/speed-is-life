@@ -34,6 +34,7 @@ const size_t WORDS = (1 << NAME_BITS) / 64;
 // The shortest record is 11 bytes and has 5 marks, so a batch holds at most 466
 // marks, plus 4 left over and 8 written past the last.
 const size_t BLOCKS = 16, MAX_MARKS = 512, MAX_RECORDS = MAX_MARKS / 5 + 1;
+const size_t PARTS = 16, PENDING = 64;
 
 // One worker's running values for one country, on one cache line. `sums` is
 // added to as one vector: id sum, amount sum, count << 32 | name bytes, note
@@ -72,6 +73,17 @@ struct Job {
   alignas(64) atomic<size_t> next, done;
 };
 
+// Name bits a worker has yet to set, by partition of the countries. Setting each
+// bit with a locked instruction cost 8% of the run, measured without the lock.
+// This way a worker takes one lock per PENDING bits, and that lock covers every
+// word of the partition, as each word belongs to one country.
+struct Pending {
+  alignas(64) u32 counts[PARTS], bits[PARTS][PENDING];
+};
+struct alignas(64) Lock {
+  std::atomic_flag held;
+};
+
 // One mapping at a fixed address, so its addresses are constants and take no
 // register. The address is above where the kernel may randomize the heap to (up
 // to 1 GB), where libc's thread block lives, and below 2 GB, the limit for
@@ -81,14 +93,17 @@ struct Job {
 // rest takes 4 KB pages.
 struct Memory {
   u8 by_id[NAMES_AT];
-  atomic<u64> slots[1 << NAME_BITS], name_bits[COUNTRIES * WORDS];
+  atomic<u64> slots[1 << NAME_BITS];
+  u64 name_bits[COUNTRIES * WORDS];
   Group groups[MAX_THREADS * COUNTRIES];
   u8 stacks[MAX_THREADS][STACK];
   alignas(4096) u8 lengths[COUNTRIES];
   std::atomic_flag codes_lock;
   int code_count;
   atomic<bool> bits_ready;
-  Job region_job, chunk_job, country_job;
+  Job region_job, chunk_job, flush_job, country_job;
+  Lock part_locks[PARTS];
+  Pending pending[MAX_THREADS];
   // One more than there are codes, so the last entry stands for _UNMATCHED.
   atomic<u8> seen_codes[CODES + 1];
   char code_of[COUNTRIES][3], lines[COUNTRIES][LINE], text[COUNTRIES * LINE];
@@ -212,12 +227,29 @@ INLINE size_t intern(atomic<u64> *table, u64 hash) {
   }
 }
 
-static void parse_chunk(size_t first, size_t stop, Group *mine) {
+// Applies a batch of bits. Lines come from other cores, so each is prefetched for
+// writing a few bits ahead, which overlaps those misses.
+static void flush(Pending &pending, size_t part) {
+  auto &lock = mem.part_locks[part].held;
+  while (lock.test_and_set(std::memory_order_acquire))
+    _mm_pause();
+  const u32 *bits = pending.bits[part];
+  for (u32 i = 0; i < pending.counts[part]; i++) {
+    __builtin_prefetch(mem.name_bits + (bits[i + 8] >> 6), 1);
+    mem.name_bits[bits[i] >> 6] |= 1ull << (bits[i] & 63);
+  }
+  lock.clear(std::memory_order_release);
+  pending.counts[part] = 0;
+}
+
+static void parse_chunk(size_t first, size_t stop, size_t index) {
+  Group *mine = mem.groups + index * COUNTRIES;
+  Pending &pending = mem.pending[index];
   const u8 *base = input, *ids = mem.by_id;
   const __m128i top = _mm_set1_epi32(REGION_END);
   const __m128i three = _mm_setr_epi16(3, 0, 3, 0, 0, 0, 0, 0);
   const __m128i key = _mm_set_epi64x(0x8BB84B93962EACC9, 0x2D358DCCAA6C78A5);
-  const auto table = mem.slots, bits = mem.name_bits;
+  const auto table = mem.slots;
   u32 marks[MAX_MARKS];
   // Number of "" pairs in the field each mark ends. It stays mostly zero.
   u32 pairs[MAX_MARKS + 8] = {};
@@ -315,7 +347,8 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
     // so the cache misses of a batch overlap instead of stalling one at a time.
     for (size_t r = 0; r < n; r++) {
       const Rec &rec = recs[r];
-      Group &group = mine[ids[rec.region]];
+      u32 country = ids[rec.region], part = country % PARTS;
+      Group &group = mine[country];
       auto sums = (v4 *)group.sums;
       // Every value but the amount is positive, so sign extending suits them all.
       *sums += one_count + _mm256_cvtepi32_epi64(rec.values);
@@ -325,19 +358,10 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
         group.min = amount;
       if (amount > group.max) [[unlikely]]
         group.max = amount;
-      size_t name = intern(table, rec.hash);
-      size_t word = ids[rec.region] * WORDS + name / 64;
-      __builtin_prefetch(bits + word, 1);
-      recs[r].hash = word;
-      recs[r].region = name % 64;
-    }
-    // A set bit costs no write, and a write costs a locked instruction that
-    // often has to fetch the line from another core, so it is the last step.
-    for (size_t r = 0; r < n; r++) {
-      auto &word = bits[recs[r].hash];
-      u64 bit = 1ull << recs[r].region;
-      if (!(word.load(relaxed) & bit))
-        word.fetch_or(bit, relaxed);
+      u32 &count = pending.counts[part];
+      pending.bits[part][count++] = country << NAME_BITS | intern(table, rec.hash);
+      if (count == PENDING)
+        flush(pending, part);
     }
     if (start >= stop)
       return;
@@ -427,14 +451,16 @@ static int worker(void *index) {
   if (!index)
     for (size_t off = 0; off < input_size; off += HUGE_PAGE)
       *(volatile const u8 *)(input + off);
-  Group *mine = mem.groups + (size_t)index * COUNTRIES;
   run(mem.chunk_job, input_size, CHUNK, [=](size_t off) {
     // The first search skips the header, as it starts with no LF before it.
     size_t first = first_record(off + !off);
     size_t stop = std::min(off + CHUNK, input_size);
     if (first < stop)
-      parse_chunk(first, stop, mine);
+      parse_chunk(first, stop, (size_t)index);
   });
+  // Every worker has finished parsing, so any thread may flush any worker's bits.
+  run(mem.flush_job, threads * PARTS, 1,
+      [](size_t i) { flush(mem.pending[i / PARTS], i % PARTS); });
   run(mem.country_job, COUNTRIES, 1, finish_country);
   return 0;
 }
@@ -456,7 +482,7 @@ int main() {
   auto clear_page = [](int page) { ((volatile u8 *)&mem)[page * HUGE_PAGE] = 0; };
   clear_page(0);
   clear_page(2);
-  madvise(mem.lengths, 1 << 16, MADV_POPULATE_WRITE);
+  madvise(mem.lengths, mem.text - (char *)mem.lengths, MADV_POPULATE_WRITE);
   // Here and not in the workers, as a late one must not be merged half made.
   for (Group &group : mem.groups)
     group.min = INT32_MAX, group.max = INT32_MIN;
