@@ -35,6 +35,7 @@ const size_t HOUR_GRACE = 10;
 // all-zero entry is an unused part of a block, and id 0 is reserved to absorb it.
 const u32 BIG = (1 << 20) - 1;
 const u32 DONE = 1 << 31;
+const size_t NONE = -1;
 
 struct Name {
   u32 at;
@@ -81,6 +82,7 @@ static u64 lane_moves[256];
 
 INLINE const u8 *low_bytes(size_t n) { return masks + 128 - n; }
 INLINE v4 load(const void *p) { return _mm256_loadu_si256((const v4 *)p); }
+INLINE v2 load2(const void *p) { return _mm_loadu_si128((const v2 *)p); }
 INLINE void store(void *p, v4 v) { _mm256_storeu_si256((v4 *)p, v); }
 
 // Zeroed memory where only touched pages are real, with nothing reserved.
@@ -99,28 +101,27 @@ static size_t hour_index(const u8 *line) {
 // Bit i is set when byte i is a space, for the 64 bytes at `p`. Taking both
 // vectors every time avoids a branch on the endpoint's length, which half the
 // lines would mispredict.
+INLINE u32 spaces32(v4 v) {
+  return _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(' ')));
+}
 INLINE u64 spaces(const u8 *p) {
-  v4 space = _mm256_set1_epi8(' ');
-  u32 low = _mm256_movemask_epi8(_mm256_cmpeq_epi8(load(p), space));
-  u32 high = _mm256_movemask_epi8(_mm256_cmpeq_epi8(load(p + 32), space));
-  return low | (u64)high << 32;
+  return spaces32(load(p)) | (u64)spaces32(load(p + 32)) << 32;
 }
 
 // Parses the latency and moves `p` past the newline, with no branch on its length:
-// the digits are shuffled to the end of a vector, then merged in pairs, fours and
-// eights, each step a single instruction.
+// the 16 bytes before the newline end in the digits, so what comes before them is
+// masked off and the digits are merged in pairs, fours and eights, each step a single
+// instruction.
 INLINE u32 parse_latency(const u8 *&p) {
-  v2 text = _mm_loadu_si128((const v2 *)p);
-  v2 newline = _mm_cmpeq_epi8(text, _mm_set1_epi8('\n'));
+  v2 newline = _mm_cmpeq_epi8(load2(p), _mm_set1_epi8('\n'));
   int len = __builtin_ctz(_mm_movemask_epi8(newline));
   p += len + 1;
-  v2 place = _mm_add_epi8(_mm_set1_epi8(len - 16),
-                          _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15));
-  v2 digits = _mm_shuffle_epi8(_mm_and_si128(text, _mm_set1_epi8(15)), place);
+  v2 digits = _mm_andnot_si128(load2(low_bytes(16 - len)), load2(p - 17));
+  digits = _mm_and_si128(digits, _mm_set1_epi8(15));
   v2 pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(10 | 1 << 8));
   v2 fours = _mm_madd_epi16(pairs, _mm_set1_epi32(100 | 1 << 16));
-  v2 eights = _mm_madd_epi16(_mm_packus_epi32(fours, fours), _mm_set1_epi32(10000 | 1 << 16));
-  u64 parts = _mm_cvtsi128_si64(eights);
+  fours = _mm_packus_epi32(fours, fours);
+  u64 parts = _mm_cvtsi128_si64(_mm_madd_epi16(fours, _mm_set1_epi32(10000 | 1 << 16)));
   return (u32)parts * 100000000 + (parts >> 32);
 }
 
@@ -207,7 +208,7 @@ INLINE void parse_line(Walk &walk, size_t &lowest) {
   _mm_prefetch((const char *)line + 1024, _MM_HINT_T0);
   // These bytes hold the month, day and hour. Nearly every line has the hour
   // of the line before it, as the file is the shards' chunks in arrival order.
-  u64 now = _mm_cvtsi128_si64(_mm_loadu_si128((const v2 *)(line + 5)));
+  u64 now = _mm_cvtsi128_si64(load2(line + 5));
   if (now != walk.stamp) {
     walk.heads[walk.hour] = walk.at;
     walk.stamp = now;
@@ -408,8 +409,7 @@ static Text render_hour(size_t hour, u32 *space) {
   if (log)
     give_region(log);
   char label[33] = "2026-MM-DDTHH:00:00Z            ";
-  u64 stamp = stamps[hour].load(relaxed);
-  memcpy(label + 5, &stamp, 8);
+  memcpy(label + 5, &stamps[hour], 8);
   u8 *text = (u8 *)take_region(), *cursor = text;
   size_t end = sum;
   for (size_t i = 0; i < known; i++) {
@@ -419,7 +419,7 @@ static Text render_hour(size_t hour, u32 *space) {
       continue;
     end -= n;
     size_t ranks[6] = {(50 * n + 99) / 100 - 1, (95 * n + 99) / 100 - 1,
-                       (99 * n + 99) / 100 - 1, (size_t)-1, (size_t)-1, (size_t)-1};
+                       (99 * n + 99) / 100 - 1, NONE, NONE, NONE};
     u32 found[6];
     select_ranks(values + end, n, 0, ranks, found, space + capacity - 8);
     store(cursor, load(label));
@@ -522,10 +522,9 @@ int main(int argc, char **) {
   // thread stack or a small mapping.
   prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
   memset(masks, 255, 128);
-  for (u64 lanes = 0; lanes < 256; lanes++) {
-    u64 ones = _pdep_u64(lanes, 0x0101010101010101) * 255, count = __builtin_popcountll(lanes);
-    u64 others = _pext_u64(0x0706050403020100, ~ones);
-    lane_moves[lanes] = _pext_u64(0x0706050403020100, ones) | others << (count * 4) << (count * 4);
+  for (u64 lanes = 0, all = 0x0706050403020100; lanes < 256; lanes++) {
+    u64 ones = _pdep_u64(lanes, 0x0101010101010101) * 255, half = _mm_popcnt_u64(lanes) * 4;
+    lane_moves[lanes] = _pext_u64(all, ones) | _pext_u64(all, ~ones) << half << half;
   }
   int fd = open("/data/requests.log", O_RDONLY);
   input_size = lseek(fd, 0, SEEK_END);
