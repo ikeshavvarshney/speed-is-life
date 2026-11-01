@@ -8,10 +8,6 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <time.h>
-static long long stamps[8];
-static long long now() { timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1000000000ll + t.tv_nsec; }
-#define STAMP(i) if (!index) stamps[i] = now();
 
 using u8 = uint8_t;
 using u32 = uint32_t;
@@ -460,10 +456,8 @@ static void finish_country(size_t country) {
 // Runs on a thread with no state of its own in libc, so it may call only what
 // keeps none. Returning ends the thread with no stack to unmap or free.
 static int worker(void *index) {
-  STAMP(1)
   run(mem.region_job, regions_size - 1, REGION_CHUNK,
       [](size_t off) { load_regions(off + 1); });
-  STAMP(2)
   // See the note in main. The other threads start at the file's start, and this
   // moves far faster than they do, so it stays ahead of them.
   if (!index)
@@ -478,14 +472,11 @@ static int worker(void *index) {
     if (first < stop)
       parse_chunk(first, stop, mine);
   });
-  STAMP(3)
   run(mem.country_job, COUNTRIES, 1, finish_country);
-  STAMP(4)
   return 0;
 }
 
 int main() {
-  stamps[0] = now();
   memset(LOW_BYTES, 255, 32);
   cpu_set_t cpus;
   sched_getaffinity(0, sizeof cpus, &cpus);
@@ -529,14 +520,5 @@ int main() {
   int fd = open("/out/aggregates.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (write(fd, mem.text, out - mem.text) != out - mem.text)
     abort();
-  close(fd);
-  stamps[5] = now();
-  auto us = [](int a, int b, int lim) { long long v = (stamps[b] - stamps[a]) / 25000; return v >= lim ? lim - 1 : v; };
-  long long tval = us(0,1,130)*130+us(1,2,130), mval = us(3,4,37)*40+us(4,5,40);
-  size_t bytes = mval * 4 << 20;
-  if (bytes) { void *m = mmap(0, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0); memset(m, 1, bytes); }
-  long long target = stamps[0] + 3000000000ll + tval * 2000000ll;
-  timespec ts{(time_t)(target / 1000000000ll), (long)(target % 1000000000ll)};
-  clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, 0);
   _exit(0);
 }
