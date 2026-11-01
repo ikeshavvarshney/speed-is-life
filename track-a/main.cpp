@@ -213,81 +213,54 @@ static u32 *claim_block(size_t hour) {
   return at;
 }
 
-// One walk along the lines of a chunk.
-struct Walk {
-  const u8 *line;
-  u32 **heads;
-  u32 *at;
-  u64 stamp;
-  size_t hour;
-};
-
-INLINE void parse_line(Walk &walk, size_t &lowest, v4 space_vector) {
-  const u8 *line = walk.line;
-  // The hardware prefetcher stops at page boundaries.
-  _mm_prefetch((const char *)line + 1024, _MM_HINT_T0);
-  // These bytes hold the month, day and hour. Nearly every line has the hour
-  // of the line before it, as the file is the shards' chunks in arrival order.
-  u64 now = load64(line + 5);
-  if (now != walk.stamp) {
-    walk.heads[walk.hour] = walk.at;
-    walk.stamp = now;
-    walk.hour = hour_index(line);
-    lowest = std::min(lowest, walk.hour);
-    stamps[walk.hour].store(now, relaxed);
-    walk.at = walk.heads[walk.hour];
-  }
-  const u8 *fields = line + 28;
-  u64 mask = spaces(fields, space_vector);
-  const u8 *name = fields + __builtin_ctzll(mask) + 1;
-  u64 rest = mask & (mask - 1);
-  while (!rest) {
-    fields += 64;
-    rest = spaces(fields, space_vector);
-  }
-  const u8 *space = fields + __builtin_ctzll(rest);
-  size_t len = space - name;
-
-  u64 hash = hash_name(name, len), seen = table[hash % SLOTS].load(relaxed);
-  u32 id = (seen ^ hash) >> 16 ? find_name(hash, name, len) : (u16)seen;
-
-  u32 error = space[1] == '5';
-  const u8 *next = space + 5;
-  u32 latency = parse_latency(next);
-  u32 entry = id << (LATENCY_BITS + 1) | error << LATENCY_BITS;
-  u32 *at = walk.at;
-  // Blocks are aligned, so this finds one with no room for two slots, or no block.
-  if (((size_t)at + 4) % (BLOCK * 4) < 8)
-    at = claim_block(walk.hour);
-  if (latency >= BIG) {
-    *at++ = entry | BIG;
-    entry = 0;
-  }
-  *at++ = entry | latency;
-  walk.at = at;
-  walk.line = next;
-}
-
-// Where a line ends depends on the line before it, so one walk has to finish each
-// line before the core can start the next. Two walks take turns, which lets the core
-// work on a line from each at once.
 static size_t parse_chunk(const u8 *line, const u8 *end, u32 **heads) {
-  size_t lowest = HOURS;
+  u64 stamp = 0;
+  size_t hour = 0, lowest = HOURS;
+  u32 *at = heads[0];
   const v4 space_vector = _mm256_set1_epi8(' ');
-  const u8 *mid = line + (end - line) / 2;
-  mid = (const u8 *)memchr(mid, '\n', end - mid);
-  mid = mid ? mid + 1 : end;
-  Walk a{line, heads, heads[0], 0, 0}, b{mid, heads + HOURS, heads[HOURS], 0, 0};
-  while (a.line < mid && b.line < end) {
-    parse_line(a, lowest, space_vector);
-    parse_line(b, lowest, space_vector);
+  while (line < end) {
+    // The hardware prefetcher stops at page boundaries.
+    _mm_prefetch((const char *)line + 1024, _MM_HINT_T0);
+    // These bytes hold the month, day and hour. Nearly every line has the hour
+    // of the line before it, as the file is the shards' chunks in arrival order.
+    u64 now = load64(line + 5);
+    if (now != stamp) {
+      heads[hour] = at;
+      stamp = now;
+      hour = hour_index(line);
+      lowest = std::min(lowest, hour);
+      stamps[hour].store(now, relaxed);
+      at = heads[hour];
+    }
+    const u8 *fields = line + 28;
+    u64 mask = spaces(fields, space_vector);
+    const u8 *name = fields + __builtin_ctzll(mask) + 1;
+    u64 rest = mask & (mask - 1);
+    while (!rest) {
+      fields += 64;
+      rest = spaces(fields, space_vector);
+    }
+    const u8 *space = fields + __builtin_ctzll(rest);
+    size_t len = space - name;
+
+    u64 hash = hash_name(name, len), seen = table[hash % SLOTS].load(relaxed);
+    u32 id = (seen ^ hash) >> 16 ? find_name(hash, name, len) : (u16)seen;
+
+    u32 error = space[1] == '5';
+    const u8 *next = space + 5;
+    u32 latency = parse_latency(next);
+    u32 entry = id << (LATENCY_BITS + 1) | error << LATENCY_BITS;
+    // Blocks are aligned, so this finds one with no room for two slots, or no block.
+    if (((size_t)at + 4) % (BLOCK * 4) < 8)
+      at = claim_block(hour);
+    if (latency >= BIG) {
+      *at++ = entry | BIG;
+      entry = 0;
+    }
+    *at++ = entry | latency;
+    line = next;
   }
-  while (a.line < mid)
-    parse_line(a, lowest, space_vector);
-  while (b.line < end)
-    parse_line(b, lowest, space_vector);
-  a.heads[a.hour] = a.at;
-  b.heads[b.hour] = b.at;
+  heads[hour] = at;
   return lowest;
 }
 
@@ -538,7 +511,7 @@ static size_t next_task() {
 }
 
 static void worker() {
-  u32 *heads[HOURS * 2] = {};
+  u32 *heads[HOURS] = {};
   for (;;) {
     size_t hour = next_task(), chunk;
     if (hour < HOURS) {
