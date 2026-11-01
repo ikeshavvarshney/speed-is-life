@@ -659,14 +659,20 @@ static size_t list_size(size_t term) {
   return m[blocks] - m[0];
 }
 
+// Whole vectors are written and read past the end, so buffers have room for them. The
+// compiler cannot vectorize this itself, as `out` might overlap the marks.
 static size_t decode_list(size_t term, u32 *out) {
   const u32 *m = list_marks + term * (blocks + 1);
   auto ids = (const u16 *)(log_regions + (term >> PARTITION_BITS) * log_span);
   size_t n = 0;
   for (size_t block = 0; block < blocks; block++) {
-    u32 top = (u32)block << BLOCK_BITS;
-    for (u32 i = m[block]; i < m[block + 1]; i++)
-      out[n++] = top | ids[i];
+    const v4 top = _mm256_set1_epi32(block << BLOCK_BITS);
+    size_t count = m[block + 1] - m[block];
+    const u16 *from = ids + m[block];
+    for (size_t i = 0; i < count; i += 8)
+      store(out + n + i, _mm256_or_si256(top, _mm256_cvtepu16_epi32(
+                                                  _mm_loadu_si128((const v2 *)(from + i)))));
+    n += count;
   }
   return n;
 }
