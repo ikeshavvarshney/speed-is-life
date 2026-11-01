@@ -57,75 +57,6 @@ struct Text {
 // load. After the first few lines it is only read, so it is shared without
 // contention and nothing needs merging. A tag and its bucket give 40 bits of
 // hash, which over 1,842 names collide with odds of 2e-6.
-#include <stdio.h>
-#include <time.h>
-constexpr int DIAG_PUSH = 3;
-static double now_ms(){timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1e3+t.tv_nsec/1e6;}
-static double T0=now_ms();
-static long read_long(const char*p){FILE*f=fopen(p,"r");long v=0;if(f){if(fscanf(f,"%ld",&v)!=1)v=0;fclose(f);}return v;}
-static long read_stat(const char*key){FILE*f=fopen("/sys/fs/cgroup/memory.stat","r");char k[64];long v=0,r=0;if(f){while(fscanf(f,"%63s %ld",k,&v)==2)if(!strcmp(k,key))r=v;fclose(f);}return r;}
-static u64 d_m=0,d_t=0;
-[[noreturn]] static void report(u64 mcode,u64 tcode){
-  long target=(128L<<20)+(long)mcode*(256L<<10);
-  long cur=read_long("/sys/fs/cgroup/memory.current");
-  long extra=target-cur;
-  if(extra>0){
-    char*m=(char*)mmap(0,extra,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
-    for(long i=0;i<extra;i+=4096)m[i]=1;
-    munmap(m,extra);
-  }
-  double until=T0+3000+(double)tcode*16;
-  timespec ts;ts.tv_sec=(time_t)(until/1e3);ts.tv_nsec=(long)((until-ts.tv_sec*1e3)*1e6);
-  clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&ts,0);
-  _exit(0);}
-static u64 q(double v,double unit,int nbits){long x=(long)(v/unit+0.5);long m=(1L<<nbits)-1;return (u64)(x>m?m:x);}
-static u64 sink_total;
-template<class F> static double run_threads(int n,F f){
-  double a=now_ms();
-  std::vector<std::thread> ts;
-  for(int i=0;i<n;i++)ts.emplace_back(f);
-  for(auto&t:ts)t.join();
-  return now_ms()-a;
-}
-static u64 scan(const u8*p,size_t n){
-  v4 acc=_mm256_setzero_si256();
-  for(size_t i=0;i+32<=n;i+=32)acc=_mm256_or_si256(acc,_mm256_loadu_si256((const v4*)(p+i)));
-  return _mm256_extract_epi64(acc,0);
-}
-static double scan_map(const u8*p,size_t size,int n){
-  atomic<size_t> next{0};
-  return run_threads(n,[&]{u64 s=0;for(;;){size_t o=next.fetch_add(1<<18);if(o>=size)break;s|=scan(p+o,std::min<size_t>(1<<18,size-o));}__atomic_fetch_or(&sink_total,s,__ATOMIC_RELAXED);});
-}
-static double scan_pread(int fd,size_t size,int n,size_t piece){
-  atomic<size_t> next{0};
-  return run_threads(n,[&]{u8*b=(u8*)aligned_alloc(4096,piece);u64 s=0;for(;;){size_t o=next.fetch_add(piece);if(o>=size)break;ssize_t r=pread(fd,b,piece,o);if(r<=0)break;s|=scan(b,r);}__atomic_fetch_or(&sink_total,s,__ATOMIC_RELAXED);free(b);});
-}
-static void probes(int fd,size_t size){
-  double base_ms=now_ms()-T0;
-  long base=read_long("/sys/fs/cgroup/memory.current");
-  long file0=read_stat("file"), anon0=read_stat("anon"), kern0=read_stat("kernel");
-  void*m=mmap(0,size,PROT_READ,MAP_PRIVATE,fd,0);
-  double fault=scan_map((const u8*)m,size,12);
-  double again=scan_map((const u8*)m,size,12);
-  double a=now_ms();madvise(m,size,MADV_DONTNEED);double zap=now_ms()-a;
-  a=now_ms();munmap(m,size);double unm=now_ms()-a;
-  double p64=scan_pread(fd,size,12,1<<16);
-  double p16=scan_pread(fd,size,12,1<<14);
-  double p256=scan_pread(fd,size,12,1<<18);
-  double one=scan_pread(fd,size,1,1<<16);
-  int tf=open("/tmp/x",O_WRONLY|O_CREAT|O_TRUNC,0600);
-  static u8 tb[1<<17];
-  memset(tb,'x',sizeof tb);
-  a=now_ms();
-  for(int i=0;i<77;i++)if(write(tf,tb,sizeof tb)<0)abort();
-  double wr=now_ms()-a;
-  close(tf);unlink("/tmp/x");
-  fprintf(stderr,"start %.2f base %.2f file %.2f anon %.2f kern %.2f | fault %.2f again %.2f zap %.2f unmap %.2f | p64 %.2f p16 %.2f p256 %.2f one %.2f | write10MB %.2f sink %llu\n",base_ms,base/1e6,file0/1e6,anon0/1e6,kern0/1e6,fault,again,zap,unm,p64,p16,p256,one,wr,sink_total);
-  if(DIAG_PUSH==1){d_m=q(fault,0.125,7)|q(again,0.125,7)<<7;d_t=q(p64,0.125,8);}
-  if(DIAG_PUSH==2){d_m=q(p16,0.125,7)|q(p256,0.125,7)<<7;d_t=q(wr,0.125,8);}
-  if(DIAG_PUSH==3){d_m=q(zap,0.125,7)|q(unm,0.125,7)<<7;d_t=q(one,1,8);}
-  if(DIAG_PUSH==4){d_m=q(base/1e6,0.05,8)|q(file0/1e6,0.1,6)<<8;d_t=q(anon0/1e6,0.05,4)|q(kern0/1e6,0.1,4)<<4;}
-}
 alignas(64) static atomic<u32> tags[SLOTS];
 // Ids are given out in the order names are first seen. Popular names come early,
 // which packs the counters they use later into few cache lines.
@@ -539,8 +470,7 @@ static void deliver(size_t hour, Text text) {
     if (write(out_fd, ready_text.data, ready_text.len) != (ssize_t)ready_text.len)
       abort();
     if (now + 1 == HOURS) {
-      fprintf(stderr,"mcode %llu tcode %llu\n",d_m,d_t);
-      report(d_m,d_t);
+      _exit(0);
     }
     lock.lock();
     // More buffers may have been needed for a moment than the threads need from
@@ -634,7 +564,6 @@ int main() {
   struct stat info;
   fstat(fd, &info);
   input_size = info.st_size;
-  probes(fd, input_size);
   cpu_set_t cpus;
   sched_getaffinity(0, sizeof cpus, &cpus);
   threads = CPU_COUNT(&cpus);
