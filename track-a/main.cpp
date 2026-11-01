@@ -26,18 +26,12 @@ constexpr auto relaxed = std::memory_order_relaxed;
 // The box's hardware threads.
 const size_t WORKERS = 12;
 const size_t CHUNK = 1 << 18, CLEAR_STEP = 1 << 23, HOURS = 72, BLOCK = 256;
-// A chunk that starts this many minutes into an hour shows that the hour before is
-// over, as the spec has the last upload of an hour land within 10 minutes of its end.
-const size_t HOUR_GRACE = 10, SLOTS = 1 << 13, MAX_IDS = 1 << 11, NONE = -1;
+const size_t SLOTS = 1 << 13, MAX_IDS = 1 << 11, NONE = -1;
 // A log entry is id << 21 | is_error << 20 | latency. A latency that does not fit,
 // on about 1% of lines, puts BIG in the entry and takes the next slot whole. An
 // all-zero entry is an unused part of a block, and id 0 is reserved to absorb it.
 const u32 BIG = (1 << 20) - 1, DONE = 1u << 31;
 
-struct Name {
-  u32 at;
-  u16 len, id;
-};
 using Text = std::string_view;
 
 // Table of names, one word each: the high 48 bits of the hash and the id. After the
@@ -45,9 +39,10 @@ using Text = std::string_view;
 // needs merging. With the slot that gives 60 bits of hash, which over 1,842 names
 // collide with odds of 2e-12. Ids are given out in the order names are first seen.
 alignas(64) static atomic<u64> table[SLOTS];
-// Names in the order they were found, and sorted up to `sorted`.
+// Names in the order they were found, and sorted up to `sorted`. Each is a word:
+// its offset in name_bytes << 32 | its length << 16 | its id.
 static std::mutex names_lock;
-static Name order[MAX_IDS];
+static u64 order[MAX_IDS];
 static size_t name_count, sorted, name_end;
 alignas(64) static char name_bytes[MAX_IDS * 128];
 // Written by every thread, so kept off the lines that each line of input reads.
@@ -59,7 +54,10 @@ alignas(64) static atomic<size_t> next_chunk, next_clear;
 // regions and the turn to write.
 alignas(64) static std::mutex plan_lock;
 static size_t parsed_chunks, hours_over, next_hour, pooled, carved;
-static bool speculating;
+// A chunk that starts this many minutes into an hour shows that the hour before is
+// over, as the spec has the last upload of an hour land within 10 minutes of its end.
+// After a restart it is too long for any hour to end before all parsing has.
+static size_t grace;
 static u32 *pool[HOURS * 3];
 // What the thread that parsed a chunk leaves for planning the hours: its first line's
 // minute, its lowest hour and a bit to say that it is done.
@@ -68,7 +66,7 @@ alignas(64) static atomic<u32> chunk_states[1 << 14];
 alignas(64) static atomic<u32> text_sizes[HOURS];
 static u8 *texts[HOURS];
 
-alignas(64) static size_t input_size, capacity, chunk_count;
+alignas(64) static size_t input_size, capacity;
 static const u8 *input;
 static u32 *regions;
 // A vector whose first `n` bytes are set, for n up to 128, then clear bytes.
@@ -152,7 +150,7 @@ INLINE u64 hash_name(const u8 *p, size_t len) {
       std::lock_guard guard(names_lock);
       if (!(seen = cell.load(relaxed))) {
         memcpy(name_bytes + name_end, name, len);
-        order[name_count++] = {(u32)name_end, (u16)len, (u16)(name_count + 1)};
+        order[name_count++] = name_end << 32 | len << 16 | (name_count + 1);
         name_end += len;
         cell.store(seen = hash >> 16 << 16 | name_count, relaxed);
       }
@@ -241,26 +239,19 @@ INLINE void parse_line(Walk &walk, size_t &lowest) {
 // work on a line from each at once.
 static size_t parse_chunk(const u8 *line, const u8 *end, u32 **heads) {
   size_t lowest = HOURS;
-  const u8 *mid = std::find(line + (end - line) / 3, end, '\n');
+  const u8 *mid = std::find(line + (end - line) / 2, end, '\n');
   mid += mid < end;
-  const u8 *mid2 = std::find(line + (end - line) * 2 / 3, end, '\n');
-  mid2 += mid2 < end;
   Walk a{line, heads, heads[0]}, b{mid, heads + HOURS, heads[HOURS]};
-  Walk c{mid2, heads + HOURS * 2, heads[HOURS * 2]};
-  while (a.line < mid && b.line < mid2 && c.line < end) {
+  while (a.line < mid && b.line < end) {
     parse_line(a, lowest);
     parse_line(b, lowest);
-    parse_line(c, lowest);
   }
   while (a.line < mid)
     parse_line(a, lowest);
-  while (b.line < mid2)
+  while (b.line < end)
     parse_line(b, lowest);
-  while (c.line < end)
-    parse_line(c, lowest);
   a.heads[a.hour] = a.at;
   b.heads[b.hour] = b.at;
-  c.heads[c.hour] = c.at;
   return lowest;
 }
 
@@ -365,13 +356,13 @@ INLINE u8 *put_number(u8 *out, u32 value) {
   return out + 9 - skip;
 }
 
-static Text name_of(Name name) { return {name_bytes + name.at, name.len}; }
-static bool by_name(Name a, Name b) { return name_of(a) < name_of(b); }
+static Text name_of(u64 n) { return {name_bytes + (n >> 32), (u16)(n >> 16)}; }
+static bool by_name(u64 a, u64 b) { return name_of(a) < name_of(b); }
 
 // Groups the hour's values by name, then answers each group with selection.
 static void render_hour(size_t hour, u32 *space) {
   u32 *counts = space, *starts = space + MAX_IDS * 2;
-  Name *names = (Name *)(space + MAX_IDS * 3);
+  u64 *names = (u64 *)(space + MAX_IDS * 3);
   u32 *values = space + MAX_IDS * 5;
   size_t known;
   {
@@ -380,7 +371,7 @@ static void render_hour(size_t hour, u32 *space) {
     std::sort(order + sorted, order + name_count, by_name);
     std::inplace_merge(order, order + sorted, order + name_count, by_name);
     sorted = known = name_count;
-    memcpy(names, order, known * sizeof(Name));
+    memcpy(names, order, known * 8);
   }
   size_t used = cursors[hour].load(relaxed);
   u32 *log = bases[hour].load(relaxed);
@@ -395,7 +386,7 @@ static void render_hour(size_t hour, u32 *space) {
   // the group being answered only overwrite one that is finished.
   u32 sum = 0;
   for (size_t i = known; i--;) {
-    u32 id = names[i].id;
+    u32 id = (u16)names[i];
     starts[id] = sum;
     sum += counts[id * 2] + counts[id * 2 + 1];
   }
@@ -411,9 +402,9 @@ static void render_hour(size_t hour, u32 *space) {
   char label[33] = "2026-MM-DDTHH:00:00Z            ";
   memcpy(label + 5, &stamps[hour], 8);
   u8 *text = (u8 *)take_region(), *cursor = text;
-  auto rank = [](size_t percent, size_t n) { return (percent * n + 99) / 100 - 1; };
+  auto rank = [](size_t p, size_t n) { return (p * n + 99) / 100 - 1; };
   for (size_t i = 0; i < known; i++) {
-    u32 id = names[i].id, errors = counts[id * 2 + 1];
+    u32 id = (u16)names[i], errors = counts[id * 2 + 1];
     size_t n = counts[id * 2] + errors;
     if (!n)
       continue;
@@ -446,15 +437,13 @@ static void render_hour(size_t hour, u32 *space) {
 // guessing, before the last hour can be written.
 static size_t next_task() {
   std::lock_guard guard(plan_lock);
-  for (u32 state; parsed_chunks < chunk_count && (state = chunk_states[parsed_chunks]) & DONE; parsed_chunks++) {
-    if ((state >> 16 & 255) < hours_over) {
-      execl("/proc/self/exe", "again", "again", nullptr);
-      _exit(1);
-    }
-    size_t over = (std::max(state & 65535, (u32)HOUR_GRACE) - HOUR_GRACE) / 60;
-    hours_over = std::max(hours_over, speculating ? over : 0);
+  for (u32 state; (state = chunk_states[parsed_chunks]) & DONE; parsed_chunks++) {
+    if ((state >> 16 & 255) < hours_over)
+      execl("/proc/self/exe", "again", "again", nullptr), _exit(1);
+    size_t over = (std::max<size_t>(state & 65535, grace) - grace) / 60;
+    hours_over = std::max(hours_over, over);
   }
-  if (parsed_chunks == chunk_count)
+  if (parsed_chunks * CHUNK >= input_size)
     hours_over = HOURS;
   return next_hour < hours_over ? next_hour++ : HOURS + (next_hour == HOURS);
 }
@@ -472,16 +461,13 @@ static bool parse_or_clear(u32 **heads) {
     chunk_states[chunk] = DONE | lowest << 16 | minute;
     return true;
   }
-  off = next_clear.fetch_add(CLEAR_STEP, relaxed);
-  if (off >= input_size)
-    return false;
   // Exit would clear the input's page tables on one thread, with the clock running.
-  madvise((void *)(input + off), CLEAR_STEP, MADV_DONTNEED);
-  return true;
+  off = next_clear.fetch_add(CLEAR_STEP, relaxed);
+  return off < input_size && (madvise((void *)(input + off), CLEAR_STEP, MADV_DONTNEED), true);
 }
 
 static void worker() {
-  u32 *heads[HOURS * 3] = {};
+  u32 *heads[HOURS * 2] = {};
   for (;;) {
     size_t hour = next_task();
     if (hour < HOURS) {
@@ -497,7 +483,7 @@ static void worker() {
 }
 
 int main(int argc, char **) {
-  speculating = argc < 2;
+  grace = argc < 2 ? 10 : 1 << 20;
   // The box has huge pages set to always, which charges 2 MB for a first touch of a
   // thread stack or a small mapping.
   prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
@@ -512,18 +498,17 @@ int main(int argc, char **) {
   // Mapped over a larger anonymous mapping, so vector loads past the end stay readable.
   input = (const u8 *)map_zeroed(input_size + (1 << 13));
   mmap((void *)input, input_size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
-  chunk_count = (input_size + CHUNK - 1) / CHUNK;
   // A line with a big latency takes two slots and over 40 bytes, which bounds any
   // hour however the lines are spread. A region can hold an hour's values and the
   // scratch space for answering it, or its text, in whole pages.
-  capacity = (3 * (input_size / 20 + WORKERS * 3 * BLOCK) + (1 << 17)) & -1024;
+  capacity = (3 * (input_size / 20 + WORKERS * 2 * BLOCK) + (1 << 17)) & -1024;
   regions = (u32 *)map_zeroed(std::size(pool) * capacity * 4);
   int out = open("/out/summary.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
   for (size_t w = 1; w < WORKERS; w++)
     std::thread(worker).detach();
   // This thread alone writes, in order, and parses while the next hour is not ready.
   // Writing the last hour ends the process, which needs no threads to be joined.
-  u32 *heads[HOURS * 3] = {};
+  u32 *heads[HOURS * 2] = {};
   for (size_t hour = 0; hour < HOURS;) {
     u32 size = text_sizes[hour];
     if (size) {
