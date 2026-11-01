@@ -24,7 +24,7 @@ using std::atomic;
 constexpr auto relaxed = std::memory_order_relaxed;
 #define INLINE [[gnu::always_inline]] inline
 
-const size_t CHUNK = 1 << 20, REGION_CHUNK = 1 << 16, UNMAP_STEP = 1 << 23;
+const size_t CHUNK = 1 << 18, REGION_CHUNK = 1 << 16, UNMAP_STEP = 1 << 23;
 const size_t COUNTRIES = 256, HUGE_PAGE = 1 << 21;
 // The generator's pool of 100,000 names, plus the few that edge-case blocks
 // add, fits at 77% load.
@@ -86,6 +86,7 @@ static atomic<u64> *slots;
 static atomic<u64> *name_bits;
 static Group *groups;
 static int threads;
+static cpu_set_t all_cpus;
 static atomic<u8> seen_codes[26 * 26 * 26];
 static std::mutex codes_lock;
 static std::vector<std::string> codes;
@@ -348,6 +349,16 @@ static size_t first_record(size_t off) {
 }
 
 static void worker(int index, std::barrier<> *barrier) {
+  // Runs are too short for the scheduler to settle: one thread on each CPU from
+  // the start, and no thread leaves the caches it filled.
+  int cpu = -1;
+  for (int seen = 0; seen <= index; seen++)
+    while (!CPU_ISSET(++cpu, &all_cpus))
+      ;
+  cpu_set_t one;
+  CPU_ZERO(&one);
+  CPU_SET(cpu, &one);
+  sched_setaffinity(0, sizeof one, &one);
   load_regions();
   barrier->arrive_and_wait();
   Group *mine = groups + index * COUNTRIES;
@@ -394,9 +405,8 @@ static char *money(char *out, long long cents) {
 
 int main() {
   memset(LOW_BYTES, 255, 32);
-  cpu_set_t cpus;
-  sched_getaffinity(0, sizeof cpus, &cpus);
-  threads = CPU_COUNT(&cpus);
+  sched_getaffinity(0, sizeof all_cpus, &all_cpus);
+  threads = CPU_COUNT(&all_cpus);
   regions = map_input("/data/regions.csv", regions_size);
   input = map_input("/data/records.csv", input_size);
   size_t line = regions_size - 1;
