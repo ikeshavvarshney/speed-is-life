@@ -41,3 +41,52 @@ The first port looked level with Rust on the 2-core laptop, but was slower on th
 | Same code, later run | run-b8a1c133b819 | 0.0245 | 10.2 | 390 | 41.02 | 80.65 |
 
 The last rows show run-to-run noise of about 3% in K on unchanged code.
+
+## Instruction throughput (2026-11-01)
+
+Plain T was too noisy for small changes, so these decisions use C/B: Track C's T divided by Track B's in the same push. Track B did not change, so this cancels the box's load. On unchanged code it was 0.313 to 0.317.
+
+**Measure first.** Diagnostic builds report through T and M: the output stays byte-exact, then the program touches memory and sleeps so that M and T encode its counters. They score about zero and cannot become a best run.
+
+| Run ID | Measured on the box |
+|---|---|
+| run-ebc8576769e1 | Thread cycles per record: scan 56, decode 72, group 38, bit write 32. Total 198, matching T |
+| run-7e3069987c61 | About 4,000 page faults and 60 ms of kernel time out of about 260 ms of thread time. Setup 1.0 ms, after parsing 1.4 ms, exec and exit 0.8 ms |
+| run-bc1f3109f6f0 | After the changes below: scan 54, decode 50, group 38, bit write 28. Total 170 |
+
+My guess was the locked bitset write, since 89.8% of records set a new bit. It was 16% of the time. Scan and decode were 64%.
+
+**The kernel's share did not lead anywhere.** It looked like the largest target, but direct attacks on it failed. Copying costs about what faulting costs, so removing faults alone wins nothing.
+
+| Change | Run ID | T (s) | C/B | Outcome |
+|---|---|---|---|---|
+| `MADV_POPULATE_READ` per chunk | run-f4c28358d0cf | 0.0263 | 0.350 | Rejected |
+| `pread` of 64 KB with 1 KB overlap | run-37035719b347 | 0.0254 | 0.320 | Rejected, and 11.0 MB |
+| 1 MB chunks, fewer threads per page table | run-bfd94851ee0f | 0.0245 | 0.326 | Rejected |
+| Pin each worker to a CPU | run-1f229baacca1, run-6c1185b0f876 | 0.0234, 0.0237 | 0.309, 0.316 | Rejected. About 1%, inside the noise, for 8 lines. My first reading of plain T claimed 4% |
+| Count distinct names when setting a bit, unconditional `fetch_or` | run-f3eb8e90d8d9 | 0.0243 | 0.325 | Rejected |
+| The same, with the read test kept | run-d0fb2d56e6dd | 0.0245 | 0.325 | Rejected |
+
+**The cause.** Running the decode loop twice per batch and timing the second run took 69 ticks warm against 93 cold, on one local core, so only a quarter was memory. The disassembly had about 150 instructions with heavy stack spilling and no hidden branches. Two hyperthreads share a 6-wide core, so each gets about 3 micro-ops a cycle, and 150 instructions take about 50 cycles. The loop was limited by how many instructions it had.
+
+| Step | Change | Run ID | T (s) | M (MB) | S | K | C/B | Outcome |
+|---|---|---|---|---|---|---|---|---|
+| 15 | Decode rewritten: lengths from one vector subtract, dot removed by shuffle so cents decode directly, BOM and sign by branch, no length in the hash, sums widened in the next pass | run-36eeb18fe4c3 | 0.0219 | 9.5 | 405 | 43.79 | 0.290 | Kept. Local decode 85 to 48 ticks |
+| 16 | Min and max by predicted branch, as a new extreme is rare | run-cbcac110af1f | 0.0216 | 9.6 | 407 | 43.90 | 0.289 | Kept |
+| 17 | Pair counts in straight lines. gcc had kept the "unconditional" loop, at 14 instructions per pass | run-797ad36975f6 | 0.0213 | 9.6 | 411 | 44.16 | 0.283 | Kept |
+| 18 | Region table sized by spec 2.3, output order from the country code, no sort or strings, detached threads | run-93587ef0f4f2 | 0.0214 | 10.3 | 395 | 43.71 | 0.283 | Kept. M rose about 1 MB here and the cause is not known |
+| 19 | No huge pages once the tables are faulted, table pointers in registers | run-d44bc75eaac2 | 0.0201 | 10.5 | 395 | 44.91 | 0.267 | Kept, the largest step after 15. Attributed to workers no longer clearing a 2 MB stack page, not measured separately |
+| 20 | Six unconditional marks per block, not eight | run-a53889219e88 | 0.0208 | 10.6 | 395 | 44.05 | 0.277 | Rejected. Mispredictions cost more than the 8 instructions |
+| 21 | Fixed moves between batches, not three library calls | run-e8c3608f3bd4 | 0.0201 | 10.6 | 401 | 44.78 | 0.254 | Kept, though Track B was unusually slow in this push, so its C/B flatters it |
+| 22 | `-mprfchw`, so the bitset prefetch fetches the line writable | run-fdb4a0f94bf8, run-51f14a1529b6 | 0.0196, 0.0197 | 10.6, 10.7 | 401 | 45.30, 45.11 | 0.260, 0.264 | Kept |
+| 23 | Line trim | run-10ff06d92ce1 | 0.0196 | 10.5 | 391 | 45.60 | 0.256 | Kept, best so far |
+| 24 | Prefetch input 512 bytes ahead, retest | run-5cac8a1a30e0 | 0.0206 | 10.4 | 392 | 44.54 | 0.271 | Rejected |
+| 25 | No prefetch of the country table | run-ce93221e9697 | 0.0202 | 10.6 | 390 | 44.79 | 0.261 | Rejected |
+| 26 | `join` instead of detach, testing step 18's memory rise | run-c5d30816fae8 | 0.0203 | 11.9 | 393 | 43.63 | 0.270 | Rejected. My explanation was wrong |
+| 27 | Batches of 8 blocks | run-2dbd013a3a56 | 0.0201 | 10.4 | 391 | 45.05 | 0.268 | Rejected |
+
+**Correctness.** The hash gained a third AES round after the last input, as two rounds left crafted names colliding. Decode now relies on more of spec section 2.2, so the final code was also compared with the official reference on seeds the code had never seen: sample seeds 7 and 11 and full seed 7, 15 runs each, plus 25 runs of the worked example, all with 12 threads forced. Every run matched.
+
+**Still unexplained.** Scan stayed at 54 to 56 cycles on the box after losing instructions, so it looks limited by memory or faults, but input prefetch made it worse. Local memory at 12 threads is 8.4 MB against 10.5 MB on the box. Per-CPU charge batching in the kernel's memory accounting would fit, but this was not measured.
+
+The board's 9.08 MB and 0.0236 s (run-ed8076394be0, K 42.79) became 10.5 MB and 0.0196 s (run-10ff06d92ce1, K 45.60).

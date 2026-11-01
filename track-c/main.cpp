@@ -35,7 +35,7 @@ const size_t CODES = 26 * 26 * 26;
 const int NAME_BITS = 17;
 // Words of one country's bitset over name ids.
 const size_t WORDS = (1 << NAME_BITS) / 64;
-const size_t BLOCKS = 8, MAX_MARKS = BLOCKS * 64 + 64;
+const size_t BLOCKS = 16, MAX_MARKS = BLOCKS * 64 + 64;
 const size_t MAX_RECORDS = MAX_MARKS / 5 + 1;
 
 // One worker's running values for one country, on one cache line. `sums` is
