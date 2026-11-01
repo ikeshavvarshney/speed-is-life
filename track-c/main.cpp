@@ -13,7 +13,6 @@
 #include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
-#include <time.h>
 
 using u8 = uint8_t;
 using u32 = uint32_t;
@@ -85,7 +84,6 @@ static atomic<u8> seen_codes[CODES];
 static std::mutex codes_lock;
 static int code_count;
 static atomic<u32> distinct_names[COUNTRIES];
-static atomic<u64> ticks[4]; static atomic<u64> nrec;
 // Written by every thread, so kept away from what records read.
 alignas(64) static atomic<size_t> next_region{1}; // The first piece holds the header.
 alignas(64) static atomic<size_t> next_chunk;
@@ -231,9 +229,7 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
   };
   size_t block = first, filled = 0, start = first;
   u64 inside = 0, closed = 0;
-  u64 tl[4]={},tn=0;
   for (;;) {
-    u64 t0=__rdtsc();
     for (size_t b = 0; b < BLOCKS; b++, block += 64) {
       // Bitmasks of one 64-byte block. A carry-less multiply by all ones is a
       // running XOR of the quote bits, set from an opening quote up to its
@@ -274,7 +270,6 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
           marks[k] = block + _tzcnt_u64(seps);
       } while (seps);
     }
-    u64 t1=__rdtsc();
     size_t whole = filled / 5, n = 0;
     bool done = false;
     for (size_t r = 0; r < whole; r++) {
@@ -320,7 +315,6 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
       recs[n++].region = region_id;
       start = lf + 1;
     }
-    u64 t2=__rdtsc();
     // Group prefetching: this pass touches only what the pass above prefetched,
     // so the cache misses of a batch overlap instead of stalling one at a time.
     for (size_t r = 0; r < n; r++) {
@@ -343,7 +337,6 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
       recs[r].hash = word;
       recs[r].region = name % 64;
     }
-    u64 t3=__rdtsc();
     // A set bit costs no write, and a write costs a locked instruction that
     // often has to fetch the line from another core, so it is the last step.
     for (size_t r = 0; r < n; r++) {
@@ -352,10 +345,8 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
       if (!(word.load(relaxed) & bit))
         word.fetch_or(bit, relaxed);
     }
-    u64 t4=__rdtsc(); tl[0]+=t1-t0;tl[1]+=t2-t1;tl[2]+=t3-t2;tl[3]+=t4-t3;tn+=n;
-    if (done || start >= stop) {
-      for(int i=0;i<4;i++)ticks[i]+=tl[i]; nrec+=tn;
-      return;}
+    if (done || start >= stop)
+      return;
     // Under five marks remain, and the mark after them may already have pairs
     // waiting for it. Fixed moves cost less than calls to copy so little.
     auto left_marks = (const __m128i *)(marks + whole * 5);
@@ -431,7 +422,6 @@ static char *money(char *out, long long cents) {
 }
 
 int main() {
-  timespec t0_;clock_gettime(CLOCK_MONOTONIC,&t0_);double w0=t0_.tv_sec*1e3+t0_.tv_nsec/1e6;
   memset(LOW_BYTES, 255, 32);
   cpu_set_t cpus;
   sched_getaffinity(0, sizeof cpus, &cpus);
@@ -490,17 +480,5 @@ int main() {
   int fd = open("/out/aggregates.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (write(fd, text, out - text) != out - text)
     abort();
-  double n=nrec?(double)nrec:1;
-  auto q=[&](double v,double unit,int top){int c=v/unit+.5;return c<0?0:c>top?top:c;};
-  int a=q(ticks[0]/n,2,63),b=q(ticks[1]/n,2,63),c=q(ticks[2]/n,2,49),d=q(ticks[3]/n,2,49);
-  if(threads==12){
-    munmap(by_id,tables_size);munmap(name_bits,COUNTRIES*WORDS*8);
-    size_t mb=128+a*64+b;
-    void*p=mmap(0,mb<<20,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_POPULATE,-1,0);
-    munmap(p,mb<<20);
-    timespec ts;clock_gettime(CLOCK_MONOTONIC,&ts);double now=ts.tv_sec*1e3+ts.tv_nsec/1e6;
-    double r=w0+3000+(c*50+d)*4.0-now;
-    if(r>0){ts.tv_sec=r/1000;ts.tv_nsec=(r-1000*(long)(r/1000))*1e6;nanosleep(&ts,0);}
-  }
   _exit(0);
 }
