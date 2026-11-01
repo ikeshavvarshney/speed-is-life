@@ -155,8 +155,8 @@ alignas(64) static u8 LOW_BYTES[64];
 
 // Up to 32 bytes are masked and mixed at a fixed cost, as a loop per word would
 // mispredict on names of varying length. Longer names, which are rare, loop over
-// the rest. Every byte passes through at least two AES rounds after it enters,
-// which spreads it over the whole state.
+// the rest. Every byte passes through at least three AES rounds after it enters,
+// as two left crafted names colliding, which would change a count.
 INLINE u64 hash_name(const u8 *p, size_t len) {
   auto mask = (const v4 *)(LOW_BYTES + 32 - std::min<size_t>(len, 32));
   v4 bytes = _mm256_and_si256(_mm256_loadu_si256((const v4 *)p),
@@ -171,7 +171,7 @@ INLINE u64 hash_name(const u8 *p, size_t len) {
         state, _mm_and_si128(_mm_loadu_si128((const __m128i *)(p + i)),
                              _mm_loadu_si128((const __m128i *)tail)));
   }
-  state = _mm_aesenc_si128(state, key);
+  state = _mm_aesenc_si128(_mm_aesenc_si128(state, key), key);
   return _mm_cvtsi128_si64(_mm_aesenc_si128(state, key)) | 1;
 }
 
