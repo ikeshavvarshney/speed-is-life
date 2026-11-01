@@ -377,8 +377,6 @@ static void render_hour(size_t hour, u32 *space) {
   u32 *log = bases[hour].load(relaxed);
   memset(counts, 0, MAX_IDS * 8);
   for (size_t i = 0; i < used; i++) {
-    // Other cores wrote these entries, so each new line takes long to arrive.
-    _mm_prefetch((const char *)(log + i + 64), _MM_HINT_T0);
     counts[log[i] >> 20]++;
     i += (log[i] & BIG) == BIG;
   }
