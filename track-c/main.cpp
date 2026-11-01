@@ -90,12 +90,6 @@ static atomic<u8> seen_codes[26 * 26 * 26];
 static std::mutex codes_lock;
 static std::vector<std::string> codes;
 static atomic<u32> distinct_names[COUNTRIES];
-#include <time.h>
-#include <cmath>
-#include <sys/resource.h>
-static double now(){timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1e3+t.tv_nsec/1e6;}
-static double w_parse0,w_parse1;
-static rusage usage;
 static Counter next_region, next_chunk, next_country, next_unmap;
 
 // Claims pieces of regions.csv. by_id holds 1 + the country's index, and 0 for
@@ -356,7 +350,6 @@ static size_t first_record(size_t off) {
 static void worker(int index, std::barrier<> *barrier) {
   load_regions();
   barrier->arrive_and_wait();
-  if(!index)w_parse0=now();
   Group *mine = groups + index * COUNTRIES;
   std::uninitialized_default_construct_n(mine, COUNTRIES);
   for (;;) {
@@ -370,7 +363,6 @@ static void worker(int index, std::barrier<> *barrier) {
       parse_chunk(first, stop, mine);
   }
   barrier->arrive_and_wait();
-  if(!index){w_parse1=now();getrusage(RUSAGE_SELF,&usage);}
 
   // Process exit would otherwise unmap every page of the input on one thread,
   // while the clock runs. Clearing the page tables now, on all threads, removes
@@ -401,7 +393,6 @@ static char *money(char *out, long long cents) {
 }
 
 int main() {
-  double w0=now();
   memset(LOW_BYTES, 255, 32);
   cpu_set_t cpus;
   sched_getaffinity(0, sizeof cpus, &cpus);
@@ -438,7 +429,6 @@ int main() {
   for (auto &thread : pool)
     thread.join();
 
-  double w1=now();
   std::vector<std::pair<std::string, int>> keys{{"_UNMATCHED", 0}};
   for (size_t i = 0; i < codes.size(); i++)
     keys.push_back({codes[i], i + 1});
@@ -467,17 +457,5 @@ int main() {
   int fd = open("/out/aggregates.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (write(fd, text, out - text) != out - text)
     abort();
-  double w2=now();
-  auto q=[&](double v,double unit,int top){int c=v/unit+.5;return c<0?0:c>top?top:c;};
-  double st=usage.ru_stime.tv_sec*1e3+usage.ru_stime.tv_usec/1e3;
-  int a=q(usage.ru_minflt,200,63),b=q(st,1,63),c=q(w_parse0-w0,.1,49),d=q(w2-w_parse1,.1,49);
-  if(threads==12){
-    munmap(by_id,tables_size);munmap(name_bits,COUNTRIES*WORDS*8);
-    size_t mb=128+a*64+b;
-    void*p=mmap(0,mb<<20,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_POPULATE,-1,0);
-    munmap(p,mb<<20);
-    double until=w0+3000+(c*50+d)*4.0;
-    for(;;){double r=until-now();if(r<=0)break;timespec ts{(time_t)(r/1000),(long)(fmod(r,1000)*1e6)};nanosleep(&ts,0);}
-  }
   _exit(0);
 }
