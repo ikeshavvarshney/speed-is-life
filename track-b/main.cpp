@@ -64,6 +64,13 @@ INLINE v4 add8(v4 a, v4 b) { return _mm256_add_epi8(a, b); }
 INLINE v4 add64(v4 a, v4 b) { return _mm256_add_epi64(a, b); }
 INLINE v4 shuffle(v4 a, v4 b) { return _mm256_shuffle_epi8(a, b); }
 INLINE u32 lanes(v4 x) { return _mm256_movemask_ps(_mm256_castsi256_ps(x)); }
+alignas(64) static u64 lane_orders[256];
+
+// Moves the lanes set in `mask` to the front, in order.
+INLINE v4 gather(v4 x, u32 mask) {
+  v2 order = _mm_loadl_epi64((const v2 *)(lane_orders + mask));
+  return _mm256_permutevar8x32_epi32(x, _mm256_cvtepu8_epi32(order));
+}
 
 // Mapped over a larger anonymous mapping so vector loads near the end of the file
 // stay readable.
@@ -290,7 +297,6 @@ static u32 *list_marks;
 static Counter *next_log_block;
 static Counter next_query, next_chunk, next_unmap, next_partition, next_answer;
 static Counter next_release;
-alignas(64) static u64 lane_orders[256];
 
 static void find_query_chunks() {
   bounds = {0};
@@ -509,12 +515,8 @@ static void parse_docs(Scratch &scratch) {
         v4 x = load(ids + at), id = _mm256_and_si256(x, id_mask);
         u32 is_high = lanes(_mm256_cmpgt_epi32(high_limit, id));
         u32 is_low = is_high ^ lanes(_mm256_cmpgt_epi32(list_limit, id));
-        auto gather = [&](u32 mask) {
-          v2 order = _mm_loadl_epi64((const v2 *)(lane_orders + mask));
-          return _mm256_permutevar8x32_epi32(id, _mm256_cvtepu8_epi32(order));
-        };
-        store(high_ids + highs, gather(is_high));
-        store(low_ids + lows, gather(is_low));
+        store(high_ids + highs, gather(id, is_high));
+        store(low_ids + lows, gather(id, is_low));
         highs += __builtin_popcount(is_high);
         lows += __builtin_popcount(is_low);
         u32 anchors = lanes(_mm256_slli_epi32(x, 31 - ID_BITS));
@@ -695,23 +697,40 @@ static size_t merge(const u32 *a, size_t na, const u32 *b, size_t nb, u32 *out) 
   while (i < na && j < nb) {
     u32 x = a[i], y = b[j];
     out[n] = std::min(x, y);
-    n += OP == OP_OR || (OP == OP_AND ? x == y : x < y);
+    n += OP == OP_OR || x < y;
     i += x <= y;
     j += y <= x;
   }
-  if (OP != OP_AND)
-    while (i < na)
-      out[n++] = a[i++];
+  n += std::copy(a + i, a + na, out + n) - (out + n);
   if (OP == OP_OR)
-    while (j < nb)
-      out[n++] = b[j++];
+    n += std::copy(b + j, b + nb, out + n) - (out + n);
+  return n;
+}
+
+// For lists of similar sizes: compares 8 ids of each list, all against all, then
+// moves on from whichever block ends first. Both lists are followed by 8 ids above
+// any document, and different ones.
+static size_t intersect(const u32 *a, size_t na, const u32 *b, size_t nb, u32 *out) {
+  const v4 rotate = _mm256_setr_epi32(1, 2, 3, 4, 5, 6, 7, 0);
+  size_t i = 0, j = 0, n = 0;
+  while (i < na && j < nb) {
+    v4 x = load(a + i), y = load(b + j), equal = _mm256_cmpeq_epi32(x, y);
+    for (int k = 1; k < 8; k++) {
+      y = _mm256_permutevar8x32_epi32(y, rotate);
+      equal = _mm256_or_si256(equal, _mm256_cmpeq_epi32(x, y));
+    }
+    u32 found = lanes(equal);
+    store(out + n, gather(x, found));
+    n += __builtin_popcount(found);
+    u32 a_last = a[i + 7], b_last = b[j + 7];
+    i += (a_last <= b_last) * 8;
+    j += (b_last <= a_last) * 8;
+  }
   return n;
 }
 
 // For lists of very different sizes. Each id of the short list skips ahead in the
-// long one by whole vectors and compares 8 at once. `b` is followed by 8 ids above
-// any document.
-template <bool KEEP>
+// long one by whole vectors and compares 8 at once.
 static size_t probe(const u32 *a, size_t na, const u32 *b, size_t nb, u32 *out) {
   size_t j = 0, n = 0;
   for (size_t i = 0; i < na; i++) {
@@ -722,9 +741,16 @@ static size_t probe(const u32 *a, size_t na, const u32 *b, size_t nb, u32 *out) 
       j += 8;
     v4 equal = _mm256_cmpeq_epi32(load(b + j), _mm256_set1_epi32(x));
     out[n] = x;
-    n += (_mm256_movemask_epi8(equal) != 0) == KEEP;
+    n += _mm256_movemask_epi8(equal) != 0;
   }
   return n;
+}
+
+static u64 sum_of(const u32 *ids, size_t n) {
+  u64 sum = 0;
+  for (size_t i = 0; i < n; i++)
+    sum += ids[i];
+  return sum;
 }
 
 // Answers one boolean query. Filters between two ORs commute, so within such a run
@@ -798,18 +824,43 @@ struct Evaluator {
       }
       n = merge<OP_OR>(r, n, l, nl, tmp);
     } else {
-      for (int i = 0; i < 8; i++)
-        l[nl + i] = r[n + i] = UINT32_MAX;
-      if (n * PROBE_RATIO < nl)
-        n = op == OP_AND ? probe<true>(r, n, l, nl, tmp)
-                         : probe<false>(r, n, l, nl, tmp);
-      else if (op == OP_AND && nl * PROBE_RATIO < n)
-        n = probe<true>(l, nl, r, n, tmp);
-      else
-        n = op == OP_AND ? merge<OP_AND>(r, n, l, nl, tmp)
-                         : merge<OP_NOT>(r, n, l, nl, tmp);
+      size_t shared = find_shared(nl);
+      if (op == OP_AND) {
+        n = shared;
+      } else {
+        n = merge<OP_NOT>(r, n, tmp, shared, l);
+        std::swap(tmp, l);
+      }
     }
     std::swap(r, tmp);
+  }
+
+  // Leaves in `tmp` the ids that `r` and `l` share.
+  size_t find_shared(size_t nl) {
+    for (int i = 0; i < 8; i++) {
+      r[n + i] = UINT32_MAX;
+      l[nl + i] = UINT32_MAX - 1;
+    }
+    if (n * PROBE_RATIO < nl)
+      return probe(r, n, l, nl, tmp);
+    if (nl * PROBE_RATIO < n)
+      return probe(l, nl, r, n, tmp);
+    return intersect(r, n, l, nl, tmp);
+  }
+
+  // A last OR or NOT needs no result list: the shared ids give its size and sum, and
+  // only the start of the result is built.
+  void finish_from_shared(u32 op, u32 id, std::string &out) {
+    size_t nl = decode_list(id - high_terms, l), shared = find_shared(nl);
+    u64 sum = sum_of(r, n) - sum_of(tmp, shared);
+    if (op == OP_OR) {
+      u32 first[20];
+      merge<OP_OR>(r, std::min<size_t>(n, 10), l, std::min<size_t>(nl, 10), first);
+      write_line(out, n + nl - shared, sum + sum_of(l, nl), first);
+    } else {
+      merge<OP_NOT>(r, std::min(n, shared + 10), tmp, shared, l);
+      write_line(out, n - shared, sum, l);
+    }
   }
 
   // `terms` holds each term's id above its operator, with AND for the first term.
@@ -835,22 +886,28 @@ struct Evaluator {
       to_dense(high_bits + base * words);
     else
       n = decode_list(base - high_terms, r);
-    for (size_t i = 1; i < count; i++)
+    for (size_t i = 1; i + 1 < count; i++)
       apply(op(terms[i]), terms[i] >> OP_BITS);
-    u32 first[10];
-    u64 total = n, sum = 0;
+    if (count > 1) {
+      u32 last_op = op(terms[count - 1]), last = terms[count - 1] >> OP_BITS;
+      if (!dense && last_op != OP_AND && last >= high_terms &&
+          n + list_size(last - high_terms) <= words * 2) {
+        finish_from_shared(last_op, last, out);
+        return;
+      }
+      apply(last_op, last);
+    }
     if (dense) {
+      u32 first[10], m = 0;
+      u64 total, sum;
       count_bits(bits, words, total, sum);
-      u32 m = 0;
       for (size_t w = 0; w < words && m < 10; w++)
         for (u64 rest = bits[w]; rest && m < 10; rest &= rest - 1)
           first[m++] = w * 64 + __builtin_ctzll(rest);
+      write_line(out, total, sum, first);
     } else {
-      for (size_t i = 0; i < n; i++)
-        sum += r[i];
-      std::copy_n(r, std::min<size_t>(n, 10), first);
+      write_line(out, n, sum_of(r, n), r);
     }
-    write_line(out, total, sum, first);
   }
 };
 
