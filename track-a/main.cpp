@@ -53,8 +53,7 @@ alignas(64) static atomic<size_t> next_chunk, next_clear;
 // Guards the rest: how far parsing has got, which hours are over and taken, the free
 // regions and the turn to write.
 alignas(64) static std::mutex plan_lock;
-static size_t parsed_chunks, hours_over, next_hour, pooled;
-static atomic<size_t> carved;
+static size_t parsed_chunks, hours_over, next_hour, pooled, carved;
 // A chunk that starts this many minutes into an hour shows that the hour before is
 // over, as the spec has the last upload of an hour land within 10 minutes of its end.
 // After a restart it is too long for any hour to end before all parsing has.
@@ -161,18 +160,17 @@ INLINE u64 hash_name(const u8 *p, size_t len) {
   }
 }
 
-static u32 *pop_region() {
-  std::lock_guard guard(plan_lock);
-  return pooled ? pool[--pooled] : nullptr;
-}
-
 // Regions are real memory only where touched, and come back warm when reused.
 static u32 *take_region() {
-  u32 *region = pop_region();
-  return region ? region : regions + carved.fetch_add(1, relaxed) * capacity;
+  std::lock_guard guard(plan_lock);
+  return pooled ? pool[--pooled] : regions + carved++ * capacity;
 }
 
+// The output file grows until the end, so that is when the peak is set. Only near the
+// end is memory left in a free region worth more to the score than the saved faults.
 static void give_region(const void *region) {
+  if (next_hour >= HOURS * 5 / 6)
+    madvise((void *)region, capacity * 4, MADV_DONTNEED);
   std::lock_guard guard(plan_lock);
   pool[pooled++] = (u32 *)region;
 }
@@ -508,7 +506,7 @@ int main(int argc, char **) {
   // hour however the lines are spread. A region can hold an hour's values and the
   // scratch space for answering it, or its text, in whole pages.
   capacity = (3 * (input_size / 20 + WORKERS * 2 * BLOCK) + (1 << 17)) & -1024;
-  regions = (u32 *)map_zeroed(2 * std::size(pool) * capacity * 4);
+  regions = (u32 *)map_zeroed(std::size(pool) * capacity * 4);
   int out = open("/out/summary.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
   for (size_t w = 1; w < WORKERS; w++)
     std::thread(worker).detach();
@@ -521,11 +519,6 @@ int main(int argc, char **) {
       if (write(out, texts[hour], size - 1) != size - 1)
         _exit(1);
       give_region(texts[hour++]);
-      // The output grows until the end, so that is when the peak is set, and regions
-      // left idle are worth more released, for the last hours only: trimming
-      // them all along costs 5% of the time in faults and interrupts.
-      for (u32 *idle; hour >= 66 && (idle = pop_region());)
-        madvise(idle, capacity * 4, MADV_DONTNEED);
     } else if (!parse_or_clear(heads))
       std::this_thread::yield();
   }
