@@ -260,178 +260,6 @@ static u32 *claim_block(size_t hour) {
   return at;
 }
 
-
-#include <stdio.h>
-#include <time.h>
-#include <x86intrin.h>
-namespace probe {
-static double now_ms(){timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1e3+t.tv_nsec/1e6;}
-static double T0=now_ms();
-static long read_long(const char*p){FILE*f=fopen(p,"r");long v=0;if(f){if(fscanf(f,"%ld",&v)!=1)v=0;fclose(f);}return v;}
-[[noreturn]] static void report(u64 code){
-  u64 mcode=code&16383,tcode=code>>14;
-  long target=(128L<<20)+(long)mcode*(256L<<10);
-  long cur=read_long("/sys/fs/cgroup/memory.current");
-  long extra=target-cur;
-  if(extra>0){
-    char*m=(char*)mmap(0,extra,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
-    for(long i=0;i<extra;i+=4096)m[i]=1;
-    munmap(m,extra);
-  }
-  double until=T0+3000+(double)tcode*16;
-  timespec ts;ts.tv_sec=(time_t)(until/1e3);ts.tv_nsec=(long)((until-ts.tv_sec*1e3)*1e6);
-  clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&ts,0);
-  _exit(0);}
-static u64 code;
-struct Gate{atomic<int> go,done;atomic<size_t> next;atomic<u64> sink,cycles,lines;};
-
-#define SPLIT()                                                                \
-    const u8 *fields = line + 28;                                              \
-    u64 mask = spaces(fields);                                                 \
-    const u8 *name = fields + __builtin_ctzll(mask) + 1;                       \
-    u64 rest = mask & (mask - 1);                                              \
-    while (!rest) {                                                            \
-      fields += 64;                                                            \
-      rest = spaces(fields);                                                   \
-    }                                                                          \
-    const u8 *space = fields + __builtin_ctzll(rest);                          \
-    size_t len = space - name;
-#define STAMP()                                                                \
-    u64 now = load64(line + 5);                                                \
-    if (now != stamp) {                                                        \
-      stamp = now;                                                             \
-      total += hour_index(line);                                               \
-    }
-#define LOOKUP()                                                               \
-    u64 hash = hash_name(name, len) | 1 << 16, seen = g.table[hash % SLOTS].load(relaxed); \
-    u32 id = (seen ^ hash) >> 16 ? find_name(hash, name, len) : (u16)seen;
-#define STORE()                                                                \
-    u32 error = space[1] == '5';                                               \
-    u32 entry = id << (LATENCY_BITS + 1) | error << LATENCY_BITS;              \
-    if (latency >= BIG) {                                                      \
-      *at++ = entry | BIG;                                                     \
-      entry = 0;                                                               \
-    }                                                                          \
-    *at++ = entry | latency;                                                   \
-    if (at > log + (1 << 14))                                                  \
-      at = log;
-
-template <int A, int B> static size_t chained(const u8 *line, const u8 *end, u32 *log, u64 &sum) {
-  size_t lines = 0; u32 *at = log; u64 stamp = 0, total = 0;
-  while (line < end) {
-    if (A) _mm_prefetch((const char *)line + A, _MM_HINT_T0);
-    if (B) _mm_prefetch((const char *)line + B, _MM_HINT_T0);
-    STAMP() SPLIT() LOOKUP()
-    const u8 *next = space + 5;
-    u32 latency = parse_latency(next);
-    STORE()
-    line = next;
-    lines++;
-  }
-  sum += total;
-  return lines;
-}
-// Newlines first over a small batch, which also brings the batch into the first level cache.
-template <size_t BATCH, int A> static size_t batched(const u8 *first, const u8 *end, u32 *log, u64 &sum) {
-  u32 starts[BATCH / 32 + 8];
-  const v4 nl = _mm256_set1_epi8('\n');
-  size_t lines = 0; u32 *at = log; u64 stamp = 0, total = 0;
-  const u8 *base = first;
-  while (base < end) {
-    size_t n = 0;
-    for (size_t i = 0; i < BATCH; i += 64) {
-      if (A) _mm_prefetch((const char *)base + i + A, _MM_HINT_T0);
-      u32 low = _mm256_movemask_epi8(_mm256_cmpeq_epi8(load(base + i), nl));
-      u32 high = _mm256_movemask_epi8(_mm256_cmpeq_epi8(load(base + i + 32), nl));
-      u64 m = low | (u64)high << 32;
-      starts[n] = i + __builtin_ctzll(m | 1ull << 63) + 1;
-      starts[n + 1] = i + __builtin_ctzll((m & (m - 1)) | 1ull << 63) + 1;
-      n += __builtin_popcountll(m);
-    }
-    if (!n) break;
-    const u8 *line = base;
-    for (size_t k = 0; k < n && line < end; k++) {
-      const u8 *line_end = base + starts[k];
-      STAMP() SPLIT() LOOKUP()
-      const u8 *next = space + 5;
-      u32 latency = parse_latency(next);
-      STORE()
-      line = line_end;
-      lines++;
-    }
-    base = line;
-  }
-  sum += total;
-  return lines;
-}
-using Fn = size_t (*)(const u8 *, const u8 *, u32 *, u64 &);
-struct Case { const char *name; Fn fn; size_t chunk; };
-static const Case cases[] = {
-  {"none", chained<0,0>, 1<<20},
-  {"p96", chained<96,0>, 1<<20}, {"p128", chained<128,0>, 1<<20}, {"p192", chained<192,0>, 1<<20}, {"p256", chained<256,0>, 1<<20},
-  {"p384", chained<384,0>, 1<<20}, {"p512", chained<512,0>, 1<<20}, {"p1024", chained<1024,0>, 1<<20},
-  {"p192p256", chained<192,256>, 1<<20}, {"p192p1024", chained<192,1024>, 1<<20}, {"p128p192", chained<128,192>, 1<<20}, {"p256p512", chained<256,512>, 1<<20},
-  {"b2k", batched<2048,0>, 1<<20}, {"b4k", batched<4096,0>, 1<<20}, {"b8k", batched<8192,0>, 1<<20}, {"b1k", batched<1024,0>, 1<<20},
-  {"b4kp", batched<4096,256>, 1<<20}, {"b2kp", batched<2048,256>, 1<<20}, {"b4kp1k", batched<4096,1024>, 1<<20},
-  {"p192c256k", chained<192,0>, 1<<18}, {"p192c64k", chained<192,0>, 1<<16}, {"p192c4m", chained<192,0>, 1<<22},
-};
-static double pass(const Case &c, int fd, size_t size, double *cycles) {
-  Gate *gt = (Gate *)mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-  for (int i = 0; i < 12; i++)
-    if (!fork()) {
-      u8 *window = (u8 *)mmap(0, c.chunk + 2 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-      static u32 log_space[(1 << 14) + 64];
-      u64 sum = 0, cyc = 0, lines = 0;
-      while (!gt->go.load()) _mm_pause();
-      for (;;) {
-        size_t off = gt->next.fetch_add(c.chunk);
-        if (off >= size) break;
-        size_t left = size - off;
-        mmap(window, std::min(c.chunk + 4096, left), PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, off);
-        u64 a = __rdtsc();
-        const u8 *line = window;
-        if (off) line = (const u8 *)memchr(window, '\n', left) + 1;
-        const u8 *end = window + std::min(c.chunk + 1, left);
-        lines += c.fn(line, end, log_space, sum);
-        cyc += __rdtsc() - a;
-      }
-      gt->sink.fetch_add(sum);
-      gt->cycles.fetch_add(cyc);
-      gt->lines.fetch_add(lines);
-      gt->done.fetch_add(1);
-      _exit(0);
-    }
-  while (false) {}
-  double a = now_ms();
-  gt->go.store(1);
-  while (gt->done.load() < 12) _mm_pause();
-  double t = now_ms() - a;
-  *cycles = (double)gt->cycles.load() / gt->lines.load();
-  while (wait(nullptr) > 0) {}
-  munmap(gt, 4096);
-  return t;
-}
-static void run_all(int fd, size_t size) {
-  int shift = 0;
-  for (const char *want : {"p512", "p256", "p192p1024", "b2k"}) {
-    for (const Case &c : cases)
-      if (!strcmp(c.name, want)) {
-        double best = 1e18, cyc = 0;
-        for (int r = 0; r < 3; r++) {
-          double cy, v = pass(c, fd, size, &cy);
-          if (v < best) { best = v; cyc = cy; }
-        }
-        fprintf(stderr, "%s wall %.2f ms, %.1f cycles per line per worker\n", c.name, best, cyc);
-        long x = (long)((best - 6) / 0.25 + 0.5);
-        x = x < 0 ? 0 : x > 63 ? 63 : x;
-        code |= (u64)x << shift;
-        shift += 6;
-      }
-  }
-  fprintf(stderr, "code %llu mcode %llu tcode %llu\n", code, code & 16383, code >> 14);
-}
-}
-
 static void parse_chunk(size_t chunk, const u8 *line, const u8 *end, Head *heads) {
   u64 stamp = 0;
   size_t hour = 0, lowest = HOURS;
@@ -708,8 +536,6 @@ static void deliver(size_t hour, Text text) {
     if (write(out_fd, ready.data, ready.len) != (ssize_t)ready.len)
       abort();
     if (now + 1 == HOURS) {
-      if (is_first)
-        probe::report(probe::code);
       g.finished.store(true);
       _exit(0);
     }
@@ -802,8 +628,6 @@ int main(int argc, char **) {
   workers = CPU_COUNT(&cpus);
   mmap(&g, sizeof g, PROT_READ | PROT_WRITE,
        MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-  probe::run_all(in_fd, input_size);
-  memset(&g, 0, sizeof g);
   chunk_count = (input_size + CHUNK - 1) / CHUNK;
   chunk_states = (ChunkState *)map_zeroed(chunk_count * sizeof(ChunkState) + PAGE, MAP_SHARED);
   // A line with a big latency takes two slots and over 40 bytes, which bounds any
@@ -827,5 +651,5 @@ int main(int argc, char **) {
       start_over();
     _mm_pause();
   }
-  probe::report(probe::code);
+  _exit(0);
 }
