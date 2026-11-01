@@ -11,7 +11,7 @@
 #include <string_view>
 #include <sys/mman.h>
 #include <sys/prctl.h>
-#include <pthread.h>
+#include <thread>
 #include <unistd.h>
 
 using u8 = uint8_t;
@@ -235,9 +235,6 @@ static void parse_chunk(size_t chunk, const u8 *line, const u8 *end, u32 **heads
   u32 *at = heads[0];
   const v4 space_vector = _mm256_set1_epi8(' ');
   while (line < end) {
-    // The bytes are in the second level cache by now, and each load that has to wait
-    // for them holds up finding the next line.
-    _mm_prefetch((const char *)line + 192, _MM_HINT_T0);
     // These bytes hold the month, day and hour. Nearly every line has the hour
     // of the line before it, as the file is the shards' chunks in arrival order.
     u64 now = load64(line + 5);
@@ -581,12 +578,8 @@ int main(int argc, char **) {
   capacity = (3 * (input_size / 20 + workers * BLOCK) + (1 << 17)) & -1024;
   regions = (u32 *)map_zeroed(std::size(free_regions) * capacity * sizeof(u32));
   out_fd = open("/out/summary.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  // A small input can be finished before the last thread starts, which then fails
-  // because the process is exiting, so that is not treated as an error.
-  for (int w = 1; w < workers; w++) {
-    pthread_t thread;
-    pthread_create(&thread, nullptr, [](void *) -> void * { worker(); return nullptr; }, nullptr);
-  }
+  for (int w = 1; w < workers; w++)
+    std::thread(worker).detach();
   worker();
   // The thread writing the last hour ends the process, so this one just waits.
   for (;;)
