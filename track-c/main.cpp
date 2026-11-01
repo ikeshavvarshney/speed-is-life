@@ -41,7 +41,6 @@ const size_t MAX_RECORDS = MAX_MARKS / 5 + 1;
 struct alignas(64) Group {
   u64 sums[4] = {};
   int min = INT32_MAX, max = INT32_MIN;
-  u32 distinct = 0;
 };
 
 // Counters that every thread writes, away from what records read.
@@ -51,10 +50,9 @@ struct alignas(64) Counter {
 };
 
 struct Rec {
-  v4 sums;
+  __m128i values; // id, amount, name bytes, note bytes
   u64 hash;
   u32 region;
-  int amount;
 };
 
 // Input mapped over a larger anonymous mapping, so vector loads near the end of
@@ -87,11 +85,11 @@ static atomic<u64> *slots;
 static atomic<u64> *name_bits;
 static Group *groups;
 static int threads;
-static cpu_set_t all_cpus;
 static atomic<u8> seen_codes[26 * 26 * 26];
 static std::mutex codes_lock;
 static std::vector<std::string> codes;
-static Counter next_region, next_chunk, next_unmap;
+static atomic<u32> distinct_names[COUNTRIES];
+static Counter next_region, next_chunk, next_country, next_unmap;
 
 // Claims pieces of regions.csv. by_id holds 1 + the country's index, and 0 for
 // anything unknown. Its last entry stays 0 and stands for every id above the
@@ -136,15 +134,20 @@ INLINE u64 load64(const u8 *p) {
 // positions zeroed. Field lengths are known from the structural masks, so
 // nothing branches on the number of digits.
 INLINE u64 digit_word(const u8 *end, size_t len) {
-  return load64(end - 8) & (~0ull << ((8 - len) * 8));
+  return load64(end - 8) & (~0ull << (-(len * 8) & 63));
 }
 
 // Converts three words of eight digits together. Each step merges pairs: digits
 // to 2-digit values, then 4, then 8. Three scalar conversions would queue on the
 // one multiply port.
 INLINE v4 decode(u64 a, u64 b, u64 c) {
-  v4 digits = _mm256_and_si256(_mm256_set_epi64x(0, c, b, a),
-                               _mm256_set1_epi8(15));
+  // In the amount's lane, `ddddd.cc` loses its dot, which leaves plain cents.
+  const v4 drop_dot = _mm256_setr_epi8(
+      0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, //
+      -1, 0, 1, 2, 3, 4, 6, 7, -1, -1, -1, -1, -1, -1, -1, -1);
+  v4 digits = _mm256_shuffle_epi8(
+      _mm256_and_si256(_mm256_set_epi64x(0, c, b, a), _mm256_set1_epi8(15)),
+      drop_dot);
   v4 x = _mm256_maddubs_epi16(digits, _mm256_set1_epi16(0x010A));
   x = _mm256_madd_epi16(x, _mm256_set1_epi32(0x00010064));
   x = _mm256_packus_epi32(x, x);
@@ -155,18 +158,21 @@ INLINE v4 decode(u64 a, u64 b, u64 c) {
 alignas(64) static u8 LOW_BYTES[64];
 
 // Up to 32 bytes are masked and mixed at a fixed cost, as a loop per word would
-// mispredict on names of varying length. Longer names, which are rare, loop over
-// the rest. Every byte passes through at least three AES rounds after it enters,
-// as two left crafted names colliding, which would change a count.
-INLINE u64 hash_name(const u8 *p, size_t len) {
-  auto mask = (const v4 *)(LOW_BYTES + 32 - std::min<size_t>(len, 32));
-  v4 bytes = _mm256_and_si256(_mm256_loadu_si256((const v4 *)p),
-                              _mm256_loadu_si256(mask));
-  __m128i key =
-      _mm_set_epi64x(0x8BB84B93962EACC9, 0x2D358DCCAA6C78A5 ^ (long long)len);
-  __m128i low = _mm_xor_si128(_mm256_castsi256_si128(bytes), key);
-  __m128i state = _mm_aesenc_si128(low, _mm256_extracti128_si256(bytes, 1));
-  for (size_t i = 32; i < len; i += 16) {
+// mispredict on names of varying length. Longer names, which never occur in
+// practice, take the loop. Names hold no NUL, so the padding cannot make two
+// names equal and the length need not be mixed in. Every byte passes through at
+// least three AES rounds after it enters, as two left crafted names colliding,
+// which would change a count.
+INLINE u64 hash_name(const u8 *p, size_t len, __m128i key) {
+  v4 bytes = _mm256_loadu_si256((const v4 *)p);
+  auto mask = (const v4 *)(LOW_BYTES + 32 - len);
+  if (len > 32) [[unlikely]]
+    mask = (const v4 *)LOW_BYTES;
+  bytes = _mm256_and_si256(bytes, _mm256_loadu_si256(mask));
+  __m128i state = _mm_aesenc_si128(
+      _mm_xor_si128(_mm256_castsi256_si128(bytes), key),
+      _mm256_extracti128_si256(bytes, 1));
+  for (size_t i = 32; i < len; i += 16) [[unlikely]] {
     auto tail = LOW_BYTES + 32 - std::min<size_t>(len - i, 16);
     state = _mm_aesenc_si128(
         state, _mm_and_si128(_mm_loadu_si128((const __m128i *)(p + i)),
@@ -215,7 +221,10 @@ INLINE size_t intern(u64 hash) {
 static void parse_chunk(size_t first, size_t stop, Group *mine) {
   const u8 *base = input;
   const u8 *ids = by_id;
-  const u32 top = last_region;
+  const __m128i top = _mm_set1_epi32(last_region);
+  const __m128i three = _mm_setr_epi16(3, 0, 3, 0, 0, 0, 0, 0);
+  const __m128i key = _mm_set_epi64x(0x8BB84B93962EACC9, 0x2D358DCCAA6C78A5);
+  const auto table = slots;
   u32 marks[MAX_MARKS];
   // Number of "" pairs in the field each mark ends. It stays mostly zero.
   u32 pairs[MAX_MARKS + 1] = {};
@@ -224,6 +233,7 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
       -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 10, -1, 44, -1, -1, -1, //
       -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 10, -1, 44, -1, -1, -1);
   const v4 quote = _mm256_set1_epi8('"');
+  const v4 one_count = _mm256_set_epi64x(0, 1ll << 32, 0, 0);
   auto mask = [](v4 x, v4 y) -> u64 {
     return (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y));
   };
@@ -274,32 +284,41 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
         break;
       }
       const u32 *m = marks + r * 5;
-      size_t c1 = m[0], c2 = m[1], c3 = m[2], c4 = m[3], lf = m[4];
-      size_t id_at = start + 3 * (base[start] == 0xEF);
-      u32 name_raw = c2 - c1 - 1, note_raw = c3 - c2 - 1;
-      name_raw -= std::min(name_raw, 2u);
-      note_raw -= std::min(note_raw, 2u);
-      size_t end = lf - (base[lf - 1] == '\r');
-      int negative = base[c4 + 1] == '-';
-      u64 text = digit_word(base + end, end - c4 - 1 - negative);
-      v4 numbers = decode(digit_word(base + c1, c1 - id_at),
-                          digit_word(base + c4, c4 - c3 - 1), text << 24);
+      size_t c1 = m[0], c4 = m[3], lf = m[4];
+      // One subtraction gives every field's length plus one. Taking 3 saturating
+      // removes a separator and two quotes, and leaves an empty field at 0.
+      // Fields are far below 64 KB, so 16 bits are enough here.
+      __m128i at = _mm_loadu_si128((const __m128i *)m);
+      __m128i gaps =
+          _mm_sub_epi32(_mm_loadu_si128((const __m128i *)(m + 1)), at);
+      __m128i raw = _mm_subs_epu16(gaps, three);
+      // Rare enough for a branch to cost less than a calculation every time.
+      if (base[start] == 0xEF) [[unlikely]]
+        start += 3;
+      size_t end = lf - (base[lf - 1] == '\r'), amount_at = c4 + 1;
+      int sign = 0;
+      if (base[amount_at] == '-') [[unlikely]] {
+        sign = -1;
+        amount_at++;
+      }
+      v4 numbers = decode(digit_word(base + c1, c1 - start),
+                          digit_word(base + c4, c4 - m[2] - 1),
+                          digit_word(base + end, end - amount_at));
       __m128i low = _mm256_castsi256_si128(numbers);
-      u32 id = _mm_cvtsi128_si32(low);
-      u32 region = std::min<u32>(_mm_extract_epi32(low, 1), top);
-      u32 whole_part = _mm256_extract_epi32(numbers, 4);
-      int cents = whole_part * 100 + ((text >> 48) & 15) * 10 + (text >> 56 & 15);
-      int amount = (cents ^ -negative) + negative;
-      u64 hash = hash_name(base + c1 + 2, name_raw);
-      _mm_prefetch((const char *)(ids + region), _MM_HINT_T0);
-      _mm_prefetch((const char *)(slots + (hash >> (67 - NAME_BITS)) * 8),
+      __m128i region = _mm_min_epu32(_mm_srli_si128(low, 4), top);
+      int amount = (_mm256_extract_epi32(numbers, 4) ^ sign) - sign;
+      u32 region_id = _mm_cvtsi128_si32(region);
+      u64 hash = hash_name(base + c1 + 2, (u32)_mm_cvtsi128_si32(raw), key);
+      _mm_prefetch((const char *)(ids + region_id), _MM_HINT_T0);
+      _mm_prefetch((const char *)(table + (hash >> (67 - NAME_BITS)) * 8),
                    _MM_HINT_T0);
-      recs[n].sums = _mm256_set_epi64x(
-          note_raw - pairs[r * 5 + 2],
-          (1ll << 32) | (name_raw - pairs[r * 5 + 1]), amount, id);
+      // `raw` less the "" pairs is the two text lengths.
+      __m128i texts = _mm_sub_epi32(
+          raw, _mm_loadu_si128((const __m128i *)(pairs + r * 5 + 1)));
+      recs[n].values =
+          _mm_unpacklo_epi64(_mm_insert_epi32(low, amount, 1), texts);
       recs[n].hash = hash;
-      recs[n].region = region;
-      recs[n++].amount = amount;
+      recs[n++].region = region_id;
       start = lf + 1;
     }
     // Group prefetching: this pass touches only what the pass above prefetched,
@@ -308,9 +327,13 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
       const Rec &rec = recs[r];
       Group &group = mine[ids[rec.region]];
       auto sums = (v4 *)group.sums;
-      _mm256_store_si256(sums, _mm256_add_epi64(*sums, rec.sums));
-      group.min = std::min(group.min, rec.amount);
-      group.max = std::max(group.max, rec.amount);
+      // Every value but the amount is positive, so sign extending suits them all.
+      _mm256_store_si256(
+          sums, _mm256_add_epi64(*sums, _mm256_add_epi64(one_count,
+                                        _mm256_cvtepi32_epi64(rec.values))));
+      int amount = _mm_extract_epi32(rec.values, 1);
+      group.min = std::min(group.min, amount);
+      group.max = std::max(group.max, amount);
       size_t name = intern(rec.hash);
       size_t word = ids[rec.region] * WORDS + name / 64;
       __builtin_prefetch(name_bits + word, 1);
@@ -319,12 +342,11 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
     }
     // A set bit costs no write, and a write costs a locked instruction that
     // often has to fetch the line from another core, so it is the last step.
-    // Whichever thread sets a bit counts that name for the country.
     for (size_t r = 0; r < n; r++) {
       auto &word = name_bits[recs[r].hash];
       u64 bit = 1ull << recs[r].region;
       if (!(word.load(relaxed) & bit))
-        mine[recs[r].hash / WORDS].distinct += !(word.fetch_or(bit, relaxed) & bit);
+        word.fetch_or(bit, relaxed);
     }
     if (done || start >= stop)
       return;
@@ -350,16 +372,6 @@ static size_t first_record(size_t off) {
 }
 
 static void worker(int index, std::barrier<> *barrier) {
-  // Runs are too short for the scheduler to settle: one thread on each CPU from
-  // the start, and no thread leaves the caches it filled.
-  int cpu = -1;
-  for (int seen = 0; seen <= index; seen++)
-    while (!CPU_ISSET(++cpu, &all_cpus))
-      ;
-  cpu_set_t one;
-  CPU_ZERO(&one);
-  CPU_SET(cpu, &one);
-  sched_setaffinity(0, sizeof one, &one);
   load_regions();
   barrier->arrive_and_wait();
   Group *mine = groups + index * COUNTRIES;
@@ -386,6 +398,16 @@ static void worker(int index, std::barrier<> *barrier) {
     madvise((void *)(input + off), std::min(UNMAP_STEP, input_size - off),
             MADV_DONTNEED);
   }
+
+  for (;;) {
+    size_t country = next_country.take(1);
+    if (country >= COUNTRIES)
+      return;
+    u32 distinct = 0;
+    for (size_t i = 0; i < WORDS; i++)
+      distinct += __builtin_popcountll(name_bits[country * WORDS + i].load(relaxed));
+    distinct_names[country].store(distinct, relaxed);
+  }
 }
 
 static char *money(char *out, long long cents) {
@@ -396,8 +418,9 @@ static char *money(char *out, long long cents) {
 
 int main() {
   memset(LOW_BYTES, 255, 32);
-  sched_getaffinity(0, sizeof all_cpus, &all_cpus);
-  threads = CPU_COUNT(&all_cpus);
+  cpu_set_t cpus;
+  sched_getaffinity(0, sizeof cpus, &cpus);
+  threads = CPU_COUNT(&cpus);
   regions = map_input("/data/regions.csv", regions_size);
   input = map_input("/data/records.csv", input_size);
   size_t line = regions_size - 1;
@@ -443,7 +466,6 @@ int main() {
         total.sums[i] += from.sums[i];
       total.min = std::min(total.min, from.min);
       total.max = std::max(total.max, from.max);
-      total.distinct += from.distinct;
     }
     u64 count = total.sums[2] >> 32;
     if (!count)
@@ -453,7 +475,7 @@ int main() {
     out = money(out, (long long)total.sums[1]);
     out = money(out, total.min);
     out = money(out, total.max);
-    out += sprintf(out, " %u %u %llu\n", total.distinct,
+    out += sprintf(out, " %u %u %llu\n", distinct_names[country].load(relaxed),
                    (u32)total.sums[2], (unsigned long long)total.sums[3]);
   }
   int fd = open("/out/aggregates.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
