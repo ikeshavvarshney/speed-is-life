@@ -299,6 +299,7 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
       int amount = (_mm256_extract_epi32(numbers, 4) ^ sign) - sign;
       u32 region_id = _mm_cvtsi128_si32(region);
       u64 hash = hash_name(base + c1 + 2, (u32)_mm_cvtsi128_si32(raw), key);
+      _mm_prefetch((const char *)(ids + region_id), _MM_HINT_T0);
       _mm_prefetch((const char *)(table + (hash >> (67 - NAME_BITS)) * 8),
                    _MM_HINT_T0);
       // `raw` less the "" pairs is the two text lengths.
@@ -401,7 +402,6 @@ static void worker(int index, std::barrier<> *barrier) {
       distinct += __builtin_popcountll(name_bits[country * WORDS + i].load(relaxed));
     distinct_names[country].store(distinct, relaxed);
   }
-  barrier->arrive_and_wait();
 }
 
 static char *money(char *out, long long cents) {
@@ -433,9 +433,12 @@ int main() {
   prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
   groups = (Group *)zeroed(threads * COUNTRIES * sizeof(Group));
   std::barrier barrier(threads);
+  std::thread pool[threads];
   for (int t = 1; t < threads; t++)
-    std::thread(worker, t, &barrier).detach();
+    pool[t] = std::thread(worker, t, &barrier);
   worker(0, &barrier);
+  for (int t = 1; t < threads; t++)
+    pool[t].join();
 
   // Countries in code order are already sorted, and _UNMATCHED sorts last.
   char text[32768], *out = text;
