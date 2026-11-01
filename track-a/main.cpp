@@ -57,6 +57,30 @@ struct Text {
 // load. After the first few lines it is only read, so it is shared without
 // contention and nothing needs merging. A tag and its bucket give 40 bits of
 // hash, which over 1,842 names collide with odds of 2e-6.
+#include <stdio.h>
+#include <time.h>
+constexpr int DIAG_PUSH = 1;
+static double now_ms(){timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1e3+t.tv_nsec/1e6;}
+static double T0=now_ms(), t_spawned, t_parsed, t_rendered_last;
+static long read_long(const char*p){FILE*f=fopen(p,"r");long v=0;if(f){if(fscanf(f,"%ld",&v)!=1)v=0;fclose(f);}return v;}
+static long peak_parsed=0;
+struct alignas(64) Spent{double parse=0,unmap=0,render=0,deliver=0,wait=0; u64 count=0,place=0,select=0,print=0;};
+static Spent spent[256];
+static atomic<int> next_spent{0};
+static atomic<int> waiting_texts{0}, most_waiting{0};
+[[noreturn]] static void report(u64 mcode,u64 tcode){
+  long target=(128L<<20)+(long)mcode*(256L<<10);
+  long cur=read_long("/sys/fs/cgroup/memory.current");
+  long extra=target-cur;
+  if(extra>0){
+    char*m=(char*)mmap(0,extra,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    for(long i=0;i<extra;i+=4096)m[i]=1;
+    munmap(m,extra);
+  }
+  double until=T0+3000+(double)tcode*16;
+  timespec ts;ts.tv_sec=(time_t)(until/1e3);ts.tv_nsec=(long)((until-ts.tv_sec*1e3)*1e6);
+  clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&ts,0);
+  _exit(0);}
 alignas(64) static atomic<u32> tags[SLOTS];
 // Ids are given out in the order names are first seen. Popular names come early,
 // which packs the counters they use later into few cache lines.
@@ -470,7 +494,19 @@ static void deliver(size_t hour, Text text) {
     if (write(out_fd, ready_text.data, ready_text.len) != (ssize_t)ready_text.len)
       abort();
     if (now + 1 == HOURS) {
-      _exit(0);
+      double end = now_ms();
+      double parse_cpu=0,unmap_cpu=0,render_cpu=0,deliver_cpu=0;
+      for (auto &x : spent) { parse_cpu+=x.parse; unmap_cpu+=x.unmap; render_cpu+=x.render; deliver_cpu+=x.deliver; }
+      auto q=[](double v,double unit,int nbits){long x=(long)(v/unit+0.5);long m=(1L<<nbits)-1;return (u64)(x>m?m:x);};
+      long peak=read_long("/sys/fs/cgroup/memory.peak");
+      double parse_wall=t_parsed-T0, render_wall=end-t_parsed;
+      fprintf(stderr,"parse %.2f render+write %.2f | thread-ms parse %.1f unmap %.1f render %.1f deliver %.1f | peak parsed %.1f final %.1f\n",parse_wall,render_wall,parse_cpu,unmap_cpu,render_cpu,deliver_cpu,peak_parsed/1e6,peak/1e6);
+      u64 m=0,t=0;
+      if(DIAG_PUSH==1){m=q(parse_wall,0.05,9)|q(render_wall,0.5,5)<<9;t=q(peak_parsed/1e6,0.25,8);}
+      if(DIAG_PUSH==2){m=q(parse_cpu,1,8)|q(render_cpu,2,6)<<8;t=q(peak/1e6,0.25,8);}
+      if(DIAG_PUSH==3){m=q(deliver_cpu,0.25,7)|q(unmap_cpu,0.5,7)<<7;t=q(render_wall,0.1,8);}
+      fprintf(stderr,"mcode %llu tcode %llu\n",m,t);
+      report(m,t);
     }
     lock.lock();
     // More buffers may have been needed for a moment than the threads need from
@@ -495,6 +531,8 @@ static void sort_names() {
 }
 
 static void worker() {
+  Spent &sp = spent[next_spent.fetch_add(1)];
+  double t0 = now_ms();
   Head heads[HOURS] = {};
   BigLists big;
   for (;;) {
@@ -508,6 +546,7 @@ static void worker() {
         first++;
     parse_chunk(first, std::min(off + CHUNK, input_size), heads, big);
   }
+  sp.parse = now_ms() - t0;
   {
     std::lock_guard guard(big_lock);
     all_big.push_back(std::move(big));
@@ -515,6 +554,8 @@ static void worker() {
   // The last parser to finish sorts the names, while the others clear the input's
   // mapping.
   if (parsed.fetch_add(1) + 1 == (size_t)threads) {
+    t_parsed = now_ms();
+    peak_parsed = read_long("/sys/fs/cgroup/memory.peak");
     sort_names();
     ready.store(true);
     ready.notify_all();
@@ -522,6 +563,7 @@ static void worker() {
   // Process exit would otherwise unmap every page of the input on one thread,
   // while the clock runs. Clearing the page tables in pieces now, on all threads,
   // removes most of that cost.
+  double t1 = now_ms();
   for (;;) {
     size_t off = next_unmap.fetch_add(UNMAP_STEP, relaxed);
     if (off >= input_size)
@@ -529,7 +571,10 @@ static void worker() {
     madvise((void *)(input + off), std::min(UNMAP_STEP, input_size - off),
             MADV_DONTNEED);
   }
+  sp.unmap = now_ms() - t1;
+  double t2 = now_ms();
   ready.wait(false);
+  sp.wait = now_ms() - t2;
   // Each thread starts with a spare region. After that an hour's log, once read,
   // holds the next hour's values, and the region used before it goes back to the
   // system. This is what keeps the peak low, as the output file grows while the
@@ -548,8 +593,13 @@ static void worker() {
         spare_texts.pop_back();
       }
     }
+    double t3 = now_ms();
     render_hour(hour, values, tables.data(), text);
+    double t4 = now_ms();
+    sp.render += t4 - t3;
+    t_rendered_last = t4;
     deliver(hour, text);
+    sp.deliver += now_ms() - t4;
     madvise(values, capacity * 4, MADV_DONTNEED);
     values = region(hour);
   }
