@@ -241,19 +241,26 @@ INLINE void parse_line(Walk &walk, size_t &lowest) {
 // work on a line from each at once.
 static size_t parse_chunk(const u8 *line, const u8 *end, u32 **heads) {
   size_t lowest = HOURS;
-  const u8 *mid = std::find(line + (end - line) / 2, end, '\n');
+  const u8 *mid = std::find(line + (end - line) / 3, end, '\n');
   mid += mid < end;
+  const u8 *mid2 = std::find(line + (end - line) * 2 / 3, end, '\n');
+  mid2 += mid2 < end;
   Walk a{line, heads, heads[0]}, b{mid, heads + HOURS, heads[HOURS]};
-  while (a.line < mid && b.line < end) {
+  Walk c{mid2, heads + HOURS * 2, heads[HOURS * 2]};
+  while (a.line < mid && b.line < mid2 && c.line < end) {
     parse_line(a, lowest);
     parse_line(b, lowest);
+    parse_line(c, lowest);
   }
   while (a.line < mid)
     parse_line(a, lowest);
-  while (b.line < end)
+  while (b.line < mid2)
     parse_line(b, lowest);
+  while (c.line < end)
+    parse_line(c, lowest);
   a.heads[a.hour] = a.at;
   b.heads[b.hour] = b.at;
+  c.heads[c.hour] = c.at;
   return lowest;
 }
 
@@ -474,7 +481,7 @@ static bool parse_or_clear(u32 **heads) {
 }
 
 static void worker() {
-  u32 *heads[HOURS * 2] = {};
+  u32 *heads[HOURS * 3] = {};
   for (;;) {
     size_t hour = next_task();
     if (hour < HOURS) {
@@ -509,14 +516,14 @@ int main(int argc, char **) {
   // A line with a big latency takes two slots and over 40 bytes, which bounds any
   // hour however the lines are spread. A region can hold an hour's values and the
   // scratch space for answering it, or its text, in whole pages.
-  capacity = (3 * (input_size / 20 + WORKERS * 2 * BLOCK) + (1 << 17)) & -1024;
+  capacity = (3 * (input_size / 20 + WORKERS * 3 * BLOCK) + (1 << 17)) & -1024;
   regions = (u32 *)map_zeroed(std::size(pool) * capacity * 4);
   int out = open("/out/summary.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
   for (size_t w = 1; w < WORKERS; w++)
     std::thread(worker).detach();
   // This thread alone writes, in order, and parses while the next hour is not ready.
   // Writing the last hour ends the process, which needs no threads to be joined.
-  u32 *heads[HOURS * 2] = {};
+  u32 *heads[HOURS * 3] = {};
   for (size_t hour = 0; hour < HOURS;) {
     u32 size = text_sizes[hour];
     if (size) {
