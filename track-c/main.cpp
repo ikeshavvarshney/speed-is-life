@@ -34,7 +34,7 @@ const size_t WORDS = (1 << NAME_BITS) / 64;
 // The shortest record is 11 bytes and has 5 marks, so a batch holds at most 466
 // marks, plus 4 left over and 8 written past the last.
 const size_t BLOCKS = 16, MAX_MARKS = 512, MAX_RECORDS = MAX_MARKS / 5 + 1;
-const size_t PARTS = 16, PENDING = 64;
+const size_t PARTS = 64, PENDING = 32;
 
 // One worker's running values for one country, on one cache line. `sums` is
 // added to as one vector: id sum, amount sum, count << 32 | name bytes, note
@@ -235,7 +235,7 @@ static void flush(Pending &pending, size_t part) {
     _mm_pause();
   const u32 *bits = pending.bits[part];
   for (u32 i = 0; i < pending.counts[part]; i++) {
-    __builtin_prefetch(mem.name_bits + (bits[i + 8] >> 6), 1);
+    __builtin_prefetch(mem.name_bits + (bits[i + 14] >> 6), 1);
     mem.name_bits[bits[i] >> 6] |= 1ull << (bits[i] & 63);
   }
   lock.clear(std::memory_order_release);
