@@ -55,13 +55,15 @@ struct Rec {
 static const u8 *map_input(const char *path, size_t &size) {
   int fd = open(path, O_RDONLY);
   size = lseek(fd, 0, SEEK_END);
-  void *base =
-      mmap(0, size + 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  mmap(base, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
+  // On a 2 MB boundary, so that each page table covers exactly 2 MB of the file.
+  size_t raw = (size_t)mmap(0, size + 4096 + HUGE_PAGE, PROT_READ,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  auto base = (const u8 *)((raw + HUGE_PAGE - 1) & -HUGE_PAGE);
+  mmap((void *)base, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
   // Page tables for the first of it. See the note in main.
   for (size_t off = 0; off < std::min(size, 2 * HUGE_PAGE); off += HUGE_PAGE)
-    *((volatile const u8 *)base + off);
-  return (const u8 *)base;
+    *(volatile const u8 *)(base + off);
+  return base;
 }
 
 // Work split into pieces that threads claim as they become free. Threads wait by
@@ -83,6 +85,9 @@ struct Memory {
   Group groups[MAX_THREADS * COUNTRIES];
   u8 stacks[MAX_THREADS][STACK];
   alignas(4096) u8 lengths[COUNTRIES];
+  std::atomic_flag codes_lock;
+  int code_count;
+  atomic<bool> bits_ready;
   Job region_job, chunk_job, country_job;
   // One more than there are codes, so the last entry stands for _UNMATCHED.
   atomic<u8> seen_codes[CODES + 1];
@@ -92,8 +97,6 @@ struct Memory {
 
 static const u8 *input, *regions;
 static size_t input_size, regions_size, threads;
-static std::atomic_flag codes_lock;
-static int code_count;
 
 template <class F> INLINE void run(Job &job, size_t size, size_t step, F f) {
   for (size_t i; (i = job.next.fetch_add(step, relaxed)) < size; job.done += step)
@@ -115,13 +118,13 @@ static void load_regions(size_t off) {
     const u8 *c = regions + i + 1;
     int key = (c[0] - 'A') * 676 + (c[1] - 'A') * 26 + c[2] - 'A';
     if (!mem.seen_codes[key].load(relaxed)) {
-      while (codes_lock.test_and_set(std::memory_order_acquire))
+      while (mem.codes_lock.test_and_set(std::memory_order_acquire))
         _mm_pause();
       if (!mem.seen_codes[key].load(relaxed)) {
-        memcpy(mem.code_of[++code_count], c, 3);
-        mem.seen_codes[key].store(code_count, relaxed);
+        memcpy(mem.code_of[++mem.code_count], c, 3);
+        mem.seen_codes[key].store(mem.code_count, relaxed);
       }
-      codes_lock.clear(std::memory_order_release);
+      mem.codes_lock.clear(std::memory_order_release);
     }
     mem.by_id[id] = mem.seen_codes[key].load(relaxed);
     i += 5;
@@ -417,6 +420,8 @@ static void finish_country(size_t country) {
 // keeps none. Returning ends the thread with no stack to unmap or free.
 static int worker(void *index) {
   run(mem.region_job, regions_size - 1, REGION_CHUNK, load_regions);
+  while (!mem.bits_ready)
+    _mm_pause();
   // See the note in main. The other threads start at the file's start, and this
   // moves far faster than they do, so it stays ahead of them.
   if (!index)
@@ -448,8 +453,9 @@ int main() {
   // counts the reserve. So this thread faults what the workers would otherwise
   // be charged for: the huge pages, the small pages they write, and page tables
   // for the input, of which thread 0 makes the rest as they start on it.
-  for (size_t page = 0; page < 3; page++)
-    ((volatile u8 *)&mem)[page * HUGE_PAGE] = 0;
+  auto clear_page = [](int page) { ((volatile u8 *)&mem)[page * HUGE_PAGE] = 0; };
+  clear_page(0);
+  clear_page(2);
   madvise(mem.lengths, 1 << 16, MADV_POPULATE_WRITE);
   // Here and not in the workers, as a late one must not be merged half made.
   for (Group &group : mem.groups)
@@ -458,6 +464,9 @@ int main() {
     clone(worker, mem.stacks[t] + STACK,
           CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD,
           (void *)t);
+  // Only the bitsets are on this page, so the workers can load regions meanwhile.
+  clear_page(1);
+  mem.bits_ready = true;
   worker(0);
 
   // Countries in code order are already sorted, and _UNMATCHED sorts last.
