@@ -561,7 +561,6 @@ static void parse_docs(Scratch &scratch) {
     size_t at = doc / LINE_DOCS * LINE_WORDS;
     for (size_t row = 0; row < high; row++) {
       u64 *from = lines + row * LINE_WORDS, *to = high_bits + row * row_words + at;
-      __builtin_prefetch(to + 8 * row_words, 1);
       v4 a = load(from), b = load(from + 4), any = _mm256_or_si256(a, b);
       // Terms that barely occur keep their pages untouched.
       if (!_mm256_testz_si256(any, any)) {
@@ -579,10 +578,6 @@ static void parse_docs(Scratch &scratch) {
     if (!((size_t)head & (LOG_BLOCK - 1))) {
       head = claim_log_block(part);
       *head++ = group << 1 | 1;
-      // These lines are mostly in the cache of whichever thread faulted the page. Stores
-      // commit in order, so one waiting for such a line would hold up all the others.
-      for (size_t at = 64; at < LOG_BLOCK; at += 64)
-        __builtin_prefetch((u8 *)head + at - 2, 1);
     }
     heads[part] = head;
   };
