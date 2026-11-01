@@ -30,7 +30,7 @@ const size_t CHUNK = 1 << 18, CLEAR_STEP = 1 << 23, HOURS = 72, BLOCK = 256;
 const size_t SLOTS = 1 << 13, MAX_IDS = 1 << 11, NONE = -1;
 // The stack each thread gets, of which the top is real from the start. A pool of this
 // many regions of this size covers what the last hours need together.
-const size_t STACK = 1 << 16, STACK_TOUCHED = 1 << 14, POOL = 20, WARM = 376 << 10;
+const size_t STACK = 1 << 16, STACK_TOUCHED = 1 << 14, POOL = 16, WARM = 376 << 10;
 // A log entry is id << 21 | is_error << 20 | latency. A latency that does not fit,
 // on about 1% of lines, puts BIG in the entry and takes the next slot whole. An
 // all-zero entry is an unused part of a block, and id 0 is reserved to absorb it.
@@ -170,7 +170,13 @@ static u32 *take_region() {
   return pooled ? pool[--pooled] : regions + carved++ * capacity;
 }
 
+// The output file grows until the end, so that is when the peak is set. Near the end a
+// region is released if enough warm ones are free, so no worker has to fault one again.
 static void give_region(const void *region) {
+  if (next_hour >= HOURS * 5 / 6 && pooled >= 3) {
+    madvise((void *)region, capacity * 4, MADV_DONTNEED);
+    return;
+  }
   std::lock_guard guard(plan_lock);
   pool[pooled++] = (u32 *)region;
 }
@@ -509,7 +515,7 @@ int main(int argc, char **) {
   // hour however the lines are spread. A region can hold an hour's values and the
   // scratch space for answering it, or its text, in whole pages.
   capacity = (3 * (input_size / 20 + WORKERS * 2 * BLOCK) + (1 << 17)) & -1024;
-  regions = (u32 *)map_zeroed(std::size(pool) * capacity * 4);
+  regions = (u32 *)map_zeroed(2 * std::size(pool) * capacity * 4);
   name_bytes = (char *)map_zeroed(MAX_IDS * 128);
   char *stacks = (char *)map_zeroed(WORKERS * STACK);
   // Each CPU that charges memory keeps up to 256 KB charged in reserve, which counts
