@@ -21,6 +21,7 @@ using u32 = uint32_t;
 using u64 = unsigned long long;
 using v4 = __m256i;
 using v2 = __m128i;
+using unaligned_u64 [[gnu::aligned(1), gnu::may_alias]] = u64;
 using std::atomic;
 constexpr auto relaxed = std::memory_order_relaxed;
 #define INLINE [[gnu::always_inline]] inline
@@ -45,26 +46,9 @@ const size_t MAX_IDS = 1 << 11;
 const u64 DIGITS = 0x3030303030303030;
 const size_t NO_RANK = -1;
 
-// Held for a few instructions, with no more threads than CPUs, so waiting in the
-// kernel would cost far more than spinning.
-struct SpinLock {
-  atomic<bool> held;
-  void lock() {
-    while (held.exchange(true, std::memory_order_acquire))
-      while (held.load(relaxed))
-        _mm_pause();
-  }
-  void unlock() { held.store(false, std::memory_order_release); }
-};
 struct Name {
   u32 at;
   u16 len, id;
-};
-// What the thread that parsed a chunk leaves for the one that plans the hours.
-struct ChunkState {
-  atomic<bool> done;
-  u8 lowest_hour;
-  u16 first_minute;
 };
 struct Text {
   u8 *data;
@@ -79,7 +63,7 @@ struct Text {
 // the counters they use later into few cache lines.
 alignas(64) static atomic<u64> table[SLOTS];
 // Names in the order they were found, and sorted up to `sorted_names`.
-static SpinLock names_lock;
+static std::mutex names_lock;
 static Name order[MAX_IDS];
 static size_t name_count, sorted_names, name_end;
 alignas(64) static char name_bytes[MAX_IDS * 128];
@@ -90,7 +74,7 @@ alignas(64) static atomic<u32 *> bases[HOURS];
 alignas(64) static atomic<size_t> next_chunk;
 // Guards the rest: how far parsing has got, which hours are over and taken, the free
 // regions and the turn to write.
-alignas(64) static SpinLock plan_lock;
+alignas(64) static std::mutex plan_lock;
 static size_t parsed_chunks, latest_minute, hours_over, next_hour, next_output;
 static size_t free_count, used_regions;
 static bool writing, speculating;
@@ -98,7 +82,10 @@ static Text waiting[HOURS];
 static u32 *free_regions[HOURS * 3];
 
 alignas(64) static size_t input_size, capacity, chunk_count;
-static ChunkState *chunk_states;
+// What the thread that parsed a chunk leaves for planning the hours: its first line's
+// minute, its lowest hour and a bit to say that it is done.
+static atomic<u32> *chunk_states;
+const u32 DONE = 1 << 31;
 static u32 *regions;
 static int out_fd;
 
@@ -107,11 +94,7 @@ alignas(64) static u8 masks[192];
 INLINE const u8 *low_bytes(size_t n) { return masks + 128 - n; }
 INLINE v4 load(const void *p) { return _mm256_loadu_si256((const v4 *)p); }
 INLINE void store(void *p, v4 v) { _mm256_storeu_si256((v4 *)p, v); }
-INLINE u64 load64(const u8 *p) {
-  u64 word;
-  memcpy(&word, p, 8);
-  return word;
-}
+INLINE u64 load64(const u8 *p) { return *(const unaligned_u64 *)p; }
 
 // Zeroed memory where only touched pages are real, with nothing reserved.
 static void *map_zeroed(size_t len) {
@@ -123,8 +106,7 @@ static void *map_zeroed(size_t len) {
 // identify the date: adding one and wrapping at 31 turns days 30, 31, 1, 2 into
 // 0, 1, 2, 3.
 static size_t hour_index(const u8 *line) {
-  auto at = [&](int i) -> size_t { return line[i] - '0'; };
-  return (at(8) * 10 + at(9) + 1) % 31 * 24 + at(11) * 10 + at(12) - 18;
+  return (line[8] * 10 + line[9] - 527) % 31 * 24 + line[11] * 10 + line[12] - 546;
 }
 
 // Bit i is set when byte i is a space, for the 64 bytes at `p`. Taking both
@@ -229,7 +211,7 @@ static u32 *claim_block(size_t hour) {
   return at;
 }
 
-static void parse_chunk(size_t chunk, const u8 *line, const u8 *end, u32 **heads) {
+static size_t parse_chunk(const u8 *line, const u8 *end, u32 **heads) {
   u64 stamp = 0;
   size_t hour = 0, lowest = HOURS;
   u32 *at = heads[0];
@@ -275,7 +257,7 @@ static void parse_chunk(size_t chunk, const u8 *line, const u8 *end, u32 **heads
     line = next;
   }
   heads[hour] = at;
-  chunk_states[chunk].lowest_hour = lowest;
+  return lowest;
 }
 
 // One layer of a sorting network: each lane is compared with the lane named in
@@ -508,14 +490,14 @@ static void deliver(size_t hour, Text text) {
 static size_t next_task() {
   std::lock_guard guard(plan_lock);
   for (; parsed_chunks < chunk_count; parsed_chunks++) {
-    ChunkState &chunk = chunk_states[parsed_chunks];
-    if (!chunk.done.load(std::memory_order_acquire))
+    u32 state = chunk_states[parsed_chunks].load(std::memory_order_acquire);
+    if (!(state & DONE))
       break;
-    if (chunk.lowest_hour < hours_over) {
+    if ((state >> 16 & 255) < hours_over) {
       execl("/proc/self/exe", "again", "again", nullptr);
       abort();
     }
-    latest_minute = std::max<size_t>(latest_minute, chunk.first_minute);
+    latest_minute = std::max<size_t>(latest_minute, state & 65535);
     if (speculating && latest_minute >= HOUR_GRACE)
       hours_over = std::max(hours_over, (latest_minute - HOUR_GRACE) / 60);
   }
@@ -547,11 +529,11 @@ static void worker() {
       if (off)
         line = (const u8 *)memchr(buffer, '\n', got) + 1;
       const u8 *end = buffer + std::min<size_t>(CHUNK + 1, got);
+      u32 minute = 0;
       if (line < end)
-        chunk_states[chunk].first_minute = hour_index(line) * 60 +
-                                           (line[14] - '0') * 10 + line[15] - '0';
-      parse_chunk(chunk, line, end, heads);
-      chunk_states[chunk].done.store(true, std::memory_order_release);
+        minute = hour_index(line) * 60 + line[14] * 10 + line[15] - 528;
+      size_t lowest = parse_chunk(line, end, heads);
+      chunk_states[chunk].store(DONE | lowest << 16 | minute, std::memory_order_release);
     } else if (hour > HOURS) {
       return;
     } else {
@@ -571,7 +553,7 @@ int main(int argc, char **) {
   sched_getaffinity(0, sizeof cpus, &cpus);
   int workers = CPU_COUNT(&cpus);
   chunk_count = (input_size + CHUNK - 1) / CHUNK;
-  chunk_states = (ChunkState *)map_zeroed(chunk_count * sizeof(ChunkState) + 1);
+  chunk_states = (atomic<u32> *)map_zeroed(chunk_count * 4 + 1);
   // A line with a big latency takes two slots and over 40 bytes, which bounds any
   // hour however the lines are spread. A region can hold an hour's values and the
   // scratch space for answering it, or its text, in whole pages.
