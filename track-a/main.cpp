@@ -25,8 +25,8 @@ constexpr auto relaxed = std::memory_order_relaxed;
 
 // The box's hardware threads.
 const int WORKERS = 12;
-const size_t CHUNK = 1 << 20, CLEAR_STEP = 1 << 23, HOURS = 72, BLOCK = 256;
-const size_t SLOTS = 1 << 13, MAX_IDS = 1 << 11;
+const size_t CHUNK = 1 << 18, CLEAR_STEP = 1 << 23, HOURS = 72, BLOCK = 256;
+const size_t SLOTS = 1 << 13, MAX_IDS = 1 << 11, KEEP = 1 << 18;
 // A chunk that starts this many minutes into an hour shows that the hour before is
 // over, as the spec has the last upload of an hour land within 10 minutes of its end.
 const size_t HOUR_GRACE = 10;
@@ -170,11 +170,10 @@ static u32 *take_region() {
   return free_count ? free_regions[--free_count] : regions + used_regions++ * capacity;
 }
 
-// The output file grows until the end, so that is when the peak is set. Only near the
-// end is memory left in a free region worth more to the score than the saved faults.
+// A free region stays warm up to the size most hours need, since faults cost more
+// time than that memory is worth, and gives back the rest.
 static void give_region(const void *region) {
-  if (next_hour >= HOURS * 5 / 6)
-    madvise((void *)region, capacity * 4, MADV_DONTNEED);
+  madvise((char *)region + KEEP, capacity * 4 - KEEP, MADV_DONTNEED);
   std::lock_guard guard(plan_lock);
   free_regions[free_count++] = (u32 *)region;
 }
