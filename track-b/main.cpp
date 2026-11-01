@@ -95,6 +95,20 @@ static u8 *reserve(size_t bytes) {
                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
 }
 
+// For what is used in full and touched all over, for the sake of the TLB. Huge pages
+// are off for the process, as a first touch elsewhere would charge 2 MB, so they are
+// turned on just to fault these, on one thread so no two threads race for a page.
+static u8 *huge_pages(size_t bytes) {
+  auto raw = (size_t)reserve(bytes + HUGE_PAGE);
+  auto aligned = (u8 *)((raw + HUGE_PAGE - 1) & -HUGE_PAGE);
+  madvise(aligned, bytes, MADV_HUGEPAGE);
+  prctl(PR_SET_THP_DISABLE, 0, 0, 0, 0);
+  for (size_t at = 0; at + HUGE_PAGE <= bytes; at += HUGE_PAGE)
+    aligned[at] = 0;
+  prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+  return aligned;
+}
+
 alignas(64) static u8 low_bytes[64];
 
 // The tail joins in early enough to reach every byte of the result.
@@ -405,16 +419,9 @@ static void plan_index() {
     chunk.lengths = {};
     chunk.hashes = {};
   }
-  // Twice the size of the draft, which leaves few displaced terms. Every token looks
-  // here, so this alone gets a huge page, for the sake of the TLB.
+  // Twice the size of the draft, which leaves few displaced terms.
   size_t table_size = (draft.mask + 1) * 2;
-  auto raw = (size_t)reserve(HUGE_PAGE * 2 + (table_size + TABLE_PADDING) * 8);
-  table = {(u64 *)((raw + HUGE_PAGE - 1) & -HUGE_PAGE), table_size - 1};
-  prctl(PR_SET_THP_DISABLE, 0, 0, 0, 0);
-  madvise(table.slots, (table_size + TABLE_PADDING) * 8, MADV_HUGEPAGE);
-  for (size_t at = 0; at < table_size + TABLE_PADDING; at += PAGE / 8)
-    table.slots[at] = 0;
-  prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+  table = {(u64 *)huge_pages((table_size + TABLE_PADDING) * 8), table_size - 1};
   for (auto *terms : {&hot, &cold})
     for (u32 at : *terms)
       table.insert(draft.hashes[at].load(relaxed),
@@ -517,7 +524,7 @@ static void parse_docs(Scratch &scratch) {
         token[i] = 0;
       for (size_t at = 1; at <= count; at++) {
         _mm_prefetch(table_slots + (tokens[at + PREFETCH_AHEAD] & table_mask),
-                     _MM_HINT_T1);
+                     _MM_HINT_T0);
         ids[at] = table.find(tokens[at]);
       }
       for (size_t i = 1; i <= 8; i++)
@@ -952,7 +959,7 @@ static void answer_queries(Scratch &scratch) {
 // Each run on one thread once all threads have arrived at the barrier.
 static void after_queries() {
   plan_index();
-  high_bits = (u64 *)reserve(high_terms * words * 8 + 64);
+  high_bits = (u64 *)huge_pages(high_terms * words * 8 + 64);
   partitions = low_terms / PARTITION_TERMS + 1;
   // A token takes at least 2 bytes of input, and 2 bytes here.
   log_span = (input_size + (1 << 24)) & -PAGE;
@@ -976,7 +983,7 @@ static void after_parsing() {
     for (const Hit &hit : scratch.hits)
       phrase_docs[cursors[hit.phrase]++] = hit.doc;
   phrases = {};
-  munmap(table.slots, HUGE_PAGE);
+  munmap(table.slots, (table.mask + 1 + TABLE_PADDING) * 8);
   munmap((void *)input, input_size + PAGE);
 }
 
