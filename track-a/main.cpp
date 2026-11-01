@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string_view>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
@@ -156,9 +157,10 @@ INLINE u64 hash_name(const u8 *p, size_t len) {
     h = _mm_aesenc_si128(h, _mm_and_si128(_mm_loadu_si128((const v2 *)(p + i)),
                                           _mm_loadu_si128(tail)));
   }
-  // One round only spreads a byte over four, so two are needed before keeping 64
-  // bits.
-  return _mm_cvtsi128_si64(_mm_aesenc_si128(_mm_aesenc_si128(h, seed), seed));
+  // Two rounds would spread each byte everywhere, but half of the state can still
+  // collide for names differing only along one of AES's diagonals. It takes three.
+  h = _mm_aesenc_si128(_mm_aesenc_si128(h, seed), seed);
+  return _mm_cvtsi128_si64(_mm_aesenc_si128(h, seed));
 }
 
 // Readers see a tag only after its id is in place, so they never read an id that
@@ -467,8 +469,9 @@ static void deliver(size_t hour, Text text) {
     lock.unlock();
     if (write(out_fd, ready_text.data, ready_text.len) != (ssize_t)ready_text.len)
       abort();
-    if (now + 1 == HOURS)
+    if (now + 1 == HOURS) {
       _exit(0);
+    }
     lock.lock();
     // More buffers may have been needed for a moment than the threads need from
     // now on, so the extra ones are given back rather than kept.
@@ -553,6 +556,9 @@ static void worker() {
 }
 
 int main() {
+  // The box has huge pages set to always, which charges 2 MB for a first touch of a
+  // thread stack or a small mapping, and more when threads race to fault one.
+  prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
   memset(masks, 255, 64);
   int fd = open("/data/requests.log", O_RDONLY);
   struct stat info;
@@ -567,8 +573,6 @@ int main() {
   capacity = (3 * (input_size / 40 + threads * BLOCK) + 2047) & -1024;
   size_t total = (HOURS + threads) * capacity * 4;
   logs = (u32 *)map_zeroed(total);
-  // These regions are sparse, and with huge pages each would take at least 2 MB.
-  madvise(logs, total, MADV_NOHUGEPAGE);
   // A file ending on a page boundary would fault on the vector loads near its end,
   // so the file is mapped over a slightly larger area of zeroed bytes.
   void *base = map_zeroed(input_size + 4096);
