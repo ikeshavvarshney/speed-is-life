@@ -232,8 +232,6 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
       // closing quote. A pair inside a value closes and at once reopens, while
       // fields always have a comma between them, so an opening quote right
       // after a closing quote is exactly a "" pair.
-      // Hardware prefetchers stop at page boundaries, and this one crosses them.
-      _mm_prefetch((const char *)(base + block + 512), _MM_HINT_T0);
       v4 x = _mm256_loadu_si256((const v4 *)(base + block));
       v4 y = _mm256_loadu_si256((const v4 *)(base + block + 32));
       u64 quotes = mask(x, quote) | mask(y, quote) << 32;
@@ -301,7 +299,6 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
       int amount = (_mm256_extract_epi32(numbers, 4) ^ sign) - sign;
       u32 region_id = _mm_cvtsi128_si32(region);
       u64 hash = hash_name(base + c1 + 2, (u32)_mm_cvtsi128_si32(raw), key);
-      _mm_prefetch((const char *)(ids + region_id), _MM_HINT_T0);
       _mm_prefetch((const char *)(table + (hash >> (67 - NAME_BITS)) * 8),
                    _MM_HINT_T0);
       // `raw` less the "" pairs is the two text lengths.
