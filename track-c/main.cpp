@@ -374,8 +374,9 @@ static void worker(int index, std::barrier<> *barrier) {
 
   // Process exit would otherwise unmap every page of the input on one thread,
   // while the clock runs. Clearing the page tables now, on all threads, removes
-  // most of that cost. Each country's turn takes one piece of it.
-  const size_t step = (input_size / COUNTRIES + 4096) & -4096;
+  // most of that cost. The first turns also take one piece of it each.
+  // Each call interrupts every thread to flush its TLB, so calls must be few.
+  const size_t step = 1 << 23;
   for (;;) {
     size_t country = next_country.fetch_add(1, relaxed);
     if (country >= COUNTRIES)
