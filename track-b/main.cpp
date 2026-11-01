@@ -26,7 +26,7 @@ using std::vector;
 constexpr auto relaxed = std::memory_order_relaxed;
 #define INLINE [[gnu::always_inline]] inline
 
-const size_t CHUNK = 1 << 19, QUERY_CHUNK = 1 << 14;
+const size_t CHUNK = 1 << 19, QUERY_CHUNK = 1 << 14, INPUT_PREFETCH = 512;
 const size_t HUGE_PAGE = 1 << 21;
 const size_t PAGE = 1 << 12, RELEASE_STEP = 1 << 22, PROBE_RATIO = 6;
 // Setting bits costs about half as much per id as a merge.
@@ -169,6 +169,8 @@ template <class F> INLINE const u8 *scan_line(const u8 *p, F &&visit) {
                                                 _mm256_cmpgt_epi8(digit, digit_top)));
   };
   for (;;) {
+    // The hardware prefetcher stops at page ends, and while later passes run on a document.
+    _mm_prefetch(p + INPUT_PREFETCH, _MM_HINT_T0);
     v4 first = load(p), second = load(p + 32);
     u64 tokens = token_mask(first) | (u64)token_mask(second) << 32;
     v4 low = _mm256_cmpeq_epi8(first, newline);
