@@ -42,6 +42,8 @@ const int ID_BITS = 18, TAG_SHIFT = 20, PAIR_BITS = 20;
 const u32 NO_ID = (1 << ID_BITS) - 1, ANCHOR = 1 << ID_BITS;
 const int DISPLACED_BIT = ID_BITS + 1;
 const u64 DISPLACED = ANCHOR << 1, TAG_MASK = ~0ull << TAG_SHIFT;
+// In place of a token: no term has this hash, and it ends a phrase comparison.
+const u64 NO_HASH = ~0ull;
 const size_t TABLE_PADDING = 1 << 10;
 const u32 OP_AND = 0, OP_OR = 1, OP_NOT = 2, OP_BITS = 2;
 
@@ -68,6 +70,7 @@ INLINE v4 add8(v4 a, v4 b) { return _mm256_add_epi8(a, b); }
 INLINE v4 add64(v4 a, v4 b) { return _mm256_add_epi64(a, b); }
 INLINE v4 shuffle(v4 a, v4 b) { return _mm256_shuffle_epi8(a, b); }
 INLINE u32 lanes(v4 x) { return _mm256_movemask_ps(_mm256_castsi256_ps(x)); }
+INLINE u32 lanes64(v4 x) { return _mm256_movemask_pd(_mm256_castsi256_pd(x)); }
 alignas(64) static u64 lane_orders[256];
 
 // Moves the lanes set in `mask` to the front, in order.
@@ -168,9 +171,11 @@ template <class F> INLINE const u8 *scan_line(const u8 *p, F &&visit) {
     if (newlines)
       return p + __builtin_ctzll(newlines) + 1;
     if (starts == 1) {
+      const u8 *start = p;
       p += 64;
       while (isalnum(*p))
         p++;
+      visit(start, long_token_hash(start, p - start));
     } else {
       p += starts ? __builtin_ctzll(starts) : 64;
     }
@@ -268,7 +273,7 @@ struct Phrases {
     return (pairs[bit / 64] >> (bit % 64)) & 1;
   }
 
-  // `tokens` holds the document's hashes, with a 0 before and after them.
+  // `tokens` holds the document's hashes, with NO_HASH before and after them.
   [[gnu::cold]] void check(size_t id, const u64 *tokens, size_t count, size_t token,
                            u32 doc, vector<Hit> &hits) const {
     for (u32 p = first_of_anchor[id]; p; p = next_of_anchor[p]) {
@@ -449,7 +454,7 @@ static void parse_docs(Scratch &scratch) {
   for (size_t part = 0; part < partitions; part++)
     heads[part] = claim_log_block(part);
   u64 *tokens = scratch.tokens;
-  u32 *ids = scratch.ids, *high_ids = scratch.high_ids, *low_ids = scratch.low_ids;
+  u32 *high_ids = scratch.high_ids, *low_ids = scratch.low_ids;
   const u64 *table_slots = table.slots;
   const size_t table_mask = table.mask;
   const u32 high = high_terms, low = low_terms;
@@ -485,9 +490,9 @@ static void parse_docs(Scratch &scratch) {
   const v4 miss = _mm256_set1_epi64x(NO_ID);
   const v4 found_mask = _mm256_set1_epi64x(NO_ID | ANCHOR);
   const v4 low_halves = _mm256_setr_epi32(0, 2, 4, 6, 0, 0, 0, 0);
-  const v4 id_mask = _mm256_set1_epi32(NO_ID);
-  const v4 high_limit = _mm256_set1_epi32(high);
-  const v4 list_limit = _mm256_set1_epi32(high + low);
+  const v4 id_mask = miss;
+  const v4 high_limit = _mm256_set1_epi64x(high);
+  const v4 list_limit = _mm256_set1_epi64x(high + low);
   const u8 *file_end = input + input_size;
   for (size_t off; (off = next_chunk.take(CHUNK)) < input_size;) {
     const u8 *p = input + off;
@@ -515,54 +520,54 @@ static void parse_docs(Scratch &scratch) {
       u64 bit = 1ull << position;
       u64 *line = lines + (doc >> GROUP_BITS) % LINE_WORDS;
       // Tokenizing, lookups and actions are separate passes. Each lookup is prefetched
-      // as soon as its hash is known, so memory arrives in time. Actions run per kind
-      // of token after a vector step sorts ids by kind, as a token's kind is
-      // unpredictable and a branch on it would be mispredicted constantly.
-      tokens[0] = 0;
+      // as soon as its hash is known, so memory arrives in time.
+      tokens[0] = NO_HASH;
       u64 *token = tokens + 1;
       p = scan_line(p, [&](const u8 *, u64 hash) {
         _mm_prefetch(table_slots + (hash & table_mask), _MM_HINT_T0);
         *token++ = hash;
       });
       size_t count = token - tokens - 1;
-      *token = 0;
+      store(token, _mm256_set1_epi64x(NO_HASH));
       // Four lookups in one vector step: an id with its anchor flag, or an id no list
       // or bitset uses. A displaced term, or a token sharing its home slot with one,
-      // takes another look, about 3% of tokens.
+      // takes another look, about 1% of tokens. Then ids are sorted by kind, as a
+      // token's kind is unpredictable and a branch on it would be mispredicted
+      // constantly.
+      size_t highs = 0, lows = 0;
       for (size_t at = 1; at <= count; at += 4) {
         v4 hash = load(tokens + at);
         v4 value = _mm256_i64gather_epi64((const long long *)table_slots,
                                           _mm256_and_si256(hash, slot_mask), 8);
         v4 same = _mm256_cmpeq_epi64(
             _mm256_srli_epi64(_mm256_xor_si256(value, hash), TAG_SHIFT), zero);
-        u32 is_same = _mm256_movemask_pd(_mm256_castsi256_pd(same));
-        u32 displaced = _mm256_movemask_pd(
-            _mm256_castsi256_pd(_mm256_slli_epi64(value, 63 - DISPLACED_BIT)));
         v4 found = _mm256_blendv_epi8(miss, _mm256_and_si256(value, found_mask), same);
-        _mm_storeu_si128((v2 *)(ids + at), _mm256_castsi256_si128(
-            _mm256_permutevar8x32_epi32(found, low_halves)));
-        for (u32 again = displaced & ~is_same; again; again &= again - 1) {
-          size_t i = at + __builtin_ctz(again);
-          ids[i] = table.find_displaced(tokens[i]);
+        u32 again = lanes64(_mm256_slli_epi64(value, 63 - DISPLACED_BIT)) & ~lanes64(same);
+        u64 ids[4];
+        if (again) {
+          store(ids, found);
+          for (; again; again &= again - 1) {
+            int i = __builtin_ctz(again);
+            ids[i] = table.find_displaced(tokens[at + i]);
+          }
+          found = load(ids);
         }
-      }
-      for (size_t i = 1; i <= 8; i++)
-        ids[count + i] = NO_ID;
-      size_t highs = 0, lows = 0;
-      for (size_t at = 1; at <= count; at += 8) {
-        v4 x = load(ids + at), id = _mm256_and_si256(x, id_mask);
-        u32 is_high = lanes(_mm256_cmpgt_epi32(high_limit, id));
-        u32 is_low = is_high ^ lanes(_mm256_cmpgt_epi32(list_limit, id));
-        store(high_ids + highs, gather(id, is_high));
-        store(low_ids + lows, gather(id, is_low));
+        v4 id = _mm256_and_si256(found, id_mask);
+        u32 is_high = lanes64(_mm256_cmpgt_epi64(high_limit, id));
+        u32 is_low = is_high ^ lanes64(_mm256_cmpgt_epi64(list_limit, id));
+        store(high_ids + highs, gather(id, _pdep_u32(is_high, 0x55)));
+        store(low_ids + lows, gather(id, _pdep_u32(is_low, 0x55)));
         highs += __builtin_popcount(is_high);
         lows += __builtin_popcount(is_low);
-        u32 anchors = lanes(_mm256_slli_epi32(x, 31 - ID_BITS));
-        for (; anchors; anchors &= anchors - 1) {
-          size_t i = at + __builtin_ctz(anchors);
-          if (phrases.may_pair(tokens[i], tokens[i + 1]) ||
-              phrases.may_pair(tokens[i - 1], tokens[i]))
-            phrases.check(ids[i] & NO_ID, tokens, count, i, doc, scratch.hits);
+        u32 anchors = lanes64(_mm256_slli_epi64(found, 63 - ID_BITS));
+        if (anchors) {
+          store(ids, id);
+          for (; anchors; anchors &= anchors - 1) {
+            int i = __builtin_ctz(anchors);
+            if (phrases.may_pair(tokens[at + i], tokens[at + i + 1]) ||
+                phrases.may_pair(tokens[at + i - 1], tokens[at + i]))
+              phrases.check(ids[i], tokens, count, at + i, doc, scratch.hits);
+          }
         }
       }
       for (size_t i = 0; i < highs; i++)
