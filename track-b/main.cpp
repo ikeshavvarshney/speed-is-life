@@ -132,18 +132,12 @@ INLINE u32 token_mask(v4 bytes) {
                       _mm256_cmpgt_epi8(digit, ones(127 - 10))));
 }
 
-// Finds the tokens of the line at `p`, writes where each starts and ends, and returns
-// what follows its newline. One classification covers 64 bytes, and tokens then come
-// straight from bit masks. Windows usually hold about 9 tokens, in numbers too varied
-// to predict, so a fixed count is always written, and only the count moves on.
-// A window restarts at a token that runs past its end, so tokens never need joining
-// up. Documents and query lines are both read this way.
-const size_t WINDOW_TOKENS = 12;
-
-INLINE const u8 *scan_line(const u8 *p, u32 *starts, u32 *ends, size_t &count) {
-  const u8 *line = p;
+// Calls `visit` with each token of the line at `p`, and returns what follows its
+// newline. One classification covers 64 bytes, and tokens then come straight from
+// bit masks. A window restarts at a token that runs past its end, so tokens never
+// need joining up. Documents and query lines are both read this way.
+template <class F> INLINE const u8 *scan_line(const u8 *p, F &&visit) {
   const v4 newline = ones('\n');
-  size_t k = 0;
   for (;;) {
     v4 first = load(p), second = load(p + 32);
     u64 mask = token_mask(first) | (u64)token_mask(second) << 32;
@@ -151,39 +145,19 @@ INLINE const u8 *scan_line(const u8 *p, u32 *starts, u32 *ends, size_t &count) {
     u32 high = _mm256_movemask_epi8(_mm256_cmpeq_epi8(second, newline));
     u64 newlines = low | (u64)high << 32;
     u64 tokens = mask & (newlines - 1);
-    u64 start_bits = tokens & ~(tokens << 1), end_bits = ~tokens & (tokens << 1);
-    size_t found = __builtin_popcountll(end_bits);
-    u32 base = p - line;
-    u64 open_token = start_bits;
-    for (size_t i = 0; i < WINDOW_TOKENS; i++) {
-      starts[k + i] = base + _tzcnt_u64(start_bits);
-      ends[k + i] = base + _tzcnt_u64(end_bits);
-      start_bits = _blsr_u64(start_bits);
-      end_bits = _blsr_u64(end_bits);
+    u64 starts = tokens & ~(tokens << 1), ends = ~tokens & (tokens << 1);
+    for (; ends; starts &= starts - 1, ends &= ends - 1) {
+      int start = __builtin_ctzll(starts);
+      visit(p + start, token_hash(p + start, __builtin_ctzll(ends) - start));
     }
-    for (size_t i = WINDOW_TOKENS; i < found; i++) {
-      starts[k + i] = base + _tzcnt_u64(start_bits);
-      ends[k + i] = base + _tzcnt_u64(end_bits);
-      start_bits = _blsr_u64(start_bits);
-      end_bits = _blsr_u64(end_bits);
-    }
-    k += found;
-    if (newlines) {
-      count = k;
+    if (newlines)
       return p + __builtin_ctzll(newlines) + 1;
-    }
-    size_t last = 63 - _lzcnt_u64(open_token);
-    if (!(tokens >> 63)) {
-      p += 64;
-    } else if (last) {
-      p += last;
-    } else {
+    if (starts == 1) {
       p += 64;
       while (isalnum(*p))
         p++;
-      starts[k] = base;
-      ends[k++] = p - line;
-      // Only a token over 64 bytes gets here. It ends where the scan stopped.
+    } else {
+      p += starts ? __builtin_ctzll(starts) : 64;
     }
   }
 }
@@ -341,26 +315,23 @@ static void find_query_chunks() {
 
 static void read_chunk(size_t c) {
   QueryChunk &chunk = query_chunks[c];
-  u32 starts[1 << 10], ends[1 << 10];
   for (const u8 *p = text + bounds[c]; p < text + bounds[c + 1];) {
     bool is_bool = *p == 'B';
-    size_t words_in_line, before = chunk.hashes.size();
+    size_t index = 0, before = chunk.hashes.size();
     u32 op = OP_AND;
-    const u8 *line = p;
-    p = scan_line(p, starts, ends, words_in_line);
-    for (size_t i = 1; i < words_in_line; i++) {
-      u64 hash = token_hash(line + starts[i], ends[i] - starts[i]);
-      if (!is_bool) {
+    p = scan_line(p, [&](const u8 *word, u64 hash) {
+      if (is_bool) {
+        if (index % 2)
+          chunk.terms.push_back(draft.intern(hash) << OP_BITS | op);
+        else if (index)
+          op = *word == 'A' ? OP_AND : *word == 'O' ? OP_OR : OP_NOT;
+      } else if (index) {
         chunk.slots.push_back(draft.intern(hash));
         chunk.hashes.push_back(hash);
-      } else if (i % 2) {
-        chunk.terms.push_back(draft.intern(hash) << OP_BITS | op);
-      } else {
-        u8 word = line[starts[i]];
-        op = word == 'A' ? OP_AND : word == 'O' ? OP_OR : OP_NOT;
       }
-    }
-    chunk.sizes.push_back(is_bool ? words_in_line / 2 : 0);
+      index++;
+    });
+    chunk.sizes.push_back(is_bool ? index / 2 : 0);
     if (!is_bool)
       chunk.lengths.push_back(chunk.hashes.size() - before);
   }
@@ -538,17 +509,15 @@ static void parse_docs(Scratch &scratch) {
       // far enough ahead for memory to arrive in time. Actions run per kind of
       // token after a vector step sorts ids by kind, as a token's kind is
       // unpredictable and a branch on it would be mispredicted constantly.
-      const u8 *text_start = p;
-      size_t count;
-      p = scan_line(p, high_ids, low_ids, count);
       tokens[0] = 0;
-      for (size_t i = 0; i < count; i++)
-        tokens[i + 1] = token_hash(text_start + high_ids[i], low_ids[i] - high_ids[i]);
+      u64 *token = tokens + 1;
+      p = scan_line(p, [&](const u8 *, u64 hash) { *token++ = hash; });
+      size_t count = token - tokens - 1;
       for (size_t i = 0; i <= PREFETCH_AHEAD; i++)
-        tokens[count + 1 + i] = 0;
+        token[i] = 0;
       for (size_t at = 1; at <= count; at++) {
         _mm_prefetch(table_slots + (tokens[at + PREFETCH_AHEAD] & table_mask),
-                     _MM_HINT_T0);
+                     _MM_HINT_T1);
         ids[at] = table.find(tokens[at]);
       }
       for (size_t i = 1; i <= 8; i++)
