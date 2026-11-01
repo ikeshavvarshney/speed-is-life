@@ -1,6 +1,6 @@
 # Track B: performance log
 
-Every step from the reference to the final version, each with the live-board run ID that measured it. Rejected experiments are listed too. A single board run varies by about 1 to 2%, so small differences below are noise, and I say so where it matters.
+Every step from the reference to the final version, each with the live-board run ID that measured it. Rejected experiments are listed too. A single board run of this track varies by up to about 4%, so small differences below are noise, and I say so where it matters.
 
 ## Summary
 
@@ -75,6 +75,9 @@ Each kept step matched the reference on all 8 local datasets before it was pushe
 | 19 | Query data in slices of one mapping, no malloc while reading queries | run-f334ea5bba9d | 0.0754 | 46.5 | 960 | 41.53 | 80.92 |
 | 20 | Three AES rounds, after finding a real hash collision | run-158b08491da4 | 0.0746 | 46.9 | 964 | 41.66 | 80.98 |
 | 21 | Plain table insertion | run-2bb9a8096c33 | 0.0748 | 46.6 | 960 | 41.67 | 80.99 |
+| | Same code, later run | run-b3229f96fa38 | 0.0781 | 46.8 | 960 | 40.74 | 80.50 |
+
+The last row shows that single runs of this code differ by up to 4% in T, so a difference of 1 or 2% between two runs above proves little. The large steps hold up, and the small ones are kept mostly because they removed code or memory.
 
 ### Why each one worked
 
@@ -135,7 +138,7 @@ Every one of these passed some checks, which is why the checks are layered.
 
 - All 8 local datasets before each push, including full seeds 1 and 2.
 - Forced thread counts of 2, 3, 7, 12 and 16 over hundreds of repeated runs, as the laptop has only 4 threads.
-- 28 fresh generator seeds at tiny, sample and full scale, compared with the reference.
+- 30 fresh generator seeds at tiny, sample and full scale, compared with the reference at 1, 4 and 12 threads.
 - A fuzzer comparing against the reference's own logic, on hostile inputs: tokens of 1 to 80 bytes, mixed case, bytes above 0x7F, terms common enough for bitsets, all operator shapes, empty documents and repeated phrase terms.
 - Targeted hash attacks, listed above.
 
