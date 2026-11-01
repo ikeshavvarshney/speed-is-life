@@ -25,7 +25,7 @@ constexpr auto relaxed = std::memory_order_relaxed;
 
 // The box's hardware threads.
 const int WORKERS = 12;
-const size_t CHUNK = 1 << 18, CLEAR_STEP = 1 << 23, HOURS = 72, BLOCK = 256;
+const size_t CHUNK = 1 << 20, CLEAR_STEP = 1 << 23, HOURS = 72, BLOCK = 256;
 const size_t SLOTS = 1 << 13, MAX_IDS = 1 << 11;
 // A chunk that starts this many minutes into an hour shows that the hour before is
 // over, as the spec has the last upload of an hour land within 10 minutes of its end.
@@ -505,12 +505,11 @@ static void worker() {
       u32 minute = line < end ? hour_index(line) * 60 + line[14] * 10 + line[15] - 528 : 0;
       u32 lowest = parse_chunk(line, end, heads);
       chunk_states[chunk].store(DONE | lowest << 16 | minute, std::memory_order_release);
+    } else if ((off = next_clear.fetch_add(CLEAR_STEP, relaxed)) < input_size) {
+      // Exit would clear the input's page tables on one thread, with the clock running.
+      madvise((void *)(input + off), std::min(CLEAR_STEP, input_size - off), MADV_DONTNEED);
     } else if (hour > HOURS) {
-      // All parsing is over, as the last hours need that. Exit would clear the input's
-      // page tables on one thread with the clock running, and freeing them lowers the peak.
-      if ((off = next_clear.fetch_add(CLEAR_STEP, relaxed)) >= input_size)
-        return;
-      munmap((void *)(input + off), std::min(CLEAR_STEP, input_size - off));
+      return;
     } else {
       std::this_thread::yield();
     }
