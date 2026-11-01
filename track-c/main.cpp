@@ -232,6 +232,8 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
       // closing quote. A pair inside a value closes and at once reopens, while
       // fields always have a comma between them, so an opening quote right
       // after a closing quote is exactly a "" pair.
+      // Hardware prefetchers stop at page boundaries, and this one crosses them.
+      _mm_prefetch((const char *)(base + block + 512), _MM_HINT_T0);
       v4 x = _mm256_loadu_si256((const v4 *)(base + block));
       v4 y = _mm256_loadu_si256((const v4 *)(base + block + 32));
       u64 quotes = mask(x, quote) | mask(y, quote) << 32;
