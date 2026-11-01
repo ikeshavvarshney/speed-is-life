@@ -191,12 +191,13 @@ struct alignas(64) Counter {
   size_t take(size_t n = 1) { return value.fetch_add(n, relaxed); }
 };
 
-// One chunk of the query file. Each line's size says how many boolean terms it has,
-// with 0 for a phrase, and each boolean term holds its operator in the low bits.
+// One chunk of the query file, in slices of address space sized by its share of the
+// file, as a term takes at least 2 bytes of it. Each line starts with how many boolean
+// terms it has, 0 for a phrase, and each term holds its operator in the low bits.
 struct QueryChunk {
-  vector<u8> sizes;
-  vector<u32> terms, lengths, slots;
-  vector<u64> hashes;
+  u32 *lines, *slots, *lengths;
+  u64 *hashes;
+  size_t line_words, slot_count, phrase_count;
 };
 
 // Terms as they are found in the queries, by all threads at once.
@@ -258,8 +259,9 @@ INLINE size_t pair_bit(u64 first, u64 second) {
 // anchor are linked, numbered from 1.
 struct Phrases {
   vector<u32> starts, first_of_anchor, next_of_anchor;
-  vector<u8> anchor_at;
-  vector<u64> terms, pairs;
+  vector<u8> anchor_at, lengths;
+  vector<u64> pairs;
+  const u64 *terms;
 
   INLINE bool may_pair(u64 first, u64 second) const {
     size_t bit = pair_bit(first, second);
@@ -270,8 +272,8 @@ struct Phrases {
   [[gnu::cold]] void check(size_t id, const u64 *tokens, size_t count, size_t token,
                            u32 doc, vector<Hit> &hits) const {
     for (u32 p = first_of_anchor[id]; p; p = next_of_anchor[p]) {
-      const u64 *first = terms.data() + starts[p - 1];
-      size_t len = starts[p] - starts[p - 1], at = anchor_at[p];
+      const u64 *first = terms + starts[p];
+      size_t len = lengths[p], at = anchor_at[p];
       if (token + len - at <= count + 2 && at <= token &&
           std::equal(first, first + len, tokens + token - at))
         hits.push_back({p - 1, doc});
@@ -294,6 +296,8 @@ static size_t text_size, input_size, docs, words, chunks, partitions, blocks;
 static size_t high_terms, low_terms, log_span;
 static vector<size_t> bounds;
 static vector<QueryChunk> query_chunks;
+static u32 *query_lines, *query_slots, *query_lengths;
+static u64 *query_hashes;
 static vector<u32> phrase_bases, matched, phrase_docs;
 static vector<Scratch> scratches;
 static vector<std::string> outputs;
@@ -320,26 +324,34 @@ static void find_query_chunks() {
 }
 
 static void read_chunk(size_t c) {
+  size_t from = bounds[c] / 2;
   QueryChunk &chunk = query_chunks[c];
+  chunk = {query_lines + from, query_slots + from, query_lengths + from,
+           query_hashes + from};
   for (const u8 *p = text + bounds[c]; p < text + bounds[c + 1];) {
     bool is_bool = *p == 'B';
-    size_t index = 0, before = chunk.hashes.size();
+    size_t index = 0, before = chunk.slot_count, header = chunk.line_words;
     u32 op = OP_AND;
+    if (is_bool)
+      chunk.line_words++;
     p = scan_line(p, [&](const u8 *word, u64 hash) {
       if (is_bool) {
         if (index % 2)
-          chunk.terms.push_back(draft.intern(hash) << OP_BITS | op);
+          chunk.lines[chunk.line_words++] = draft.intern(hash) << OP_BITS | op;
         else if (index)
           op = *word == 'A' ? OP_AND : *word == 'O' ? OP_OR : OP_NOT;
       } else if (index) {
-        chunk.slots.push_back(draft.intern(hash));
-        chunk.hashes.push_back(hash);
+        chunk.slots[chunk.slot_count] = draft.intern(hash);
+        chunk.hashes[chunk.slot_count++] = hash;
       }
       index++;
     });
-    chunk.sizes.push_back(is_bool ? index / 2 : 0);
-    if (!is_bool)
-      chunk.lengths.push_back(chunk.hashes.size() - before);
+    if (is_bool) {
+      chunk.lines[header] = index / 2;
+    } else {
+      chunk.lines[chunk.line_words++] = 0;
+      chunk.lengths[chunk.phrase_count++] = chunk.slot_count - before;
+    }
   }
 }
 
@@ -348,15 +360,19 @@ static void read_chunk(size_t c) {
 // only in phrases need no table entry, as phrases compare hashes.
 static void plan_index() {
   vector<u16> phrase_seen(draft.len), bool_seen(draft.len);
-  size_t phrase_count = 0, term_count = 0;
+  size_t phrase_count = 0;
+  // Calls `f` with each boolean term of the lines of a chunk.
+  auto each_term = [](QueryChunk &chunk, auto &&f) {
+    for (size_t i = 0; i < chunk.line_words; i++)
+      for (u32 left = chunk.lines[i]; left; left--)
+        f(chunk.lines[++i]);
+  };
   for (auto &chunk : query_chunks) {
-    for (u32 at : chunk.slots)
-      phrase_seen[at]++;
-    for (u32 term : chunk.terms)
-      bool_seen[term >> OP_BITS]++;
+    for (size_t i = 0; i < chunk.slot_count; i++)
+      phrase_seen[chunk.slots[i]]++;
+    each_term(chunk, [&](u32 term) { bool_seen[term >> OP_BITS]++; });
     phrase_bases.push_back(phrase_count);
-    phrase_count += chunk.lengths.size();
-    term_count += chunk.hashes.size();
+    phrase_count += chunk.phrase_count;
   }
   auto seen = [&](size_t at) { return (u32)phrase_seen[at] + bool_seen[at]; };
   for (size_t at = 0; at < draft.len; at++)
@@ -370,24 +386,27 @@ static void plan_index() {
       (seen(at) >= HOT_COUNT ? hot : cold).push_back(at);
     }
 
-  phrases.terms.reserve(term_count);
-  phrases.starts.reserve(phrase_count + 1);
-  phrases.starts.push_back(0);
+  phrases.terms = query_hashes;
+  phrases.starts.resize(phrase_count + 1);
+  phrases.lengths.resize(phrase_count + 1);
   phrases.first_of_anchor.resize(next_id + phrase_count + 1);
   phrases.next_of_anchor.resize(phrase_count + 1);
   phrases.anchor_at.resize(phrase_count + 1);
   phrases.pairs.resize(1 << (PAIR_BITS - 6));
   vector<bool> is_anchor(draft.len);
+  u32 phrase = 0;
   for (auto &chunk : query_chunks) {
     size_t first = 0;
-    for (u32 length : chunk.lengths) {
-      const u32 *list = chunk.slots.data() + first;
-      const u64 *hashes = chunk.hashes.data() + first;
+    for (size_t p = 0; p < chunk.phrase_count; p++) {
+      size_t length = chunk.lengths[p];
+      const u32 *list = chunk.slots + first;
+      const u64 *hashes = chunk.hashes + first;
       first += length;
       size_t at = std::min_element(list, list + length, [&](u32 a, u32 b) {
                     return seen(a) < seen(b);
                   }) - list;
-      u32 slot = list[at], phrase = phrases.starts.size();
+      u32 slot = list[at];
+      phrase++;
       if (ids[slot] == NO_ID) {
         ids[slot] = next_id++;
         cold.push_back(slot);
@@ -399,18 +418,17 @@ static void plan_index() {
       size_t one = at + 1 < length ? at : at - 1;
       size_t bit = pair_bit(hashes[one], hashes[one + 1]);
       phrases.pairs[bit / 64] |= 1ull << (bit % 64);
-      phrases.terms.insert(phrases.terms.end(), hashes, hashes + length);
-      phrases.starts.push_back(phrases.terms.size());
+      phrases.starts[phrase] = hashes - query_hashes;
+      phrases.lengths[phrase] = length;
     }
   }
 
-  for (auto &chunk : query_chunks) {
-    for (u32 &term : chunk.terms)
+  for (auto &chunk : query_chunks)
+    each_term(chunk, [&](u32 &term) {
       term = ids[term >> OP_BITS] << OP_BITS | (term & ((1 << OP_BITS) - 1));
-    chunk.slots = {};
-    chunk.lengths = {};
-    chunk.hashes = {};
-  }
+    });
+  munmap(query_slots, text_size * 2);
+  munmap(query_lengths, text_size * 2);
   // Four times the size of the draft, which leaves few displaced terms.
   size_t table_size = (draft.mask + 1) * 4;
   table = {(u64 *)huge_pages((table_size + TABLE_PADDING) * 8), table_size - 1};
@@ -931,11 +949,12 @@ static void answer_queries(Scratch &scratch) {
     std::string &out = outputs[c];
     out.reserve(bounds[c + 1] - bounds[c]);
     size_t phrase = phrase_bases[c];
-    u32 *terms = query_chunks[c].terms.data();
-    for (u8 size : query_chunks[c].sizes) {
+    QueryChunk &chunk = query_chunks[c];
+    for (size_t i = 0; i < chunk.line_words; i++) {
+      u32 size = chunk.lines[i];
       if (size) {
-        evaluator.answer(terms, size, out);
-        terms += size;
+        evaluator.answer(chunk.lines + i + 1, size, out);
+        i += size;
       } else {
         // A document can match a phrase more than once, but it counts once.
         u32 *first = phrase_docs.data() + matched[phrase];
@@ -967,6 +986,7 @@ static void after_queries() {
 // Groups the phrases' documents by phrase. Answers sort each phrase's few documents.
 static void after_parsing() {
   size_t phrase_count = phrases.starts.size() - 1, total = 0;
+  munmap(query_hashes, text_size * 4);
   matched.resize(phrase_count + 1);
   for (auto &scratch : scratches)
     for (const Hit &hit : scratch.hits)
@@ -1059,6 +1079,11 @@ int main() {
   draft.mask = size - 1;
   draft.hashes = (std::atomic<u64> *)calloc(draft.len, 8);
   query_chunks.resize(chunks);
+  // A line has a size as well as its terms, and a line takes at least 7 bytes.
+  query_lines = (u32 *)reserve(text_size * 3);
+  query_slots = (u32 *)reserve(text_size * 2);
+  query_lengths = (u32 *)reserve(text_size * 2);
+  query_hashes = (u64 *)reserve(text_size * 4);
   outputs.resize(chunks);
   input = map_input("/data/docs.txt", input_size);
   if (input_size) {
