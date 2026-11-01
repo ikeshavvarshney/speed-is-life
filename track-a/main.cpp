@@ -176,12 +176,12 @@ static void finish(){
   fprintf(stderr,"wall %.2f forks %.2f startavg %.2f endparse %.2f | map %.1f parse %.1f plan %.1f render %.1f (count %.1f place %.1f select %.1f) deliver %.1f idle %.1f | peak %.2f shmem %.2f anon %.2f kernel %.2f pt %.2f regions %zu\n",wall,ms(sp->forks),ms(sp->start_sum)/12,ms(sp->end_parse),ms(sp->map),ms(sp->parse),ms(sp->plan),ms(sp->render),ms(sp->count),ms(sp->place),ms(sp->select),ms(sp->deliver),ms(sp->idle),peak/1e6,shmem/1e6,anon/1e6,kernel/1e6,pt/1e6,g.used_regions);
   (void)since0;
   u64 c=0;
-  if(1==1)c=q(ms(sp->map),1,8)|q(ms(sp->parse),1,8)<<8|q(ms(sp->render),0.5,8)<<16;
-  if(1==2)c=q(ms(sp->count),0.5,6)|q(ms(sp->place),0.5,6)<<6|q(ms(sp->select),0.5,6)<<12|q(ms(sp->deliver),0.5,6)<<18;
-  if(1==3)c=q(wall,0.1,8)|q(ms(sp->forks),0.05,8)<<8|q(ms(sp->end_parse),0.1,8)<<16;
-  if(1==4)c=q(ms(sp->idle),0.25,8)|q(ms(sp->plan),0.05,8)<<8|q(ms(sp->start_sum)/12,0.05,8)<<16;
-  if(1==5)c=q(peak/1e6,0.1,8)|q(shmem/1e6,0.1,8)<<8|q(pt/1e6,0.05,4)<<16|q(g.used_regions,2,4)<<20;
-  if(1==6)c=q(anon/1e6,0.05,8)|q(kernel/1e6,0.05,8)<<8|q(pt/1e6,0.05,8)<<16;
+  if(5==1)c=q(ms(sp->map),1,8)|q(ms(sp->parse),1,8)<<8|q(ms(sp->render),0.5,8)<<16;
+  if(5==2)c=q(ms(sp->count),0.5,6)|q(ms(sp->place),0.5,6)<<6|q(ms(sp->select),0.5,6)<<12|q(ms(sp->deliver),0.5,6)<<18;
+  if(5==3)c=q(wall,0.1,8)|q(ms(sp->forks),0.05,8)<<8|q(ms(sp->end_parse),0.1,8)<<16;
+  if(5==4)c=q(ms(sp->idle),0.25,8)|q(ms(sp->plan),0.05,8)<<8|q(ms(sp->start_sum)/12,0.05,8)<<16;
+  if(5==5)c=q(peak/1e6,0.1,8)|q(shmem/1e6,0.1,8)<<8|q(pt/1e6,0.05,4)<<16|q(g.used_regions,2,4)<<20;
+  if(5==6)c=q(anon/1e6,0.05,8)|q(kernel/1e6,0.05,8)<<8|q(pt/1e6,0.05,8)<<16;
   fprintf(stderr,"code %llu mcode %llu tcode %llu\n",c,c&16383,c>>14);
   report(c);
 }
