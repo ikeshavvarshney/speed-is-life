@@ -44,13 +44,15 @@ const u64 DISPLACED = ANCHOR << 1, TAG_MASK = ~0ull << TAG_SHIFT;
 const size_t TABLE_PADDING = 1 << 10;
 const u32 OP_AND = 0, OP_OR = 1, OP_NOT = 2, OP_BITS = 2;
 
-// A logged hit is 16 bits: a term within its partition, and a document within
-// its group of 64. A worker writes a marker naming the group when it starts one.
-// Workers claim small blocks of a partition's region, so all hits of a partition
-// lie together with no copying as a log grows, and few pages stay partly used.
-const int GROUP_BITS = 6, PARTITION_BITS = 9;
+// A logged hit is 16 bits: a term within its partition, a document within its group
+// of 64, and a clear low bit. A worker writes a marker when it starts a group: the
+// group's number and a set low bit. So a term's id shifted left by HIT_TERM_SHIFT is
+// a hit with its partition just above it, and a vector step can make it. Workers claim
+// small blocks of a partition's region, so all hits of a partition lie together with
+// no copying as a log grows, and few pages stay partly used.
+const int GROUP_BITS = 6, PARTITION_BITS = 9, HIT_TERM_SHIFT = GROUP_BITS + 1;
 const u32 GROUP_DOCS = 1 << GROUP_BITS, PARTITION_TERMS = 1 << PARTITION_BITS;
-const u16 MARKER = 1 << 15, LOG_END = UINT16_MAX;
+const u16 LOG_END = UINT16_MAX;
 const size_t LOG_BLOCK = 1 << 9;
 
 // Common terms gather one cache line per term, 512 documents, before it is written
@@ -134,23 +136,21 @@ INLINE u64 mix_rounds(v2 state) {
 // the state still collides for tokens differing only along one of AES's diagonals:
 // `wodeand` and `woweandvi` both occur in the seed 2 corpus, and had the same hash. The
 // hash stands in for the bytes: with about 600,000 distinct tokens and 76,000 terms,
-// the chance of any collision is about 1 in 100 million.
-INLINE u64 token_hash(const u8 *start, size_t len) {
-  if (len > 16)
-    return long_token_hash(start, len);
+// the chance of any collision is about 1 in 100 million. `back` is minus the length.
+INLINE u64 token_hash(const u8 *start, long back) {
+  if (back < -16)
+    return long_token_hash(start, -back);
   v2 bytes = _mm_or_si128(_mm_loadu_si128((const v2 *)start), _mm_set1_epi8(0x20));
   return mix_rounds(
-      _mm_and_si128(bytes, _mm_loadu_si128((const v2 *)(low_bytes + 32 - len))));
+      _mm_and_si128(bytes, _mm_loadu_si128((const v2 *)(low_bytes + 32 + back))));
 }
 
-// Adding moves each range to the top of the signed bytes, where one compare finds
-// it. OR-ing 0x20 maps only upper case into the range of lower case.
-INLINE u32 token_mask(v4 bytes) {
-  v4 letter = add8(_mm256_or_si256(bytes, ones(0x20)), ones(127 - 'z'));
-  v4 digit = add8(bytes, ones(127 - '9'));
-  return _mm256_movemask_epi8(
-      _mm256_or_si256(_mm256_cmpgt_epi8(letter, ones(127 - 26)),
-                      _mm256_cmpgt_epi8(digit, ones(127 - 10))));
+// A constant the compiler keeps in a register: left to itself, it rebuilds some of them
+// in every iteration of the loop using them, at three micro-ops each.
+INLINE v4 held(int byte) {
+  v4 x = ones(byte);
+  asm("" : "+x"(x));
+  return x;
 }
 
 // Calls `visit` with each token of the line at `p`, and returns what follows its
@@ -158,29 +158,45 @@ INLINE u32 token_mask(v4 bytes) {
 // bit masks. A window restarts at a token that runs past its end, so tokens never
 // need joining up. Documents and query lines are both read this way.
 template <class F> INLINE const u8 *scan_line(const u8 *p, F &&visit) {
-  const v4 newline = ones('\n');
+  const v4 lower = held(0x20), letter_add = held(127 - 'z'), digit_add = held(127 - '9');
+  const v4 letter_top = held(127 - 26), digit_top = held(127 - 10), newline = held('\n');
+  // Adding moves each range to the top of the signed bytes, where one compare finds
+  // it. OR-ing 0x20 maps only upper case into the range of lower case.
+  auto token_mask = [&](v4 bytes) -> u32 {
+    v4 letter = add8(_mm256_or_si256(bytes, lower), letter_add);
+    v4 digit = add8(bytes, digit_add);
+    return _mm256_movemask_epi8(_mm256_or_si256(_mm256_cmpgt_epi8(letter, letter_top),
+                                                _mm256_cmpgt_epi8(digit, digit_top)));
+  };
   for (;;) {
     v4 first = load(p), second = load(p + 32);
-    u64 mask = token_mask(first) | (u64)token_mask(second) << 32;
-    u32 low = _mm256_movemask_epi8(_mm256_cmpeq_epi8(first, newline));
-    u32 high = _mm256_movemask_epi8(_mm256_cmpeq_epi8(second, newline));
-    u64 newlines = low | (u64)high << 32;
-    u64 tokens = mask & (newlines - 1);
+    u64 tokens = token_mask(first) | (u64)token_mask(second) << 32;
+    v4 low = _mm256_cmpeq_epi8(first, newline);
+    v4 high = _mm256_cmpeq_epi8(second, newline);
+    v4 any = _mm256_or_si256(low, high);
+    u64 newlines = 0;
+    // Most windows hold no newline, and those need no bit mask of them.
+    if (!_mm256_testz_si256(any, any)) {
+      newlines = (u32)_mm256_movemask_epi8(low) |
+                 (u64)_mm256_movemask_epi8(high) << 32;
+      tokens &= newlines - 1;
+    }
     u64 starts = tokens & ~(tokens << 1), ends = ~tokens & (tokens << 1);
     for (; ends; starts &= starts - 1, ends &= ends - 1) {
-      int start = __builtin_ctzll(starts);
-      visit(p + start, token_hash(p + start, __builtin_ctzll(ends) - start));
+      u64 start = _tzcnt_u64(starts);
+      visit(p + start, token_hash(p + start, start - _tzcnt_u64(ends)));
     }
     if (newlines)
-      return p + __builtin_ctzll(newlines) + 1;
+      return p + _tzcnt_u64(newlines) + 1;
     if (starts == 1) {
       const u8 *start = p;
       p += 64;
-      while (isalnum(*p))
+      // No library call here: it would clobber the constants this loop keeps in registers.
+      while ((u8)((*p | 0x20) - 0x61) < 26 || (u8)(*p - 0x30) < 10)
         p++;
       visit(start, long_token_hash(start, p - start));
     } else {
-      p += starts ? __builtin_ctzll(starts) : 64;
+      p += _tzcnt_u64(starts);
     }
   }
 }
@@ -294,6 +310,7 @@ struct Phrases {
 struct Scratch {
   u64 *tokens;
   u32 *ids, *high_ids, *low_ids;
+  size_t highs, lows;
   vector<Hit> hits;
 };
 
@@ -362,7 +379,7 @@ static void read_chunk(size_t c) {
   }
 }
 
-// Final ids run through the common terms, then those with lists, then anchors used
+// Final ids run through the terms with lists, then the common terms, then anchors used
 // only in phrases, so an id alone says how a token is handled. Other terms used
 // only in phrases need no table entry, as phrases compare hashes.
 static void plan_index() {
@@ -386,10 +403,10 @@ static void plan_index() {
     if (bool_seen[at])
       (seen(at) > HIGH_COUNT ? high_terms : low_terms)++;
   vector<u32> ids(draft.len, NO_ID);
-  size_t next_high = 0, next_id = high_terms;
+  size_t next_low = 0, next_id = low_terms;
   for (size_t at = 0; at < draft.len; at++)
     if (bool_seen[at])
-      ids[at] = seen(at) > HIGH_COUNT ? next_high++ : next_id++;
+      ids[at] = seen(at) > HIGH_COUNT ? next_id++ : next_low++;
 
   phrases.terms = query_hashes;
   phrases.starts.resize(phrase_count + 1);
@@ -448,18 +465,95 @@ static u16 *claim_log_block(size_t partition) {
                  next_log_block[partition].take() * LOG_BLOCK);
 }
 
+// The passes over a document are separate functions, so each loop has the registers for
+// its own constants: inlined together, the compiler rebuilds them in every iteration.
+// Each lookup is prefetched as soon as its hash is known, so memory arrives in time.
+[[gnu::noinline]] static const u8 *hash_tokens(const u8 *p, u64 *tokens, size_t &count) {
+  const u64 *slots = table.slots;
+  const size_t mask = table.mask;
+  u64 *token = tokens;
+  p = scan_line(p, [&](const u8 *, u64 hash) {
+    _mm_prefetch(slots + (hash & mask), _MM_HINT_T0);
+    *token++ = hash;
+  });
+  count = token - tokens;
+  return p;
+}
+
+// Four lookups in one vector step: an id with its anchor flag, or an id no list or
+// bitset uses. A displaced term, or a token sharing its home slot with one, takes
+// another look, about 1% of tokens.
+[[gnu::noinline]] static void look_up(const u64 *tokens, u32 *ids, size_t count) {
+  const u64 *slots = table.slots;
+  const v4 slot_mask = _mm256_set1_epi64x(table.mask), zero = _mm256_setzero_si256();
+  const v4 miss = _mm256_set1_epi64x(NO_ID);
+  const v4 found_mask = _mm256_set1_epi64x(NO_ID | ANCHOR);
+  const v4 low_halves = _mm256_setr_epi32(0, 2, 4, 6, 0, 0, 0, 0);
+  for (size_t at = 1; at <= count; at += 4) {
+    v4 hash = load(tokens + at);
+    v4 value = _mm256_i64gather_epi64((const long long *)slots,
+                                      _mm256_and_si256(hash, slot_mask), 8);
+    v4 same = _mm256_cmpeq_epi64(
+        _mm256_srli_epi64(_mm256_xor_si256(value, hash), TAG_SHIFT), zero);
+    u32 is_same = _mm256_movemask_pd(_mm256_castsi256_pd(same));
+    u32 displaced = _mm256_movemask_pd(
+        _mm256_castsi256_pd(_mm256_slli_epi64(value, 63 - DISPLACED_BIT)));
+    v4 found = _mm256_blendv_epi8(miss, _mm256_and_si256(value, found_mask), same);
+    _mm_storeu_si128((v2 *)(ids + at), _mm256_castsi256_si128(
+        _mm256_permutevar8x32_epi32(found, low_halves)));
+    for (u32 again = displaced & ~is_same; again; again &= again - 1) {
+      size_t i = at + __builtin_ctz(again);
+      ids[i] = table.find_displaced(tokens[i]);
+    }
+  }
+  for (size_t i = 1; i <= 8; i++)
+    ids[count + i] = NO_ID;
+}
+
+// Sorts ids by kind in a vector step, as a token's kind is unpredictable and a branch on
+// it would be mispredicted constantly. A common term leaves its line's byte offset, and
+// a list term leaves its hit with the partition above it.
+[[gnu::noinline]] static void sort_by_kind(Scratch &scratch, size_t count, u32 doc) {
+  const u64 *tokens = scratch.tokens;
+  u32 *ids = scratch.ids, *high_ids = scratch.high_ids, *low_ids = scratch.low_ids;
+  const v4 id_mask = _mm256_set1_epi32(NO_ID);
+  const v4 low_limit = _mm256_set1_epi32(low_terms);
+  const v4 high_limit = _mm256_set1_epi32(low_terms + high_terms);
+  const v4 position = _mm256_set1_epi32((doc & (GROUP_DOCS - 1)) << 1);
+  size_t highs = 0, lows = 0;
+  for (size_t at = 1; at <= count; at += 8) {
+    v4 x = load(ids + at), id = _mm256_and_si256(x, id_mask);
+    u32 is_low = lanes(_mm256_cmpgt_epi32(low_limit, id));
+    u32 is_high = is_low ^ lanes(_mm256_cmpgt_epi32(high_limit, id));
+    v4 offset = _mm256_slli_epi32(id, HIT_TERM_SHIFT - 1);
+    store(high_ids + highs, gather(offset, is_high));
+    store(low_ids + lows,
+          gather(_mm256_or_si256(_mm256_add_epi32(offset, offset), position), is_low));
+    highs += __builtin_popcount(is_high);
+    lows += __builtin_popcount(is_low);
+    u32 anchors = lanes(_mm256_slli_epi32(x, 31 - ID_BITS));
+    for (; anchors; anchors &= anchors - 1) {
+      size_t i = at + __builtin_ctz(anchors);
+      if (phrases.may_pair(tokens[i], tokens[i + 1]) ||
+          phrases.may_pair(tokens[i - 1], tokens[i]))
+        phrases.check(ids[i] & NO_ID, tokens, count, i, doc, scratch.hits);
+    }
+  }
+  scratch.highs = highs;
+  scratch.lows = lows;
+}
+
 static void parse_docs(Scratch &scratch) {
   vector<u16 *> heads(partitions);
   for (size_t part = 0; part < partitions; part++)
     heads[part] = claim_log_block(part);
   u64 *tokens = scratch.tokens;
-  u32 *ids = scratch.ids, *high_ids = scratch.high_ids, *low_ids = scratch.low_ids;
-  const u64 *table_slots = table.slots;
-  const size_t table_mask = table.mask;
-  const u32 high = high_terms, low = low_terms;
-  const size_t row_words = words;
-  auto lines = (u64 *)aligned_alloc(64, (high + 1) * LINE_WORDS * 8);
-  memset(lines, 0, (high + 1) * LINE_WORDS * 8);
+  const u32 *high_ids = scratch.high_ids;
+  const auto low_hits = (const u16 *)scratch.low_ids;
+  const u32 high = high_terms;
+  const size_t row_words = words, line_bytes = LINE_WORDS * 8;
+  auto lines = (u64 *)aligned_alloc(64, (high + 1) * line_bytes);
+  memset(lines, 0, (high + 1) * line_bytes);
   u32 group = UINT32_MAX;
   auto flush = [&](u32 doc) {
     size_t at = doc / LINE_DOCS * LINE_WORDS;
@@ -481,17 +575,10 @@ static void parse_docs(Scratch &scratch) {
     // Every block starts with a marker.
     if (!((size_t)head & (LOG_BLOCK - 1))) {
       head = claim_log_block(part);
-      *head++ = MARKER | group;
+      *head++ = group << 1 | 1;
     }
     heads[part] = head;
   };
-  const v4 slot_mask = _mm256_set1_epi64x(table_mask), zero = _mm256_setzero_si256();
-  const v4 miss = _mm256_set1_epi64x(NO_ID);
-  const v4 found_mask = _mm256_set1_epi64x(NO_ID | ANCHOR);
-  const v4 low_halves = _mm256_setr_epi32(0, 2, 4, 6, 0, 0, 0, 0);
-  const v4 id_mask = _mm256_set1_epi32(NO_ID);
-  const v4 high_limit = _mm256_set1_epi32(high);
-  const v4 list_limit = _mm256_set1_epi32(high + low);
   const u8 *file_end = input + input_size;
   for (size_t off; (off = next_chunk.take(CHUNK)) < input_size;) {
     const u8 *p = input + off;
@@ -513,69 +600,22 @@ static void parse_docs(Scratch &scratch) {
       if (doc >> GROUP_BITS != group) {
         group = doc >> GROUP_BITS;
         for (size_t part = 0; part < partitions; part++)
-          push(part, MARKER | group);
+          push(part, group << 1 | 1);
       }
-      u32 position = doc & (GROUP_DOCS - 1);
-      u64 bit = 1ull << position;
-      u64 *line = lines + (doc >> GROUP_BITS) % LINE_WORDS;
-      // Tokenizing, lookups and actions are separate passes. Each lookup is prefetched
-      // as soon as its hash is known, so memory arrives in time. Actions run per kind
-      // of token after a vector step sorts ids by kind, as a token's kind is
-      // unpredictable and a branch on it would be mispredicted constantly.
+      size_t count;
       tokens[0] = 0;
-      u64 *token = tokens + 1;
-      p = scan_line(p, [&](const u8 *, u64 hash) {
-        _mm_prefetch(table_slots + (hash & table_mask), _MM_HINT_T0);
-        *token++ = hash;
-      });
-      size_t count = token - tokens - 1;
-      *token = 0;
-      // Four lookups in one vector step: an id with its anchor flag, or an id no list
-      // or bitset uses. A displaced term, or a token sharing its home slot with one,
-      // takes another look, about 1% of tokens.
-      for (size_t at = 1; at <= count; at += 4) {
-        v4 hash = load(tokens + at);
-        v4 value = _mm256_i64gather_epi64((const long long *)table_slots,
-                                          _mm256_and_si256(hash, slot_mask), 8);
-        v4 same = _mm256_cmpeq_epi64(
-            _mm256_srli_epi64(_mm256_xor_si256(value, hash), TAG_SHIFT), zero);
-        u32 is_same = _mm256_movemask_pd(_mm256_castsi256_pd(same));
-        u32 displaced = _mm256_movemask_pd(
-            _mm256_castsi256_pd(_mm256_slli_epi64(value, 63 - DISPLACED_BIT)));
-        v4 found = _mm256_blendv_epi8(miss, _mm256_and_si256(value, found_mask), same);
-        _mm_storeu_si128((v2 *)(ids + at), _mm256_castsi256_si128(
-            _mm256_permutevar8x32_epi32(found, low_halves)));
-        for (u32 again = displaced & ~is_same; again; again &= again - 1) {
-          size_t i = at + __builtin_ctz(again);
-          ids[i] = table.find_displaced(tokens[i]);
-        }
-      }
-      for (size_t i = 1; i <= 8; i++)
-        ids[count + i] = NO_ID;
-      size_t highs = 0, lows = 0;
-      for (size_t at = 1; at <= count; at += 8) {
-        v4 x = load(ids + at), id = _mm256_and_si256(x, id_mask);
-        u32 is_high = lanes(_mm256_cmpgt_epi32(high_limit, id));
-        u32 is_low = is_high ^ lanes(_mm256_cmpgt_epi32(list_limit, id));
-        store(high_ids + highs, gather(id, is_high));
-        store(low_ids + lows, gather(id, is_low));
-        highs += __builtin_popcount(is_high);
-        lows += __builtin_popcount(is_low);
-        u32 anchors = lanes(_mm256_slli_epi32(x, 31 - ID_BITS));
-        for (; anchors; anchors &= anchors - 1) {
-          size_t i = at + __builtin_ctz(anchors);
-          if (phrases.may_pair(tokens[i], tokens[i + 1]) ||
-              phrases.may_pair(tokens[i - 1], tokens[i]))
-            phrases.check(ids[i] & NO_ID, tokens, count, i, doc, scratch.hits);
-        }
-      }
-      for (size_t i = 0; i < highs; i++)
-        line[high_ids[i] * LINE_WORDS] |= bit;
-      for (size_t i = 0; i < lows; i++) {
-        u32 term = low_ids[i] - high;
-        push(term >> PARTITION_BITS,
-             (term & (PARTITION_TERMS - 1)) << GROUP_BITS | position);
-      }
+      p = hash_tokens(p, tokens + 1, count);
+      tokens[count + 1] = 0;
+      look_up(tokens, scratch.ids, count);
+      sort_by_kind(scratch, count, doc);
+      u64 bit = 1ull << (doc & (GROUP_DOCS - 1));
+      // Offsets count from the first id of a common term.
+      size_t base = (size_t)(lines + (doc >> GROUP_BITS) % LINE_WORDS) -
+                    low_terms * line_bytes;
+      for (size_t i = 0; i < scratch.highs; i++)
+        *(u64 *)(base + high_ids[i]) |= bit;
+      for (size_t i = 0; i < scratch.lows * 2; i += 2)
+        push(low_hits[i + 1], low_hits[i]);
       if (doc % LINE_DOCS == LINE_DOCS - 1 || p == file_end)
         flush(doc);
     }
@@ -600,19 +640,19 @@ static void build_lists(size_t p, Scratch &scratch) {
   memset(group_starts, 0, (groups + 2) * 4);
   for (size_t i = 0; i < used / 2; i++) {
     u16 entry = log[i];
-    if (entry < MARKER) {
-      counts[entry >> GROUP_BITS]++;
+    if (!(entry & 1)) {
+      counts[entry >> HIT_TERM_SHIFT]++;
     } else if (entry == LOG_END) {
       i |= LOG_BLOCK / 2 - 1;
     } else {
       runs[run_count++] = i;
-      group_starts[(entry & ~MARKER) + 2]++;
+      group_starts[(entry >> 1) + 2]++;
     }
   }
   for (size_t g = 2; g < groups + 2; g++)
     group_starts[g] += group_starts[g - 1];
   for (size_t i = 0; i < run_count; i++)
-    order[group_starts[(log[runs[i]] & ~MARKER) + 1]++] = runs[i];
+    order[group_starts[(log[runs[i]] >> 1) + 1]++] = runs[i];
 
   u32 cursors[PARTITION_TERMS], sum = 0;
   for (size_t term = 0; term < PARTITION_TERMS; term++) {
@@ -630,16 +670,16 @@ static void build_lists(size_t p, Scratch &scratch) {
   u32 last[PARTITION_TERMS];
   memset(last, 255, sizeof last);
   for (size_t r = 0; r < run_count; r++) {
-    u32 run = order[r], group = log[run] & ~MARKER;
+    u32 run = order[r], group = log[run] >> 1;
     size_t run_block = group >> GROUPS_PER_BLOCK_BITS;
     while (block < run_block) {
       mark(++block);
       memset(last, 255, sizeof last);
     }
     u32 group_low = (group & ((1 << GROUPS_PER_BLOCK_BITS) - 1)) << GROUP_BITS;
-    for (u32 i = run + 1; log[i] < MARKER; i++) {
-      size_t term = log[i] >> GROUP_BITS;
-      u32 doc_low = group_low | (log[i] & (GROUP_DOCS - 1));
+    for (u32 i = run + 1; !(log[i] & 1); i++) {
+      size_t term = log[i] >> HIT_TERM_SHIFT;
+      u32 doc_low = group_low | (log[i] >> 1 & (GROUP_DOCS - 1));
       // A term repeated within a document appears once per token.
       image[cursors[term]] = doc_low;
       cursors[term] += last[term] != doc_low;
@@ -826,8 +866,8 @@ struct Evaluator {
   void apply(u32 op, u32 id) {
     if (!dense && !n && op != OP_OR)
       return;
-    if (id < high_terms) {
-      const u64 *row = high_bits + id * words;
+    if (id >= low_terms) {
+      const u64 *row = high_bits + (id - low_terms) * words;
       if (dense) {
         for (size_t i = 0; i < words; i += 4) {
           v4 x = load(bits + i), y = load(row + i);
@@ -842,7 +882,7 @@ struct Evaluator {
       }
       return;
     }
-    size_t nl = decode_list(id - high_terms, l);
+    size_t nl = decode_list(id, l);
     if (dense) {
       if (op == OP_AND) {
         std::swap(r, l);
@@ -893,7 +933,7 @@ struct Evaluator {
   // A last OR or NOT needs no result list: the shared ids give its size and sum, and
   // only the start of the result is built.
   void finish_from_shared(u32 op, u32 id, std::string &out) {
-    size_t nl = decode_list(id - high_terms, l), shared = find_shared(nl);
+    size_t nl = decode_list(id, l), shared = find_shared(nl);
     u64 sum = sum_of(r, n) - sum_of(tmp, shared);
     if (op == OP_OR) {
       u32 first[20];
@@ -910,7 +950,7 @@ struct Evaluator {
     auto op = [](u32 term) { return term & ((1 << OP_BITS) - 1); };
     auto key = [&](u32 term) {
       u32 id = term >> OP_BITS;
-      u64 size = id < high_terms ? UINT32_MAX : list_size(id - high_terms);
+      u64 size = id >= low_terms ? UINT32_MAX : list_size(id);
       return size | (u64)(op(term) == OP_NOT) << 32;
     };
     for (size_t i = 0; i < count;) {
@@ -924,16 +964,16 @@ struct Evaluator {
     u32 base = terms[0] >> OP_BITS;
     n = 0;
     dense = false;
-    if (base < high_terms)
-      to_dense(high_bits + base * words);
+    if (base >= low_terms)
+      to_dense(high_bits + (base - low_terms) * words);
     else
-      n = decode_list(base - high_terms, r);
+      n = decode_list(base, r);
     for (size_t i = 1; i + 1 < count; i++)
       apply(op(terms[i]), terms[i] >> OP_BITS);
     if (count > 1) {
       u32 last_op = op(terms[count - 1]), last = terms[count - 1] >> OP_BITS;
-      if (!dense && last_op != OP_AND && last >= high_terms &&
-          n + list_size(last - high_terms) <= words * 2) {
+      if (!dense && last_op != OP_AND && last < low_terms &&
+          n + list_size(last) <= words * 2) {
         finish_from_shared(last_op, last, out);
         return;
       }
