@@ -11,7 +11,7 @@
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
-#include <thread>
+#include <pthread.h>
 #include <unistd.h>
 
 using u8 = uint8_t;
@@ -24,7 +24,7 @@ constexpr auto relaxed = std::memory_order_relaxed;
 #define INLINE [[gnu::always_inline]] inline
 
 const size_t CHUNK = 1 << 18, REGION_CHUNK = 1 << 16, UNMAP_STEP = 1 << 23;
-const size_t COUNTRIES = 256, HUGE_PAGE = 1 << 21;
+const size_t COUNTRIES = 256, HUGE_PAGE = 1 << 21, STACK = 1 << 16;
 // Region ids stop below this at every scale (spec section 2.3). Its own entry
 // stays 0 and stands for every id above the table.
 const u32 REGION_END = 1000000;
@@ -63,6 +63,10 @@ static const u8 *map_input(const char *path, size_t &size) {
   void *base =
       mmap(0, size + 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   mmap(base, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
+  // Creates every page table page here. See the note in main.
+  for (size_t off = 0; off < size; off += HUGE_PAGE)
+    *(volatile const u8 *)((const u8 *)base + off);
+  *(volatile const u8 *)((const u8 *)base + size - 1);
   return (const u8 *)base;
 }
 
@@ -80,6 +84,7 @@ static atomic<u64> *slots;
 static atomic<u64> *name_bits;
 static Group *groups;
 static int threads;
+static std::barrier<> *barrier;
 static atomic<u8> seen_codes[CODES];
 static std::mutex codes_lock;
 static int code_count;
@@ -365,11 +370,11 @@ static size_t first_record(size_t off) {
   return i;
 }
 
-static void worker(int index, std::barrier<> *barrier) {
+static void *worker(void *arg) {
+  size_t index = (size_t)arg;
   load_regions();
   barrier->arrive_and_wait();
   Group *mine = groups + index * COUNTRIES;
-  std::uninitialized_default_construct_n(mine, COUNTRIES);
   for (;;) {
     size_t off = next_chunk.fetch_add(CHUNK, relaxed);
     if (off >= input_size)
@@ -403,6 +408,7 @@ static void worker(int index, std::barrier<> *barrier) {
     distinct_names[country].store(distinct, relaxed);
   }
   barrier->arrive_and_wait();
+  return 0;
 }
 
 static char *money(char *out, long long cents) {
@@ -411,6 +417,13 @@ static char *money(char *out, long long cents) {
 }
 
 int main() {
+  // The first memory charge on a CPU reserves 256 KB for that CPU, and peak memory
+  // counts the reserve. So this thread faults everything the workers will write,
+  // and their CPUs never charge: globals here, then tables, page tables, groups
+  // and stacks below. On 12 CPUs this saves about 2.5 MB.
+  extern char __data_start, _end;
+  for (char *page = &__data_start; page < &_end; page += 4096)
+    *(volatile char *)page = *page;
   memset(LOW_BYTES, 255, 32);
   cpu_set_t cpus;
   sched_getaffinity(0, sizeof cpus, &cpus);
@@ -433,10 +446,21 @@ int main() {
   // or the groups takes 4 KB, not 2 MB.
   prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
   groups = (Group *)zeroed(threads * COUNTRIES * sizeof(Group));
-  std::barrier barrier(threads);
-  for (int t = 1; t < threads; t++)
-    std::thread(worker, t, &barrier).detach();
-  worker(0, &barrier);
+  std::uninitialized_default_construct_n(groups, threads * COUNTRIES);
+  std::barrier all(threads);
+  barrier = &all;
+  u8 *stacks = zeroed(threads * STACK);
+  for (int t = 1; t < threads; t++) {
+    u8 *stack = stacks + t * STACK;
+    for (size_t off = STACK / 2; off < STACK; off += 4096)
+      stack[off] = 0;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstack(&attr, stack, STACK);
+    pthread_t id;
+    pthread_create(&id, &attr, worker, (void *)(size_t)t);
+  }
+  worker(0);
 
   // Countries in code order are already sorted, and _UNMATCHED sorts last.
   char text[32768], *out = text;
