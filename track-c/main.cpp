@@ -81,14 +81,14 @@ struct Job {
 // rest takes 4 KB pages.
 struct Memory {
   u8 by_id[NAMES_AT];
-  atomic<u32> slots[1 << NAME_BITS];
-  atomic<u64> name_bits[COUNTRIES * WORDS];
+  atomic<u64> slots[1 << NAME_BITS], name_bits[COUNTRIES * WORDS];
   Group groups[MAX_THREADS * COUNTRIES];
   u8 stacks[MAX_THREADS][STACK];
   alignas(4096) u8 lengths[COUNTRIES];
   std::atomic_flag codes_lock;
   int code_count;
   atomic<bool> bits_ready;
+  alignas(64) atomic<size_t> mapped;
   Job region_job, chunk_job, country_job;
   // One more than there are codes, so the last entry stands for _UNMATCHED.
   atomic<u8> seen_codes[CODES + 1];
@@ -187,27 +187,28 @@ INLINE u64 hash_name(const u8 *p, size_t len, __m128i key) {
 // so a hit does not branch on where the hash sits. A bucket fills in order, so a
 // thread that sees a free way has not missed its hash further along, and losing
 // the race for a way only means looking at the winner's hash.
-INLINE size_t intern(atomic<u32> *table, u64 hash) {
+INLINE size_t intern(atomic<u64> *table, u64 hash) {
   size_t bucket = hash >> (67 - NAME_BITS);
-  u32 tag = hash;
-  v4 want = _mm256_set1_epi32(tag);
+  v4 want = _mm256_set1_epi64x(hash);
   auto mask = [](v4 x, v4 y) -> u32 {
-    return _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(x, y)));
+    return _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(x, y)));
   };
   for (;;) {
     auto at = table + bucket * 8;
-    v4 ways = _mm256_load_si256((const v4 *)at);
-    u32 hit = mask(ways, want);
+    v4 low = _mm256_load_si256((const v4 *)at);
+    v4 high = _mm256_load_si256((const v4 *)(at + 4));
+    u32 hit = mask(low, want) | mask(high, want) << 4;
     if (hit)
       return bucket * 8 + __builtin_ctz(hit);
-    u32 free = mask(ways, _mm256_setzero_si256());
+    v4 zero = _mm256_setzero_si256();
+    u32 free = mask(low, zero) | mask(high, zero) << 4;
     if (!free) {
       bucket = (bucket + 1) & ((1 << (NAME_BITS - 3)) - 1);
       continue;
     }
     int way = __builtin_ctz(free);
-    u32 actual = 0;
-    if (at[way].compare_exchange_strong(actual, tag, relaxed) || actual == tag)
+    u64 actual = 0;
+    if (at[way].compare_exchange_strong(actual, hash, relaxed) || actual == hash)
       return bucket * 8 + way;
   }
 }
@@ -217,8 +218,7 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
   const __m128i top = _mm_set1_epi32(REGION_END);
   const __m128i three = _mm_setr_epi16(3, 0, 3, 0, 0, 0, 0, 0);
   const __m128i key = _mm_set_epi64x(0x8BB84B93962EACC9, 0x2D358DCCAA6C78A5);
-  const auto table = mem.slots;
-  const auto bits = mem.name_bits;
+  const auto table = mem.slots, bits = mem.name_bits;
   u32 marks[MAX_MARKS];
   // Number of "" pairs in the field each mark ends. It stays mostly zero.
   u32 pairs[MAX_MARKS + 8] = {};
@@ -423,16 +423,20 @@ static int worker(void *index) {
   run(mem.region_job, regions_size - 1, REGION_CHUNK, load_regions);
   while (!mem.bits_ready)
     _mm_pause();
-  // See the note in main. The other threads start at the file's start, and this
-  // moves far faster than they do, so it stays ahead of them.
+  // See the note in main. This moves far faster than the other threads, which
+  // wait for it only if they ever catch up.
   if (!index)
-    for (size_t off = 0; off < input_size; off += HUGE_PAGE)
+    for (size_t off = 0; off < input_size; mem.mapped.store(off, relaxed)) {
       *(volatile const u8 *)(input + off);
+      off += HUGE_PAGE;
+    }
   Group *mine = mem.groups + (size_t)index * COUNTRIES;
   run(mem.chunk_job, input_size, CHUNK, [=](size_t off) {
     // The first search skips the header, as it starts with no LF before it.
     size_t first = first_record(off + !off);
     size_t stop = std::min(off + CHUNK, input_size);
+    while (mem.mapped.load(relaxed) < std::min(stop + HUGE_PAGE, input_size))
+      _mm_pause();
     // Faults together here, not between the batches of a chunk, as each one costs
     // the parsing loop its cached state. The kernel maps 64 KB per fault.
     for (size_t at = off; at < stop; at += 1 << 16)
