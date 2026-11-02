@@ -61,7 +61,7 @@ static const u8 *map_input(const char *path, size_t &size) {
   auto base = (const u8 *)((raw + HUGE_PAGE - 1) & -HUGE_PAGE);
   mmap((void *)base, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
   // Page tables for the first of it. See the note in main.
-  for (size_t off = 0; off < std::min(size, 2 * HUGE_PAGE); off += HUGE_PAGE)
+  for (size_t off = 0; off < std::min(size, 8 * HUGE_PAGE); off += HUGE_PAGE)
     *(volatile const u8 *)(base + off);
   return base;
 }
