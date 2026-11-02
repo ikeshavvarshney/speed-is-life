@@ -17,7 +17,7 @@ constexpr auto relaxed = std::memory_order_relaxed;
 #define INLINE [[gnu::always_inline]] inline
 #define LOAD(p) _mm_loadu_si128((const __m128i *)(p))
 
-const size_t CHUNK = 1 << 17, REGION_CHUNK = 1 << 16, UNMAP = 1 << 23;
+const size_t CHUNK = 1 << 18, REGION_CHUNK = 1 << 16, UNMAP = 1 << 23;
 // 240 countries at every scale (spec section 2.3), plus _UNMATCHED. The box has 12
 // threads, and more than that would only cost time.
 const size_t COUNTRIES = 241, HUGE_PAGE = 1 << 21, MAX_THREADS = 12;
@@ -419,10 +419,8 @@ static int worker(void *index) {
   // See the note in main. This moves far faster than the other threads, which
   // wait for it only if they ever catch up.
   if (!index)
-    for (size_t off = 0; off < input_size; mem.mapped.store(off, relaxed)) {
+    for (size_t off = 0; off < input_size; mem.mapped = off += HUGE_PAGE)
       *(volatile const u8 *)(input + off);
-      off += HUGE_PAGE;
-    }
   Group *mine = mem.groups + (size_t)index * COUNTRIES;
   run(mem.chunk_job, input_size, CHUNK, [=](size_t off) {
     size_t stop = std::min(off + CHUNK, input_size);
