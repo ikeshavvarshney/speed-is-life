@@ -21,9 +21,7 @@ const size_t CHUNK = 1 << 18, REGION_CHUNK = 1 << 16, UNMAP = 1 << 23;
 // 240 countries at every scale (spec section 2.3), plus _UNMATCHED. The box has 12
 // threads, and more than that would only cost time.
 const size_t COUNTRIES = 241, HUGE_PAGE = 1 << 21, MAX_THREADS = 12;
-// Not a multiple of 4 KB, so the stacks of threads sharing a core use different L1
-// cache sets.
-const size_t STACK = 9088, LINE = 128;
+const size_t STACK = 1 << 13, LINE = 128;
 // Region ids stop below this at every scale (spec section 2.3). Its own entry
 // stays 0 and stands for every id above the table.
 const u32 REGION_END = 1000000;
@@ -83,7 +81,8 @@ struct Job {
 // rest takes 4 KB pages.
 struct Memory {
   u8 by_id[NAMES_AT];
-  atomic<u64> slots[1 << NAME_BITS], name_bits[COUNTRIES * WORDS];
+  atomic<u32> slots[1 << NAME_BITS];
+  atomic<u64> name_bits[COUNTRIES * WORDS];
   Group groups[MAX_THREADS * COUNTRIES];
   u8 stacks[MAX_THREADS][STACK];
   alignas(4096) u8 lengths[COUNTRIES];
@@ -188,28 +187,27 @@ INLINE u64 hash_name(const u8 *p, size_t len, __m128i key) {
 // so a hit does not branch on where the hash sits. A bucket fills in order, so a
 // thread that sees a free way has not missed its hash further along, and losing
 // the race for a way only means looking at the winner's hash.
-INLINE size_t intern(atomic<u64> *table, u64 hash) {
+INLINE size_t intern(atomic<u32> *table, u64 hash) {
   size_t bucket = hash >> (67 - NAME_BITS);
-  v4 want = _mm256_set1_epi64x(hash);
+  u32 tag = hash;
+  v4 want = _mm256_set1_epi32(tag);
   auto mask = [](v4 x, v4 y) -> u32 {
-    return _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(x, y)));
+    return _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(x, y)));
   };
   for (;;) {
     auto at = table + bucket * 8;
-    v4 low = _mm256_load_si256((const v4 *)at);
-    v4 high = _mm256_load_si256((const v4 *)(at + 4));
-    u32 hit = mask(low, want) | mask(high, want) << 4;
+    v4 ways = _mm256_load_si256((const v4 *)at);
+    u32 hit = mask(ways, want);
     if (hit)
       return bucket * 8 + __builtin_ctz(hit);
-    v4 zero = _mm256_setzero_si256();
-    u32 free = mask(low, zero) | mask(high, zero) << 4;
+    u32 free = mask(ways, _mm256_setzero_si256());
     if (!free) {
       bucket = (bucket + 1) & ((1 << (NAME_BITS - 3)) - 1);
       continue;
     }
     int way = __builtin_ctz(free);
-    u64 actual = 0;
-    if (at[way].compare_exchange_strong(actual, hash, relaxed) || actual == hash)
+    u32 actual = 0;
+    if (at[way].compare_exchange_strong(actual, tag, relaxed) || actual == tag)
       return bucket * 8 + way;
   }
 }
@@ -219,7 +217,8 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
   const __m128i top = _mm_set1_epi32(REGION_END);
   const __m128i three = _mm_setr_epi16(3, 0, 3, 0, 0, 0, 0, 0);
   const __m128i key = _mm_set_epi64x(0x8BB84B93962EACC9, 0x2D358DCCAA6C78A5);
-  const auto table = mem.slots, bits = mem.name_bits;
+  const auto table = mem.slots;
+  const auto bits = mem.name_bits;
   u32 marks[MAX_MARKS];
   // Number of "" pairs in the field each mark ends. It stays mostly zero.
   u32 pairs[MAX_MARKS + 8] = {};
