@@ -140,6 +140,7 @@ First place had been lost by 0.14 points. Identical code turned out to vary much
 | 30 | Term counts taken while reading queries; anchors and lookup table filled on all threads | run-f724a5b0b64a, run-3de1b2745389, run-db9355c58194 | 0.0643, 0.0672, 0.0650 | 1024 | 44.49 | Yes |
 | 31 | Input prefetch 1024 bytes ahead, as the window loop now runs in bursts | run-adb9de0b31c4, run-4a33d3bf9835, run-ff2e021ab74f | 0.0667, 0.0651, 0.0683 | 1025 | 44.05 | No: slower, and M rose 0.8 MB |
 | | Step 30's code, later run | run-a766fde65b8b | 0.0641 | 1024 | 44.50 | |
+| 32 | Long lists searched where they lie, by 16-bit vectors, when 4 times longer than the ids looked up, which replaced the decoded probe; and trims with no change in behaviour | run-24641180274f | 0.0645 | 1016 | 44.46 | Yes: level in time, 8 fewer lines |
 
 ### Why each one worked, or did not
 
@@ -158,6 +159,8 @@ First place had been lost by 0.14 points. Identical code turned out to vary much
 **Input prefetch (24, 31), rejected twice.** On the laptop a prefetch 512 bytes ahead cut parsing by 20%. On the box neither 512 nor 1024 bytes gained anything, and the second raised peak memory by 0.8 MB. The box's hardware prefetcher keeps up where the laptop's does not, which is the third time the laptop has misled this track.
 
 **Writable prefetch (26), rejected.** The idea was that log lines sit modified in the cache of whichever thread faulted the page, so a store waiting for one holds up all younger stores. One run showed nothing (0.0710 against 0.0706).
+
+**Searching lists in place (32).** Counters showed 18 million of the 60 million decoded ids served under 100,000 probes, all against lists at least 32 times longer than what was looked up in them. A long list is now searched where it lies, skipping 128 then 16 ids at a time with 16-bit compares, and is never decoded. Locally this cut answer time by about 17%, and it made the decoded probe unnecessary.
 
 **Standing boolean queries, simulated and not built.** Matching boolean queries live like phrases, triggered by their rarest term, would drop list terms from the log. An offline simulation on seed 1 with real term frequencies showed each trigger costs more than answering from lists (a trigger fires about 50 times per query), and at best it saves 2.7 MB of log. Not worth the code.
 
