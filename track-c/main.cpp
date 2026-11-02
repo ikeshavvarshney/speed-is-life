@@ -275,7 +275,7 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
     // The hardware prefetcher stops at each 4 KB page, so without this the first
     // lines of every page are demand misses to memory.
     if ((block & 4095) >= 4096 - BLOCKS * 64)
-      for (int i = 1; i <= 6; i++)
+      for (int i = 1; i <= 4; i++)
         _mm_prefetch(base + (block | 4095) + i * 64, _MM_HINT_T0);
     size_t whole = filled / 5, n = 0;
     for (size_t r = 0; r < whole && start < stop; r++) {
