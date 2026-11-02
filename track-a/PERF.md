@@ -120,9 +120,10 @@ Parsing is mostly instruction-bound even here: memory adds only 6 ticks. The hot
 | F6 | E2 with the text written in the log's region, spare regions trimmed from hour 60, line trims | run-333463c45d55 | 0.0172 | 0.267 | 17.9 | 422 | 53.06 | Rejected |
 | F9 | F6 with trimmed regions dropped, the main thread keeping one faulted spare | run-deb83b396eea | 0.0176 | 0.272 | 18.0 | 433 | 52.20 | Rejected |
 | G1 | Step 14 plus only the parts of E2 that cost no memory (below), line trims, one-load digit mask | run-12af58a94720, run-95f8666c90d9 | 0.0153, 0.0154 | 0.230, 0.237 | 17.9, 17.0 | 413 | 56.42, 56.70 | Kept. The second run is the best K so far |
-| G2 | G1 with the PGO profile trained on the laptop and committed as data, so the Dockerfile has no training stage (4 lines fewer) | run-ecc9403f442a, run-f4a113312595, run-9ef3361a61e9 | 0.0159, 0.0159, 0.0155 | 0.245, 0.240, 0.235 | 17.7, 17.2, 17.6 | 409 | 55.59, 55.86, 56.37 | Rejected. About 2.7% slower than G1 on average, which outweighs 4 lines. G1's profile is trained during the build, so in final scoring it is trained on the box with 12 real threads |
+| G2 | G1 with the PGO profile trained on the laptop and committed as data, so the Dockerfile has no training stage (4 lines fewer) | run-ecc9403f442a, run-f4a113312595, run-9ef3361a61e9 | 0.0159, 0.0159, 0.0155 | 0.245, 0.240, 0.235 | 17.7, 17.2, 17.6 | 409 | 55.59, 55.86, 56.37 | Kept, see G4 |
 | G3 | G2 with regions trimmed only once every hour has started, as the peak is at the end | run-a2375667e3e7 | 0.0188 | 0.290 | 20.0 | 411 | 49.79 | Rejected. Regions faulted in mid-run bursts stayed charged, and all the releases landed on the final tail |
-| G4 | G1 with one name shortened so a line no longer wraps (402 lines) | see push log | | | | 412 | | Final version, same code as G1 |
+| G4 | G1's source with one name shortened so a line no longer wraps, profile trained in the build | run-1ddb3ed8560f, run-a2cc3d2e6077 | 0.0182, 0.0166 | 0.279, 0.256 | 18.3, 16.5 | 412 | 51.48, 55.01 | Rejected, and it changed the plan. The rename cannot change the code, and the second run reused the same cached image. So the build itself was slower: a profile trained during the build varies from build to build, and final scoring builds once on the box |
+| G5 | G4's source with G2's committed profile: the binary is byte-identical to G2's (sha256 `595f6323...`), with one line fewer | see push log | | | | 408 | | Final version. Its build is deterministic, so the final build is the binary measured as G2 |
 
 **What G1 changed, and why:**
 
@@ -131,7 +132,7 @@ Parsing is mostly instruction-bound even here: memory adds only 6 ticks. The hot
 3. **Scratch.** Selection's scratch sits right after the hour's values instead of at the top of the region, so it lands in pages already touched.
 4. **Digit mask.** The latency's digits are masked by one table load rather than a computed shift, an `andnot` and an `and`.
 
-G1's two runs average A/B 0.2335 against the baseline's 0.248, about 6% less time. The same source with the committed profile (G2) averaged 0.240 over three runs.
+The committed-profile build (G2, now G5) averages A/B 0.240 over three runs, against the baseline's 0.248: about 3% less time, at the same memory and the same line count. Profiles trained during the build gave a fast binary once (G1, 0.230 and 0.237) and a slow one once (G4, 0.279 and 0.256). That is a gamble on a build made once, so a fixed profile is the safer choice for final scoring.
 
 **Why memory stays near 17 to 18 MB:**
 
