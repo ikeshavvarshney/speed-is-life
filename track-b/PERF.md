@@ -1,6 +1,6 @@
 # Track B: performance log
 
-Every step from the reference to the final version, each with the live-board run ID that measured it. Rejected experiments are listed too. A single board run of this track varies by up to about 4%, so small differences below are noise, and I say so where it matters.
+Every step from the reference to the final version, each with the live-board run ID that measured it. Rejected experiments are listed too. A single board run of this track varies by up to about 4% in quiet hours and up to 9% in busy ones, so small differences below are noise, and I say so where it matters. In the second pass every step ran three times.
 
 ## Summary
 
@@ -10,7 +10,8 @@ Every step from the reference to the final version, each with the live-board run
 | First Rust version | run-0136d17c3355 | 0.554 | 162 | 781 | 12.31 | 54.51 | 43 |
 | Second Rust version, mask tokenizer | run-9d8f92934f66 | 0.157 | 58 | 1119 | 26.88 | 71.47 | 5 |
 | C++ port, tuned for the core | run-566f7abf2f2c | 0.154 | 57 | 786 | 28.70 | 72.90 | 6 |
-| Redesign below, final | run-2bb9a8096c33 | 0.0748 | 46.6 | 960 | 41.67 | 80.99 | 1 |
+| Redesign below | run-2bb9a8096c33 | 0.0748 | 46.6 | 960 | 41.67 | 80.99 | 1 |
+| Second pass below, final | run-a766fde65b8b | 0.0641 | 47.1 | 1024 | 44.50 | 82.42 | 1, later 3 |
 
 ## Earlier steps
 
@@ -122,6 +123,44 @@ Measured locally, not pushed:
 - A single malloc arena: 0.5 MB less at first, but query reading got no speedup from threads at all, through lock contention. Removing it later cost no memory.
 - Sized reservations for query vectors: about 1 MB worse, through arena holes.
 
+## Second pass, step by step (2026-11-01)
+
+First place had been lost by 0.14 points. Identical code turned out to vary much more than 4% between single board runs: one build ran 0.0656, 0.0715 and 0.0659 s, and on some pushes every track ran slow together. So from step 28 each version ran three times (the extra runs are the empty "another run of" commits), and I compare medians. This pass measured only through ordinary board runs, with no diagnostic builds.
+
+| Step | Change | Run IDs | T (s), each run | S | Best K | Kept |
+|---|---|---|---|---|---|---|
+| 22 | Lists decoded by explicit vector steps | run-f85ca6b3133e | 0.0737 | 965 | 41.92 | Yes |
+| 23 | Each pass over a document its own function, constants held in registers, log hits made in the vector step | run-9c0388107ef9, run-6dba745a19ca | 0.0778, 0.0735 | 1000 | 41.73 | Yes |
+| 24 | Input prefetch 512 bytes ahead | run-cf6de9963150 | 0.0751 | 1001 | 41.19 | No |
+| 25 | No false sharing: query chunks with their output, and scratch, on cache lines of their own | run-3a11c626966f | 0.0706 | 1000 | 42.55 | Yes |
+| 26 | Claimed log blocks and bitset rows fetched writable ahead of the stores | run-ae6dfe4bfcf4 | 0.0710 | 1003 | 42.39 | No |
+| 27 | clang 17 from `swift:6.2` in place of gcc 16 | run-8571a1f871bf, run-81d8395c92cd | 0.0684, 0.0735 | 999 | 43.29 | Yes |
+| 28 | PGO, trained during the build on generator output (seed 2, full scale) | run-e3980444e2bc, run-7fc8e14c483c, run-0c6de8cd2e04 | 0.0687, 0.0673, 0.0685 | 1003 | 43.62 | Yes |
+| 29 | Token edges through a byte table with no branch, then one long hashing loop | run-17c06e1ba685, run-f72cca4e6414, run-2b76188c8787 | 0.0656, 0.0715, 0.0659 | 1009 | 44.06 | Yes |
+| 30 | Term counts taken while reading queries; anchors and lookup table filled on all threads | run-f724a5b0b64a, run-3de1b2745389, run-db9355c58194 | 0.0643, 0.0672, 0.0650 | 1024 | 44.49 | Yes |
+| 31 | Input prefetch 1024 bytes ahead, as the window loop now runs in bursts | run-adb9de0b31c4, run-4a33d3bf9835, run-ff2e021ab74f | 0.0667, 0.0651, 0.0683 | 1025 | 44.05 | No: slower, and M rose 0.8 MB |
+| | Step 30's code, later run | run-a766fde65b8b | 0.0641 | 1024 | 44.50 | |
+
+### Why each one worked, or did not
+
+**Decoding (22).** Counters around each answer operation put 45% of answer time in list decoding, at 2.4 ns per id, about 7 cycles. The loop was scalar: `out` and the list marks are both `u32` arrays, so the compiler had to assume a store could change the loop bound and reloaded it every iteration. Writing the vector step out (8 ids per `vpmovzxwd`, reading and writing whole vectors past the end into buffers that have room) cut local one-core answers from 325 to 225 ms.
+
+**Registers (23).** The disassembly of the tokenizer showed gcc rebuilding four broadcast constants in every 64-byte window, 12 micro-ops of which 8 on port 5, and reloading two pointers from the stack for every log push. Splitting each pass into its own function was not enough: gcc still rematerialized `set1` constants, so an empty `asm` statement hides their values and they stay in registers. A log hit is now made in the vector step, as a term's id shifted left already holds the entry with its partition above it, so a push fell from about 18 micro-ops to 10. The board showed no gain from this alone (0.0735 against 0.0737), and a local test gave the same 33 cycles per token with and without those micro-ops. The tokenizer was stalling, not short of execution slots, which led to steps 25 and 29.
+
+**False sharing (25).** Neighbouring query chunks are claimed by different threads, and each chunk's output string sat next to its neighbour's in one vector, so every append moved that cache line between cores. The chunk counters written for each term while reading queries had the same problem, and so did `Scratch` once step 23 gave it fields written per document. One `alignas(64)` on each, and output strings moved into their chunk: 4% of the whole run.
+
+**Compiler and profile (27, 28).** The same source under clang 17 ran about 3% faster. PGO on top of it was level to slightly better, and runs of it varied less.
+
+**Branch-free token edges (29).** Each 64-byte window ended its token loop with a mispredicted branch, as the number of tokens in a window varies, about once every 8.6 tokens. Removing one layer at a time locally (classify only, then the token loop, then the hash, the table prefetch and the store) showed the loop's cost was not in its micro-ops. Now the bits where tokens start and end go a byte at a time through the table of bit positions that the vector sorts already use, with no branch at all, and each document's tokens are then hashed in one long, predictable loop. This also removed the restart at a window's unfinished token and the special path for a token longer than a window. Local tokenizer cost fell from 46 to 35 cycles per token, and the board median from 0.0685 to 0.0659 s.
+
+**Setup on all threads (30).** Choosing each phrase's anchor and filling the lookup table ran on one thread at a barrier. Counts are now taken with atomic adds while queries are read, ids are assigned in one short serial pass, and anchors, table entries and query rewriting are done per chunk on all threads. The table's `add` tolerates two threads adding one term at once, and the draft holds each term's count and later its id next to its hash, so a lookup costs one cache line. Median 0.0659 to 0.0650 s for 15 more lines.
+
+**Input prefetch (24, 31), rejected twice.** On the laptop a prefetch 512 bytes ahead cut parsing by 20%. On the box neither 512 nor 1024 bytes gained anything, and the second raised peak memory by 0.8 MB. The box's hardware prefetcher keeps up where the laptop's does not, which is the third time the laptop has misled this track.
+
+**Writable prefetch (26), rejected.** The idea was that log lines sit modified in the cache of whichever thread faulted the page, so a store waiting for one holds up all younger stores. One run showed nothing (0.0710 against 0.0706).
+
+**Standing boolean queries, simulated and not built.** Matching boolean queries live like phrases, triggered by their rarest term, would drop list terms from the log. An offline simulation on seed 1 with real term frequencies showed each trigger costs more than answering from lists (a trigger fires about 50 times per query), and at best it saves 2.7 MB of log. Not worth the code.
+
 ## Bugs the tests caught
 
 Every one of these passed some checks, which is why the checks are layered.
@@ -132,6 +171,7 @@ Every one of these passed some checks, which is why the checks are layered.
 - Tokens of 64 bytes or more were dropped, which made their neighbours look adjacent. The spec caps generated tokens at 32 bytes, so it could not affect scoring, but a fuzzer against the reference found it and the fix is two lines.
 - A limit overflowed in list decoding, which decoded everything as empty, and made answers look 5x faster. A result that good is worth doubting.
 - `munmap` with a fixed 2 MB length unmapped a neighbour on small datasets. These crashes wrote 8 GB of core dumps to my disk, so the test scripts now disable core dumps.
+- My own check script, not the solution: it builds an instrumented copy for the fuzzer and forced thread counts, and when a code change broke the instrumentation patch it went on testing the previous binary and reported a pass. Datasets were still checked on the real build, and nothing wrong was pushed. It now stops on any patch failure and deletes old binaries first.
 - One board run failed to build (run-9e761074ac6e): stripping my timing marks left an `else if` with no body, and my command pushed despite the failed check. Pushes now go through a script that refuses unless the build and all datasets pass.
 
 ## How it was checked
