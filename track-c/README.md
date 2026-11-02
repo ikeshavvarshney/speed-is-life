@@ -30,9 +30,19 @@ The first memory charge on a CPU reserves 256 KB for it, and peak memory counts 
 
 ## Setup and teardown
 
-Threads are raw `clone` calls on preset stacks, which avoids mapping and protecting a stack per thread, and unmapping it on exit. They wait by spinning, as waits last microseconds. A worker may call only what keeps no thread state in libc.
+Threads are raw `clone` calls on preset stacks, which avoids mapping and protecting a stack per thread, and unmapping it on exit. They wait by spinning, as waits last microseconds. A worker may call only what keeps no thread state in libc: with no thread block of its own it shares the main thread's `errno`, so it makes only system calls whose errors do not matter (`madvise`). This is a contest trade-off, not code for a general library, where `pthread_create` with preset stacks would be the safe form. Step 28 in `PERF.md` bundled it with other changes and took T from 0.0194 to 0.0190 s and M from 10.4 to 9.1 MB.
 
 Work is split into jobs with a claim counter and a done counter: regions, chunks, then countries. The last job merges totals, counts bits and formats a line on whichever thread claims it, so nothing runs serially until the final write. Output order comes from the base-26 country code, so nothing is sorted. The same job clears the input's page tables, as process exit would otherwise do that on one thread while the clock runs.
+
+## Limits
+
+The spec rules these cases out, and the code relies on that without checking at run time:
+
+- Ids and amounts have at most 8 digits, counting the amount's dot (`digit_word`).
+- Region ids are below 1,000,000, and `regions.csv` lines are `id,XYZ` with LF endings and three capital letters (spec section 2.3).
+- A newline inside a note is followed by a lowercase word or a quote (spec section 2.2), which lets chunks split without a quote-parity pass.
+- Names are identified by a 64-bit hash, with a collision chance of about 3e-10 on this data.
+- Failures of `open` are not checked. The fixed mapping aborts if its address is taken.
 
 ## Dependencies
 

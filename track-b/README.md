@@ -4,7 +4,7 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-C++20, standard library only, built by clang 17 from the allowlisted `swift:6.2` image with a profile trained during the build on generator output (seed 2; the generator is copied in byte for byte). One thread per available CPU. One pool of threads goes through the steps below, with a barrier between steps, and any serial work runs on one thread at the barrier.
+C++20, standard library only, built by clang 17 from the allowlisted `swift:6.2` image with a profile trained during the build on generator output (seed 2; the generator is copied in byte for byte). One thread per available CPU. One pool of threads goes through the steps below, with a barrier between steps, and any serial work runs on one thread at the barrier. That serial work is the barrier's completion function, `between_steps`, which calls the next entry of a fixed list each time the barrier opens. The list has `nop` entries where no serial work is needed, and its last entry writes the output and exits, so the threads still waiting at that barrier never need joining.
 
 **Queries first.** Queries are read on all threads, and only the terms they use are indexed, which the spec allows. Terms go into a lock-free draft table, which also counts how often each is used. Each boolean query is kept as term ids and operators, so its text is never read again.
 
@@ -24,6 +24,15 @@ C++20, standard library only, built by clang 17 from the allowlisted `swift:6.2`
 **Answers.** Filters between two ORs commute, so a run starts from its smallest list, with NOT last, and the result is the same as strictly left to right, as the spec requires. Lists of similar sizes compare 8 ids against 8 in one vector step, and a list over 4 times longer than the ids looked up in it is searched where it lies by 16-bit vectors, never decoded. The last OR or NOT needs no result list: the ids shared with the last list give the result's size and sum, and only its first ten ids are built. Unions over 1,024 ids move to a bitset, whose count and sum come from an AVX2 positional popcount.
 
 **Memory and the kernel.** The box has huge pages set to `always`, which charges 2 MB for a first touch of a sparse region or a thread stack, so they are off for the process except to fault the lookup table. All threads clear the input's page tables after parsing and give back all memory before the output is written, as exit would otherwise do that on one thread with the clock running. Query reading does no malloc, and every step reuses the same per-thread pages. Everything a thread writes often, such as a chunk's output, sits on a cache line of its own: sharing one with a neighbouring chunk on another thread cost 4% of the run.
+
+## Limits
+
+The spec rules these cases out, and the code relies on that without checking at run time:
+
+- A hash stands in for a term's bytes, with about a 1 in 100 million chance of any collision on this data.
+- Tokens over 32 bytes are hashed by their first and last 16 bytes and their length. That is exact for matching, as the generator caps tokens at 32 bytes, so no query term is longer.
+- At most 262,143 distinct query terms (18-bit ids).
+- Failures of `open` and `mmap` are not checked. Only the output `write` is.
 
 ## Dependencies
 

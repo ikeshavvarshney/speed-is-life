@@ -29,7 +29,7 @@ Every step from the reference to the final version, each with the live-board run
 
 ## Trim and build flags
 
-The first port looked level with Rust on the 2-core laptop, but was slower on the 12-thread box. Three build-level fixes followed, the same on all tracks: writable globals moved off shared cache lines, `u64` given a different type from `size_t` so writes to it do not force sizes and masks to be reloaded, and `-mtune=alderlake` to match the box's P-cores. Tuning for the core appeared to be the largest of these, in the one push that changed it across all tracks. `prefetchw` was tried on tracks C and D and removed in the same push as the first two fixes, so its own cost was not isolated.
+The three build-level fixes shared by all tracks are described once in the [root README](../README.md#port-to-c). This track's runs:
 
 | Step | Run ID | T (s) | M (MB) | S | K | Points |
 |---|---|---|---|---|---|---|
@@ -97,11 +97,11 @@ The board's 9.08 MB and 0.0236 s (run-ed8076394be0, K 42.79) became 10.5 MB and 
 
 | Step | Change | Run ID | T (s) | M (MB) | S | K | Outcome |
 |---|---|---|---|---|---|---|---|
-| Start | | run-33e3561d13f4 | 0.0194 | 10.4 | 378 | 46.17 | |
-| 1 | Raw `clone` on preset stacks, spin waits, merge and formatting on all threads, no `sprintf`, groups and stacks inside the huge pages | run-2db4c74624e2 | 0.0190 | 9.1 | 419 | 47.06 | Kept. M fell because workers stopped charging memory |
-| 2 | Prefetch 6 lines of the next page at each page crossing | run-240aea77489e | 0.0185 | 8.1 | 424 | 48.83 | Kept. C/B 0.295 to 0.285 |
-| 3 | Trim, by vector operators on `__m256i` and one number writer | run-d6efa91552fd | 0.0187 | 9.8 | 362 | 47.85 | Kept, M rose by chance of timing |
-| 4 | No worker is first to write to any page, maps on 2 MB boundaries, one huge page cleared after spawning | run-16b7fc1fb9e4, run-edadce99ac41 | 0.0186, 0.0186 | 8.1, 7.9 | 371 | 49.68, 49.97 | Kept, final version |
+| 27 (start) | | run-33e3561d13f4 | 0.0194 | 10.4 | 378 | 46.17 | |
+| 28 | Raw `clone` on preset stacks, spin waits, merge and formatting on all threads, no `sprintf`, groups and stacks inside the huge pages | run-2db4c74624e2 | 0.0190 | 9.1 | 419 | 47.06 | Kept. M fell because workers stopped charging memory |
+| 29 | Prefetch 6 lines of the next page at each page crossing | run-240aea77489e | 0.0185 | 8.1 | 424 | 48.83 | Kept. C/B 0.295 to 0.285 |
+| 30 | Trim, by vector operators on `__m256i` and one number writer | run-d6efa91552fd | 0.0187 | 9.8 | 362 | 47.85 | Kept, M rose by chance of timing |
+| 31 | No worker is first to write to any page, maps on 2 MB boundaries, one huge page cleared after spawning | run-16b7fc1fb9e4, run-edadce99ac41 | 0.0186, 0.0186 | 8.1, 7.9 | 371 | 49.68, 49.97 | Kept, final version |
 
 **Why memory fell.** The first charge on a CPU reserves 256 KB for that CPU, and `memory.peak` counts the reserve, so 12 CPUs could hold 3 MB nobody uses. A worker now charges nothing when all goes well: the main thread faults the huge pages, the small pages workers write, and page tables. The tables leave 294 KB free in the third huge page, and the groups and stacks fit there, costing no memory or faults.
 

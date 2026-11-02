@@ -40,7 +40,7 @@ Experiments that failed:
 
 ## Port to C++
 
-The first port looked level with Rust on the 2-core laptop, but was slower on the 12-thread box. Three build-level fixes followed, the same on all tracks: writable globals moved off shared cache lines, `u64` given a different type from `size_t` so writes to it do not force sizes and masks to be reloaded, and `-mtune=alderlake` to match the box's P-cores. Tuning for the core appeared to be the largest of these, in the one push that changed it across all tracks. `prefetchw` was tried on tracks C and D and removed in the same push as the first two fixes, so its own cost was not isolated.
+The three build-level fixes shared by all tracks are described once in the [root README](../README.md#port-to-c). This track's runs:
 
 | Step | Run ID | T (s) | M (MB) | S | K | Points |
 |---|---|---|---|---|---|---|
@@ -58,8 +58,32 @@ Rust scored K 20.6 to 21.2 over recent runs, so C++ is level on K. Two memory gu
 | Step | Run ID | T (s) | S | K | Result |
 |---|---|---|---|---|---|
 | Thread stacks capped below 2 MB, so huge pages do not charge them (c8c82af) | not run alone | | | | Reverted: the next push replaced it before it ran |
-| Built with clang 17 from the swift:6.2 image instead of gcc 16 (932f8ed) | run-5162d57c3ae8 | not recorded | 456 | 20.68 | Rejected: inside gcc's range of K 20.1 to 21.3, so no gain |
+| Built with clang 17 from the swift:6.2 image instead of gcc 16 (932f8ed) | run-5162d57c3ae8 | not recorded | 456 | 20.68 | Rejected: inside gcc's range of K 20.1 to 21.3, so no gain. Its T was not logged at the time |
 | Best run: the code of run-950a97e36a10, run again by a later push (d051694) | run-e62eb6af6e64 | 0.1940 | 456 | 21.33 | Same code, so this shows the spread: identical code scored K 20.15 to 21.33 |
 | Back to the gcc 16 build of the best run, run-e62eb6af6e64 (2d0d9ef) | run-2f197a870ae4 | 0.1966 | 456 | 21.11 | Kept, final version |
 
 Over many runs the gcc build scored K 20.1 to 21.3, and the board varies about 2% between runs. One clang run inside that range proved nothing, so the final version is the gcc build that every earlier measurement used.
+
+## Where the time goes
+
+Measured locally on one core of the laptop, full seed 1, before the C++ port (about 1.9 s in all):
+
+| Phase | Time (s) | Share |
+|---|---|---|
+| Parsing | 0.15 | 8% |
+| Placing edges | 0.15 | 8% |
+| Queries | 1.55 | 82% |
+
+Queries cost about 200 ns per popped node, mostly label misses. A cycle counter around each operation put a label lookup at about 105 cycles, the largest single cost, after three wrong guesses about where the time went. That is why the neighbours' labels are prefetched one node ahead. The laptop's 3 MB L3 exaggerates misses against the box's 24 MB, and the box's own split was not measured, which is the largest gap in this log.
+
+Counts from the data set the layout: 98.8% of nodes have out-degree 4 or less, and only 3,478 of 5 million weights exceed 2,047, so four slots and 11 bits of weight cover nearly every edge.
+
+Counting which operations miss mattered more than counting operations. Skipping the edge back to the parent removed a third of relaxations and changed nothing, as those lookups were already cache hits.
+
+## Not tried, and why
+
+- **Contraction hierarchies.** The site says heavy indexes rarely repay themselves on this track. Most targets are near (median Dijkstra rank 512), so the preprocessing over 1.7 million nodes and 5 million edges would have to cost less than the queries it saves, and no design that cheap was found in the time.
+- **Landmarks (ALT).** Each landmark needs a full search and a table of at least 7 MB, and memory carries weight 0.20 in K. Short searches gain least from landmarks, and most searches here are short.
+- **Parallel renumbering.** Renumbering made queries 25 to 30% faster, but its 0.65 to 0.85 s was serial. An order built in parallel during parsing is the most promising untried idea, and is the first item in the README's next 24 hours.
+
+The bucket queue followed a [study of monotone queues](https://arxiv.org/pdf/2409.06061), which predicted a small gain (about 5% locally), and the renumbering test followed [this work on graph reordering](https://arxiv.org/html/2306.10410).

@@ -41,7 +41,7 @@ Experiments that did not pay on the board:
 
 ## Port to C++
 
-The first port looked level with Rust on the 2-core laptop, but was slower on the 12-thread box. Three build-level fixes followed, the same on all tracks: writable globals moved off shared cache lines, `u64` given a different type from `size_t` so writes to it do not force sizes and masks to be reloaded, and `-mtune=alderlake` to match the box's P-cores. Tuning for the core appeared to be the largest of these, in the one push that changed it across all tracks. `prefetchw` was tried on tracks C and D and removed in the same push as the first two fixes, so its own cost was not isolated.
+The three build-level fixes shared by all tracks are described once in the [root README](../README.md#port-to-c). This track's runs:
 
 | Step | Run ID | T (s) | M (MB) | S | K | Points |
 |---|---|---|---|---|---|---|
@@ -123,7 +123,7 @@ Parsing is mostly instruction-bound even here: memory adds only 6 ticks. The hot
 | G2 | G1 with the PGO profile trained on the laptop and committed as data, so the Dockerfile has no training stage (4 lines fewer) | run-ecc9403f442a, run-f4a113312595, run-9ef3361a61e9 | 0.0159, 0.0159, 0.0155 | 0.245, 0.240, 0.235 | 17.7, 17.2, 17.6 | 409 | 55.59, 55.86, 56.37 | Kept, see G4 |
 | G3 | G2 with regions trimmed only once every hour has started, as the peak is at the end | run-a2375667e3e7 | 0.0188 | 0.290 | 20.0 | 411 | 49.79 | Rejected. Regions faulted in mid-run bursts stayed charged, and all the releases landed on the final tail |
 | G4 | G1's source with one name shortened so a line no longer wraps, profile trained in the build | run-1ddb3ed8560f, run-a2cc3d2e6077 | 0.0182, 0.0166 | 0.279, 0.256 | 18.3, 16.5 | 412 | 51.48, 55.01 | Rejected, and it changed the plan. The rename cannot change the code, and the second run reused the same cached image. So the build itself was slower: a profile trained during the build varies from build to build, and final scoring builds once on the box |
-| G5 | G4's source with G2's committed profile: the binary is byte-identical to G2's (sha256 `595f6323...`), with one line fewer | run-64581e133247, run-2edaa439b1b4 | 0.0156, 0.0156 | 0.2395, 0.241 | 17.3, 17.0 | 408 | 56.41, 56.51 | Final version |
+| G5 | G4's source with G2's committed profile: the binary is byte-identical to G2's (sha256 `595f6323...`), with one line fewer | run-64581e133247, run-2edaa439b1b4, run-8d35fd827a7f | 0.0156, 0.0156, 0.0155 | 0.2395, 0.241, 0.233 | 17.3, 17.0, 17.0 | 408 | 56.41, 56.51, 56.79 | Final version. The third run, from a push that changed only Track D, is the best Track A run on the board |
 | B12 | G5 with a committed profile that really covers the hot functions (below), trained on the laptop with 12 threads | run-520d037d2f50 | 0.0169 | 0.260 | 20.3 | 408 | 52.36 | Rejected |
 | B4 | The same, trained with 4 workers on the laptop's 4 CPUs, so idle loops are not inflated by oversubscription | run-465a10a09de0 | 0.0193 | 0.292 | 17.2 | 408 | 50.66 | Rejected |
 | N0 | No profile at all | run-ec2a0b4b177a | 0.0158 | 0.245 | 17.6 | 408 | 55.74 | Rejected: at the slow end of G5's five runs, never better |

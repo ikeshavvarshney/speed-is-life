@@ -23,7 +23,15 @@ C++20, standard library only, statically linked, built by clang 17 from the allo
 - When parsing ends, all threads clear the input's mapping in 8 MB pieces, as exit would otherwise unmap it page by page on one thread with the clock still running.
 - The thread that writes the last hour ends the process.
 
-**Limits.** The spec guarantees the 72-hour span, well-formed lines and exactly 1,842 endpoints. The hour mapping and the 11-bit ids rely on that: more than 2,047 distinct names would not fit, and this is not checked at run time.
+**Limits.** The spec guarantees the 72-hour span, well-formed lines and exactly 1,842 endpoints. The code relies on these and does not check them at run time:
+
+- More than 2,047 distinct names would not fit the 11-bit ids, and `find_name` would write past `order` (`MAX_IDS`).
+- `hour_index` maps only days 30, 31, 1 and 2, and the output label has the year 2026 written in.
+- A chunk's first line must start within 256 bytes of the chunk's start (`memchr` in `parse_or_clear`).
+- Names must average under 128 bytes, or `name_bytes` overflows.
+- Failures of `open`, `mmap` and `pthread_create` are not checked. Only the output `write` is.
+
+Each would be a one-line check. They were left out because the spec rules the cases out, and every line counts toward S.
 
 ## Dependencies
 

@@ -9,6 +9,10 @@ Our entry for [Speed Demon 2026](https://speeddemon.dev), all four tracks in C++
 | `track-c` | Join a hostile CSV | Parse in place, shared name table with per-country bitsets, prefetch pipeline |
 | `track-d` | Shortest paths | Parallel bucketed graph build, bidirectional Dijkstra with small hash tables |
 
+## Port to C++
+
+All four tracks started in Rust, and each moved to C++ for 21 to 30% fewer scored lines at about the same K. The first port looked level with Rust on the 2-core laptop, but was slower on the 12-thread box. Three build-level fixes followed, the same on all tracks: writable globals moved off shared cache lines, `u64` given a different type from `size_t` so writes to it do not force sizes and masks to be reloaded, and `-mtune=alderlake` to match the box's P-cores. Tuning for the core appeared to be the largest of these, in the one push that changed it across all tracks. `prefetchw` was tried on tracks C and D and removed in the same push as the first two fixes, so its own cost was not isolated. Each track's `PERF.md` has its own runs for these steps.
+
 `tools/` holds what we used while building, none of it scored: `bench_<track>.sh` checks a track against the reference on several datasets, and `board_log.py` records each push's board results.
 
 The rest of this file is the organisers' starter guide.

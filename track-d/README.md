@@ -16,7 +16,7 @@ Distances for both directions share one table, so a relaxation touches one slot.
 
 Random label lookups are the largest cost, because node ids are random. So prefetching happens in two stages: pushing a node prefetches its edges, and popping a node reads the next node's edges and prefetches its neighbours' labels, so they are ready when that node is processed.
 
-Each thread owns a small label table. Searches that outgrow it borrow a large one from a shared pool, so no search pays to map or unmap memory, which stalls every thread.
+Each thread owns a small label table. Searches that outgrow it borrow a large one from a shared pool, so no search pays to map or unmap memory, which stalls every thread. A table grows when it is 7/8 full.
 
 ## Dependencies
 
@@ -24,4 +24,14 @@ None. `mimalloc` and `radix-heap` were tried and rejected: see `PERF.md`.
 
 ## With another 24 hours
 
-Reduce line count, and find a cheap way to give node ids locality. Renumbering made queries 25 to 30% faster, but cost more than it saved.
+- Give node ids locality cheaply. Renumbering made queries 25 to 30% faster but cost 0.65 to 0.85 s of serial work, so the next attempt is an order built in parallel during parsing, judged by label misses per popped node.
+- Measure the phase split on the box, as Tracks B and C did, since the laptop's small L3 exaggerates the query share.
+- Try a few landmarks only for the long searches that outgrow the per-thread table, where the tail of the time is.
+
+## Limits
+
+The spec rules these cases out, and the code relies on that without checking at run time:
+
+- Node ids fit in 21 bits (n below 2,097,152), and every query names a node below n.
+- Distances stay below 2^43. A longer path would corrupt a label rather than fail.
+- Failures of `open`, `fstat` and `mmap` are not checked. Only the output `write` is.
