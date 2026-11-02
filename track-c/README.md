@@ -26,7 +26,7 @@ The name table, region table and bitsets are random accesses on nearly every rec
 
 All writable memory is one mapping at a fixed address, so its addresses are constants in instructions. Its first 6 MB take three huge pages, which hold the tables and bitsets, and what those leave free holds each worker's stack and totals, at no extra cost.
 
-The first memory charge on a CPU reserves 256 KB for it, and peak memory counts the reserve. So the main thread faults what workers would otherwise be charged for: the huge pages, the small pages they write, and page tables. Thread 0 keeps making page tables ahead of the others while they parse.
+The first memory charge on a CPU reserves 256 KB for it, and peak memory counts the reserve. So the main thread faults what workers would otherwise be charged for: the huge pages, the small pages they write, and page tables. Thread 0 keeps making page tables ahead of the others while they parse, and a worker waits for the table of its chunk before reading any of it.
 
 ## Setup and teardown
 
@@ -40,4 +40,4 @@ None.
 
 ## With another 24 hours
 
-Removing the bitset's locked instruction gained 8% in a test that lost updates, and three correct designs did not reach it, so a fourth is the largest known target. Add the page table fix that `PERF.md` describes, which makes peak memory steadier, and sample it enough to compare with the final version. Find out why a page crossing burst of 12 lines costs 20% when 4 and 6 are level.
+Removing the bitset's locked instruction gained 8% in a test that lost updates, and three correct designs did not reach it, so a fourth is the largest known target. Find out why a page crossing burst of 12 lines costs 20% when 4 and 6 are level.
