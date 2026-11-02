@@ -5,8 +5,9 @@ set -eu
 cd "$(dirname "$0")/.."
 from="$1"; subject="$2"; note="$3"
 cp "$from/main.cpp" "$from/Dockerfile" track-a/
-[ -f "$from/p.profdata" ] && cp "$from/p.profdata" track-a/
-[ -f "$from/a_ingest.py" ] || rm -f track-a/a_ingest.py
+for extra in p.profdata a_ingest.py; do
+  if [ -f "$from/$extra" ]; then cp "$from/$extra" track-a/; else rm -f "track-a/$extra"; fi
+done
 if git diff --quiet HEAD -- track-a; then
   git commit -q --allow-empty -m "$subject"
 else
