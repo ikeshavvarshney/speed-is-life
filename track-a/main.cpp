@@ -250,10 +250,10 @@ static size_t parse_chunk(const u8 *line, const u8 *end, u32 **heads) {
 }
 
 // One layer of a sorting network: each lane is compared with the lane named in
-// `partner`, and the lanes set in BLEND take the larger value.
-template <int BLEND> INLINE v4 sort_layer(v4 v, v4 partner) {
-  v4 other = _mm256_permutevar8x32_epi32(v, partner);
-  return _mm256_blend_epi32(_mm256_min_epu32(v, other), _mm256_max_epu32(v, other), BLEND);
+// `partner`, and the lanes set in B take the larger value.
+template <int B> INLINE v4 sort_layer(v4 v, v4 partner) {
+  v4 w = _mm256_permutevar8x32_epi32(v, partner);
+  return _mm256_blend_epi32(_mm256_min_epu32(v, w), _mm256_max_epu32(v, w), B);
 }
 
 // Sorts up to eight values in a register, with no branches: lanes past n read as
