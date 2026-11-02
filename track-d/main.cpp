@@ -6,7 +6,6 @@
 #include <fcntl.h>
 #include <immintrin.h>
 #include <mutex>
-#include <pthread.h>
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -475,12 +474,6 @@ int main() {
   cpu_set_t cpus;
   sched_getaffinity(0, sizeof cpus, &cpus);
   int threads = CPU_COUNT(&cpus);
-  // With transparent huge pages always on, the first touch of a default 8 MB
-  // thread stack charges a whole 2 MB page. A stack below 2 MB cannot hold one.
-  pthread_attr_t attr;
-  pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, 1 << 18);
-  pthread_setattr_default_np(&attr);
 
   size_t text_size;
   const u8 *text = map_input("/data/queries.txt", text_size);
