@@ -52,3 +52,13 @@ The first port looked level with Rust on the 2-core laptop, but was slower on th
 | Regrow copy sized exactly | run-950a97e36a10 | 0.1971 | 97.2 | 456 | 21.00 | 66.11 |
 
 Rust scored K 20.6 to 21.2 over recent runs, so C++ is level on K. Two memory guesses failed. Freeing edge lists while merging did nothing, as there are only about 59,000 loose edges, 0.7 MB. Mapping label tables directly did nothing either. Measuring the cgroup peak after each phase then showed the peak falls during search, where a temporary copy made while a label table grows was held twice by doubling. Sizing it exactly cut the peak from 102 to 97 MB. Both failed changes were reverted.
+
+## Final day
+
+| Step | Run ID | T (s) | S | K | Result |
+|---|---|---|---|---|---|
+| Thread stacks capped below 2 MB, so huge pages do not charge them (c8c82af) | not run alone | | | | Reverted: the next push replaced it before it ran |
+| Built with clang 17 from the swift:6.2 image instead of gcc 16 (932f8ed) | run-5162d57c3ae8 | | 456 | 20.68 | Rejected: inside gcc's range of K 20.1 to 21.3, so no gain |
+| Back to the gcc 16 build of the best run, run-e62eb6af6e64 (2d0d9ef) | run-2f197a870ae4 | 0.1966 | 456 | 21.11 | Kept, final version |
+
+Over many runs the gcc build scored K 20.1 to 21.3, and the board varies about 2% between runs. One clang run inside that range proved nothing, so the final version is the gcc build that every earlier measurement used.
