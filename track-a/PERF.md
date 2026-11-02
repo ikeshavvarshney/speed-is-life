@@ -52,3 +52,92 @@ The first port looked level with Rust on the 2-core laptop, but was slower on th
 | Same code, later run | run-a2b887667b80 | 0.0193 | 23.0 | 475 | 46.84 | 83.53 |
 
 Rust scored K 45.4 to 47.3 over recent runs, so C++ is level on K rather than ahead. T is about 10% worse than the best Rust run, and 21% fewer lines make up for it. The cause of the remaining time difference was not found.
+
+## C++ steps after the port (2026-11-01)
+
+Each kept step, in order. "A/B" is Track A's time over Track B's in the same push: B's code did not change, so the ratio separates a change from the box's run-to-run swings of up to 8%.
+
+| Step | Change | Run ID | T (s) | M (MB) | S | K |
+|---|---|---|---|---|---|---|
+| 3 | Render each hour as soon as it is over, restart on a late line, regions reused | run-0c0c1f149f2b | 0.0200 | 15.0 | 459 | 50.31 |
+| 4 | Two walks per chunk, so a core works on two lines at once (one walk retested: 0.0167 against 0.0162) | run-c2e90f05568c | 0.0196 | 15.7 | 481 | 50.01 |
+| 5 | Same code built by clang 17 from the allowlisted `swift:6.2` image with PGO: A/B 0.262 to 0.245, the largest build change | run-8ce8725b186a | 0.0185 | 15.1 | 485 | 51.76 |
+| 6 | Input prefetched into the first cache level | run-9f00557627dd | 0.0181 | 15.6 | 486 | 52.12 |
+| 7 | Free regions trimmed only over the last 12 hours: fewer faults, more memory | run-c49ca13a0e9e | 0.0174 | 17.2 | 486 | 52.06 |
+| 8 | One shared `mmap` of the input, cleared in parallel at the end, prefetch 1024 bytes ahead: A/B 0.231 to 0.215 | run-78f3f98ed06f | 0.0162 | 16.9 | 493 | 54.04 |
+| 9 | Compact rewrite: vector latency parse, one permutation per partition, bounded scratch | run-33e4dbcf61ae | 0.0161 | 17.4 | 454 | 54.51 |
+| 10 | PGO trained on full-scale generated data | run-e6a411d5724b | 0.0160 | 17.4 | 450 | 54.79 |
+| 11 | The main thread alone writes the output, between chunks of parsing | run-5d11c39ef9f9 | 0.0160 | 16.8 | 448 | 55.15 |
+| 12 | Line trim with no change in behaviour | run-95dd669ce84c | 0.0162 | 16.8 | 417 | 55.39 |
+| 13 | The log prefetched in the count pass, as those reads come from other cores | run-6cb9c06217bc | 0.0158 | 17.3 | 418 | 55.73 |
+| 14 | Names in one word, a stall limit of 48 chunks past the frontier, trimming from hour 60 (best single run) | run-8579db581edf | 0.0157 | 17.0 | 408 | 56.42 |
+
+Step 14's code ran unchanged in 49 pushes made for other tracks: T median 0.0161 (0.0157 to 0.0174), M median 17.2 (16.5 to 20.7), A/B median 0.248. Those numbers are the baseline below.
+
+Tried after the port and rejected:
+
+| Change | Run ID | Result |
+|---|---|---|
+| No position-independent code | run-5bf9464c9fa3 | No change in T. The flag stayed, as it costs nothing |
+| `-march=native` | run-08ea6d663463 | A/B 0.219 against 0.210 |
+| Context-sensitive PGO | run-4452aece2aea | No change in T, more build steps |
+| `munmap` of the input after parsing | run-86cf466a4167 | T 0.0214, only 0.2 MB saved |
+| 1 MB chunks | run-7b47901e6784 | T 0.0157 but M 18.6, K 54.53 |
+| Free regions keep 256 KB warm | run-28261bb4ca30 | T 0.0158 but M 19.0, K 54.13 |
+| Render each hour an hour later | run-591ebd369029 | Same T, M 17.7 |
+| Non-temporal prefetch | run-e8b980023d4f | T 0.0171 |
+| Prefetch 512 and 2048 bytes ahead | run-120399faccba, run-fbea911ec097 | T 0.0164 both |
+| Forked workers, each mapping one chunk | run-a4b88ab43be5 | T 0.0180, M 20.4, S 538 |
+| One mapping populated ahead of the parsers | run-3ead9dcb37eb | T 0.0252 |
+| Each thread maps the input | run-19905ebfb7db | M up 3 MB |
+| `pread` of 64 KB chunks | run-c49ca13a0e9e | T 0.0174, 7% slower than `mmap` under clang |
+
+## Final day (2026-11-02): where the time and memory go
+
+**Measured first, on one laptop core** (full seed 1, TSC ticks per line, best of several runs):
+
+| Phase | Ticks per line |
+|---|---|
+| Parse, warm input | 50 |
+| Parse, one 256 KB chunk repeated in cache | 44 |
+| Render: count 10, place 9, select 10, format 5 | 35 |
+
+Parsing is mostly instruction-bound even here: memory adds only 6 ticks. The hot loop is about 83 instructions per line.
+
+**Facts about the data:**
+
+- Hours hold 14,484 to 73,244 lines.
+- The last six hours are among the busiest (58,940 to 73,244), so the memory peak falls at the end of the file, when the output is nearly complete.
+- All 1,842 names appear within the first 100,000 lines, and only the first two hours have new names.
+- 1.2% of latencies need more than 20 bits.
+
+| Step | Change | Run ID | T (s) | A/B | M (MB) | S | K | Verdict |
+|---|---|---|---|---|---|---|---|---|
+| E0 | LSD radix sort of each hour, in place of count, place and select (40 fewer lines) | lab only | | | | | | Rejected: 43 to 54 ticks per line against 33 to 39. Selection with a vector partition is cheaper than three radix passes |
+| E1 | Raw `clone` on preset stacks, spin locks in place of mutexes, `pause` in idle loops | run-0af85f7eb1e9, run-d59fd349b8fa | 0.0414, 0.0203 | 0.623, 0.317 | 16.3, 20.2 | 421 | 34.83, 47.63 | Rejected. With 4 workers on the laptop it was 20% faster, so spinning, not the work, is what hurt at 12 threads |
+| | Step 14 restored, as a reference sample | run-0c380088b249 | 0.0162 | 0.251 | 17.5 | 408 | 55.09 | |
+| E2 | Workers never charge memory: the main thread faults their stacks, the globals, a pool of 10 regions and every input page table | run-70e804ece3b6, run-03f01acc2761 | 0.0149, 0.0161 | 0.232, 0.242 | 20.1, 23.8 | 439 | 55.35, 51.55 | Rejected for memory. Faster, but regions beyond the pool were faulted anyway and nothing was trimmed until the end |
+| F6 | E2 with the text written in the log's region, spare regions trimmed from hour 60, line trims | run-333463c45d55 | 0.0172 | 0.267 | 17.9 | 422 | 53.06 | Rejected |
+| F9 | F6 with trimmed regions dropped, the main thread keeping one faulted spare | run-deb83b396eea | 0.0176 | 0.272 | 18.0 | 433 | 52.20 | Rejected |
+| G1 | Step 14 plus only the parts of E2 that cost no memory (below), line trims, one-load digit mask | run-12af58a94720 | 0.0153 | 0.230 | 17.9 | 413 | 56.42 | Kept |
+| G2 | G1 with the PGO profile committed as data | run-ecc9403f442a | 0.0159 | 0.245 | 17.7 | 409 | 55.59 | Kept, final version |
+
+**What G1 changed, and why:**
+
+1. **Page tables.** The main thread touches one byte of every 2 MB of the input, far ahead of the parsers, so no worker waits to allocate a page table or is charged for one.
+2. **Stacks.** Thread stacks are our own memory, faulted by the main thread, so they need no `mmap`, and no unmapping or `madvise` when a thread ends.
+3. **Scratch.** Selection's scratch sits right after the hour's values instead of at the top of the region, so it lands in pages already touched.
+4. **Digit mask.** The latency's digits are masked by one table load rather than a computed shift, an `andnot` and an `and`.
+
+Over its two runs, G1's A/B averages 0.238 against the baseline's 0.248, about 4% less time.
+
+**Why memory stays near 17 to 18 MB:**
+
+- The output is 10.1 MB on tmpfs.
+- The harness's own processes, the input's page tables (0.47 MB) and the globals add about 2 MB.
+- About five hours are being rendered at the end of the file, each holding its values and its log or text, about 0.65 MB per hour.
+- Each CPU that charges memory keeps a reserve of up to 256 KB, as the kernel charges in batches of 64 pages per CPU, and `memory.peak` counts the reserve.
+
+E2 removed that reserve, but a pool big enough for the busiest moment costs more than the reserve it saves. The leader's 14.8 MB shows that a lower floor exists. Reaching it here would need a render that holds less than a whole hour's values at once.
+
+**Checks for every pushed version:** all 11 local datasets, including full seed 2 and sample seed 3, matched the reference hashes. Repeated runs (6 to 25 per dataset, at 4 and 2 CPUs with 12 threads) all matched. The final binary also matched the reference on 120 generated hostile logs (480 runs), with lines sorted, reversed, shuffled, with stragglers, late hours and boundary latencies.
