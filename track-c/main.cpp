@@ -422,13 +422,12 @@ static int worker(void *index) {
   run(mem.region_job, regions_size - 1, REGION_CHUNK, load_regions);
   while (!mem.bits_ready)
     _mm_pause();
-  // See the note in main. The other threads start at the file's start, and this
-  // moves far faster than they do, so it stays ahead of them.
-  if (!index)
-    for (size_t off = 0; off < input_size; off += HUGE_PAGE)
-      *(volatile const u8 *)(input + off);
   Group *mine = mem.groups + (size_t)index * COUNTRIES;
-  run(mem.chunk_job, input_size, CHUNK, [=](size_t off) {
+  // Chunks are taken far apart, as threads faulting pages under one page table
+  // wait for its lock. 37 shares no factor with a count of chunks near 770.
+  size_t chunks = (input_size + CHUNK - 1) / CHUNK;
+  run(mem.chunk_job, chunks, 1, [=](size_t i) {
+    size_t off = (chunks % 37 ? i * 37 % chunks : i) * CHUNK;
     // The first search skips the header, as it starts with no LF before it.
     size_t first = first_record(off + !off);
     size_t stop = std::min(off + CHUNK, input_size);
@@ -470,6 +469,8 @@ int main() {
           (void *)t);
   // Only the bitsets are on this page, so the workers can load regions meanwhile.
   clear_page(1);
+  for (size_t off = 0; off < input_size; off += HUGE_PAGE)
+    *(volatile const u8 *)(input + off);
   mem.bits_ready = true;
   worker(0);
 
