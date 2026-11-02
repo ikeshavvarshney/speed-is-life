@@ -119,8 +119,10 @@ Parsing is mostly instruction-bound even here: memory adds only 6 ticks. The hot
 | E2 | Workers never charge memory: the main thread faults their stacks, the globals, a pool of 10 regions and every input page table | run-70e804ece3b6, run-03f01acc2761 | 0.0149, 0.0161 | 0.232, 0.242 | 20.1, 23.8 | 439 | 55.35, 51.55 | Rejected for memory. Faster, but regions beyond the pool were faulted anyway and nothing was trimmed until the end |
 | F6 | E2 with the text written in the log's region, spare regions trimmed from hour 60, line trims | run-333463c45d55 | 0.0172 | 0.267 | 17.9 | 422 | 53.06 | Rejected |
 | F9 | F6 with trimmed regions dropped, the main thread keeping one faulted spare | run-deb83b396eea | 0.0176 | 0.272 | 18.0 | 433 | 52.20 | Rejected |
-| G1 | Step 14 plus only the parts of E2 that cost no memory (below), line trims, one-load digit mask | run-12af58a94720 | 0.0153 | 0.230 | 17.9 | 413 | 56.42 | Kept |
-| G2 | G1 with the PGO profile committed as data | run-ecc9403f442a | 0.0159 | 0.245 | 17.7 | 409 | 55.59 | Kept, final version |
+| G1 | Step 14 plus only the parts of E2 that cost no memory (below), line trims, one-load digit mask | run-12af58a94720, run-95f8666c90d9 | 0.0153, 0.0154 | 0.230, 0.237 | 17.9, 17.0 | 413 | 56.42, 56.70 | Kept. The second run is the best K so far |
+| G2 | G1 with the PGO profile trained on the laptop and committed as data, so the Dockerfile has no training stage (4 lines fewer) | run-ecc9403f442a, run-f4a113312595, run-9ef3361a61e9 | 0.0159, 0.0159, 0.0155 | 0.245, 0.240, 0.235 | 17.7, 17.2, 17.6 | 409 | 55.59, 55.86, 56.37 | Rejected. About 2.7% slower than G1 on average, which outweighs 4 lines. G1's profile is trained during the build, so in final scoring it is trained on the box with 12 real threads |
+| G3 | G2 with regions trimmed only once every hour has started, as the peak is at the end | run-a2375667e3e7 | 0.0188 | 0.290 | 20.0 | 411 | 49.79 | Rejected. Regions faulted in mid-run bursts stayed charged, and all the releases landed on the final tail |
+| G4 | G1 with one name shortened so a line no longer wraps (402 lines) | see push log | | | | 412 | | Final version, same code as G1 |
 
 **What G1 changed, and why:**
 
@@ -129,7 +131,7 @@ Parsing is mostly instruction-bound even here: memory adds only 6 ticks. The hot
 3. **Scratch.** Selection's scratch sits right after the hour's values instead of at the top of the region, so it lands in pages already touched.
 4. **Digit mask.** The latency's digits are masked by one table load rather than a computed shift, an `andnot` and an `and`.
 
-Over its two runs, G1's A/B averages 0.238 against the baseline's 0.248, about 4% less time.
+G1's two runs average A/B 0.2335 against the baseline's 0.248, about 6% less time. The same source with the committed profile (G2) averaged 0.240 over three runs.
 
 **Why memory stays near 17 to 18 MB:**
 
