@@ -124,6 +124,7 @@ The board's 9.08 MB and 0.0236 s (run-ed8076394be0, K 42.79) became 10.5 MB and 
 | `pread` of 32 KB | run-def04b3c7790 | 0.0203 | 10.0 | Copying costs more than faulting, as on the earlier tries |
 | Stacks on different L1 sets | run-743efdfe642e | 0.0187 | 8.7 | No gain |
 | 32-bit name tags | run-3a891db55e9c | 0.0192 | 8.9 | No gain, and a far higher collision chance |
+| Name bits set one batch late, so the write prefetch has longer to land | run-7c82d43195f8 | 0.0191 | 8.2 | No gain, 10 lines more |
 
 **The lock.** Without it, T was 0.0172 (run-924c80cb7770, hash mismatch as expected, since it loses updates). That is 8% and level with the fastest teams, so it was worth three designs. Each buffered design had to fetch the same lines, and none beat the plain lock. The remaining gap to 0.0172 is the largest known target.
 

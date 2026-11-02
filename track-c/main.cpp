@@ -21,8 +21,7 @@ const size_t CHUNK = 1 << 18, REGION_CHUNK = 1 << 16, UNMAP = 1 << 23;
 // 240 countries at every scale (spec section 2.3), plus _UNMATCHED. The box has 12
 // threads, and more than that would only cost time.
 const size_t COUNTRIES = 241, HUGE_PAGE = 1 << 21, MAX_THREADS = 12;
-// With the tables, 12 stacks of this size fill the third huge page to 128 bytes.
-const size_t STACK = 9088, LINE = 128;
+const size_t STACK = 1 << 13, LINE = 128;
 // Region ids stop below this at every scale (spec section 2.3). Its own entry
 // stays 0 and stands for every id above the table.
 const u32 REGION_END = 1000000;
@@ -223,18 +222,6 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
   // Number of "" pairs in the field each mark ends. It stays mostly zero.
   u32 pairs[MAX_MARKS + 8] = {};
   alignas(32) Rec recs[MAX_RECORDS];
-  // Bits of the batch before, set a batch late so the prefetch has had time to
-  // bring their lines in before the locked instruction waits for them.
-  u32 later[MAX_RECORDS];
-  size_t later_count = 0;
-  auto set_later = [&] {
-    for (size_t r = 0; r < later_count; r++) {
-      auto &word = bits[later[r] / 64];
-      u64 bit = 1ull << (later[r] % 64);
-      if (!(word.load(relaxed) & bit))
-        word.fetch_or(bit, relaxed);
-    }
-  };
   // Indexed by a byte's low bits, this returns the byte itself only for LF and comma.
   const long long lf_comma = 0xFFFFFF2CFF0AFFFF;
   const v4 finder = _mm256_set_epi64x(lf_comma, -1, lf_comma, -1);
@@ -341,14 +328,14 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
     }
     // A set bit costs no write, and a write costs a locked instruction that
     // often has to fetch the line from another core, so it is the last step.
-    set_later();
-    for (size_t r = 0; r < n; r++)
-      later[r] = recs[r].region;
-    later_count = n;
-    if (start >= stop) {
-      set_later();
-      return;
+    for (size_t r = 0; r < n; r++) {
+      auto &word = bits[recs[r].region / 64];
+      u64 bit = 1ull << (recs[r].region % 64);
+      if (!(word.load(relaxed) & bit))
+        word.fetch_or(bit, relaxed);
     }
+    if (start >= stop)
+      return;
     // Under five marks remain, and the mark after them may already have pairs
     // waiting for it. Fixed moves cost less than calls to copy so little.
     u32 kept_pairs[5];
