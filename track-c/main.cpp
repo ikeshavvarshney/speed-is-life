@@ -17,12 +17,13 @@ constexpr auto relaxed = std::memory_order_relaxed;
 #define INLINE [[gnu::always_inline]] inline
 #define LOAD(p) _mm_loadu_si128((const __m128i *)(p))
 
-const size_t CHUNK = 1 << 15, REGION_CHUNK = 1 << 16, AFTER = 1024;
-const size_t BUFFER = 64 + 1 + CHUNK + AFTER + 2048;
+const size_t CHUNK = 1 << 18, REGION_CHUNK = 1 << 16, UNMAP = 1 << 23;
 // 240 countries at every scale (spec section 2.3), plus _UNMATCHED. The box has 12
 // threads, and more than that would only cost time.
 const size_t COUNTRIES = 241, HUGE_PAGE = 1 << 21, MAX_THREADS = 12;
-const size_t STACK = 1 << 13, LINE = 128;
+// Not a multiple of 4 KB, so the stacks of threads sharing a core use different L1
+// cache sets.
+const size_t STACK = 9088, LINE = 128;
 // Region ids stop below this at every scale (spec section 2.3). Its own entry
 // stays 0 and stands for every id above the table.
 const u32 REGION_END = 1000000;
@@ -90,15 +91,13 @@ struct Memory {
   int code_count;
   atomic<bool> bits_ready;
   Job region_job, chunk_job, country_job;
-  alignas(64) u8 buffers[MAX_THREADS][BUFFER];
   // One more than there are codes, so the last entry stands for _UNMATCHED.
   atomic<u8> seen_codes[CODES + 1];
   char code_of[COUNTRIES][3], lines[COUNTRIES][LINE], text[COUNTRIES * LINE];
 };
 #define mem (*(Memory *)0x60000000)
 
-static const u8 *regions;
-static int input_fd;
+static const u8 *input, *regions;
 static size_t input_size, regions_size, threads;
 
 template <class F> INLINE void run(Job &job, size_t size, size_t step, F f) {
@@ -215,8 +214,8 @@ INLINE size_t intern(atomic<u64> *table, u64 hash) {
   }
 }
 
-static void parse_chunk(const u8 *base, size_t first, size_t stop, Group *mine) {
-  const u8 *ids = mem.by_id;
+static void parse_chunk(size_t first, size_t stop, Group *mine) {
+  const u8 *base = input, *ids = mem.by_id;
   const __m128i top = _mm_set1_epi32(REGION_END);
   const __m128i three = _mm_setr_epi16(3, 0, 3, 0, 0, 0, 0, 0);
   const __m128i key = _mm_set_epi64x(0x8BB84B93962EACC9, 0x2D358DCCAA6C78A5);
@@ -277,6 +276,9 @@ static void parse_chunk(const u8 *base, size_t first, size_t stop, Group *mine) 
     }
     // The hardware prefetcher stops at each 4 KB page, so without this the first
     // lines of every page are demand misses to memory.
+    if ((block & 4095) >= 4096 - BLOCKS * 64)
+      for (int i = 1; i <= 6; i++)
+        _mm_prefetch(base + (block | 4095) + i * 64, _MM_HINT_T0);
     size_t whole = filled / 5, n = 0;
     for (size_t r = 0; r < whole && start < stop; r++) {
       const u32 *m = marks + r * 5;
@@ -356,9 +358,9 @@ static void parse_chunk(const u8 *base, size_t first, size_t stop, Group *mine) 
 // Past a chunk's start, the next record starts after an LF followed by a digit
 // or BOM. Newlines inside notes are always followed by a lowercase word or a
 // quote (spec section 2.2).
-static size_t first_record(const u8 *text, size_t len) {
-  size_t i = 1;
-  while (i < len && !(text[i - 1] == '\n' && (u8(text[i] - '0') < 10 || text[i] == 0xEF)))
+static size_t first_record(size_t off) {
+  size_t i = off;
+  while (i < input_size && !(input[i - 1] == '\n' && (u8(input[i] - '0') < 10 || input[i] == 0xEF)))
     i++;
   return i;
 }
@@ -381,6 +383,14 @@ static char *field(char *p, long long value, int dot = -1) {
 // Merges one country and formats its line. Each worker's group was last written
 // by another core, so doing this on all threads overlaps those misses.
 static void finish_country(size_t country) {
+  // Process exit would otherwise unmap every page of the input on one thread,
+  // while the clock runs. Clearing the page tables now, on all threads, removes
+  // most of that cost. The first turns also take one piece of it each. Each call
+  // interrupts every thread to flush its TLB, so calls must be few.
+  // A call must stop at the end of the file, or it clears what is mapped above.
+  size_t off = country * UNMAP;
+  if (off < input_size)
+    madvise((u8 *)input + off, std::min(UNMAP, input_size - off), MADV_DONTNEED);
   Group total{{}, INT32_MAX, INT32_MIN};
   for (size_t t = 0; t < threads; t++) {
     const Group &from = mem.groups[t * COUNTRIES + country];
@@ -414,17 +424,22 @@ static int worker(void *index) {
   run(mem.region_job, regions_size - 1, REGION_CHUNK, load_regions);
   while (!mem.bits_ready)
     _mm_pause();
+  // See the note in main. The other threads start at the file's start, and this
+  // moves far faster than they do, so it stays ahead of them.
+  if (!index)
+    for (size_t off = 0; off < input_size; off += HUGE_PAGE)
+      *(volatile const u8 *)(input + off);
   Group *mine = mem.groups + (size_t)index * COUNTRIES;
   run(mem.chunk_job, input_size, CHUNK, [=](size_t off) {
-    u8 *buffer = mem.buffers[(size_t)index], *text = buffer + 64;
-    size_t from = off ? off - 1 : 0;
-    size_t len = std::min(off + CHUNK + AFTER, input_size) - from;
-    if (pread(input_fd, text, len, from) != (ssize_t)len)
-      abort();
-    size_t first = first_record(text, len);
-    size_t stop = std::min(off + CHUNK, input_size) - from;
+    // The first search skips the header, as it starts with no LF before it.
+    size_t first = first_record(off + !off);
+    size_t stop = std::min(off + CHUNK, input_size);
+    // Faults together here, not between the batches of a chunk, as each one costs
+    // the parsing loop its cached state. The kernel maps 64 KB per fault.
+    for (size_t at = off; at < stop; at += 1 << 16)
+      *(volatile const u8 *)(input + at);
     if (first < stop)
-      parse_chunk(buffer, 64 + first, 64 + stop, mine);
+      parse_chunk(first, stop, mine);
   });
   run(mem.country_job, COUNTRIES, 1, finish_country);
   return 0;
@@ -436,8 +451,7 @@ int main() {
   sched_getaffinity(0, sizeof cpus, &cpus);
   threads = std::min<size_t>(CPU_COUNT(&cpus), MAX_THREADS);
   regions = map_input("/data/regions.csv", regions_size);
-  input_fd = open("/data/records.csv", O_RDONLY);
-  input_size = lseek(input_fd, 0, SEEK_END);
+  input = map_input("/data/records.csv", input_size);
   if (mmap(&mem, sizeof(Memory), PROT_READ | PROT_WRITE,
            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0) != &mem)
     abort();
