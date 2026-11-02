@@ -432,6 +432,10 @@ static int worker(void *index) {
     // The first search skips the header, as it starts with no LF before it.
     size_t first = first_record(off + !off);
     size_t stop = std::min(off + CHUNK, input_size);
+    // Faults together here, not between the batches of a chunk, as each one costs
+    // the parsing loop its cached state. The kernel maps 64 KB per fault.
+    for (size_t at = off; at < stop; at += 1 << 16)
+      *(volatile const u8 *)(input + at);
     if (first < stop)
       parse_chunk(first, stop, mine);
   });
