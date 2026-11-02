@@ -24,7 +24,7 @@ constexpr auto relaxed = std::memory_order_relaxed;
 #define AES _mm_aesenc_si128
 
 // The box's hardware threads.
-const size_t WORKERS = 12, STACK = 1 << 18, FAULTED = 10;
+const size_t WORKERS = 12, STACK = 1 << 18;
 const size_t CHUNK = 1 << 18, CLEAR_STEP = 1 << 23, HOURS = 72, BLOCK = 256;
 const size_t SLOTS = 1 << 13, MAX_IDS = 1 << 11, NONE = -1;
 // A log entry is id << 21 | is_error << 20 | latency. A latency that does not fit,
@@ -33,7 +33,6 @@ const size_t SLOTS = 1 << 13, MAX_IDS = 1 << 11, NONE = -1;
 const u32 BIG = (1 << 20) - 1, DONE = 1u << 31;
 
 using Text = std::string_view;
-extern char __bss_start[], _end[];
 
 // Table of names, one word each: the high 48 bits of the hash and the id. After the
 // first few lines it is only read, so it is shared without contention and nothing
@@ -50,7 +49,7 @@ alignas(64) static atomic<u32 *> bases[HOURS];
 alignas(64) static std::mutex names_lock, plan_lock;
 static u64 order[MAX_IDS];
 static size_t name_count, sorted, name_end;
-static char *name_bytes;
+alignas(64) static char name_bytes[MAX_IDS * 128];
 // `grace`: a chunk that starts this many minutes into an hour shows that the hour
 // before is over, as the spec has the last upload of an hour land within 10 minutes
 // of its end. After a restart it is too long for any hour to end before all parsing has.
@@ -58,7 +57,7 @@ static size_t parsed, hours_over, next_hour, pooled, carved, grace;
 // What the thread that parsed a chunk leaves for planning the hours: its first line's
 // minute, its lowest hour and a bit to say that it is done. Then each hour's size plus
 // one, which also says that its text is ready.
-alignas(64) static atomic<u32> chunk_states[1 << 12], text_sizes[HOURS];
+alignas(64) static atomic<u32> chunk_states[1 << 14], text_sizes[HOURS];
 static u8 *texts[HOURS];
 
 alignas(64) static size_t input_size, capacity;
@@ -161,15 +160,11 @@ static u32 *take_region() {
   return pooled ? pool[--pooled] : regions + carved++ * capacity;
 }
 
-// The output file grows until the end, so that is when the peak is set. Near the end,
-// memory in a region beyond one spare is worth more to the score given back, and once
-// every hour has started no region is needed again. A region given back is dropped,
-// so that a worker never takes one it would have to fault again.
+// The output file grows until the end, so that is when the peak is set. Only near the
+// end is memory left in a free region worth more to the score than the saved faults.
 static void give_region(const void *region) {
-  if (next_hour == HOURS || (next_hour >= HOURS * 5 / 6 && pooled)) {
+  if (next_hour >= HOURS * 5 / 6)
     madvise((void *)region, capacity * 4, MADV_DONTNEED);
-    return;
-  }
   std::lock_guard guard(plan_lock);
   pool[pooled++] = (u32 *)region;
 }
@@ -389,7 +384,7 @@ static void render_hour(size_t hour, u32 *space) {
     biggest = std::max(biggest, n);
   }
   starts[0] = sum;
-  // Scratch for selection goes right after the values, in pages already faulted.
+  // Scratch for selection goes right after the values, so it touches few new pages.
   u32 *top = values + sum + biggest + 16;
   for (size_t i = 0; i < used; i++) {
     u32 latency = log[i] & BIG, slot = starts[log[i] >> 21]++;
@@ -397,13 +392,11 @@ static void render_hour(size_t hour, u32 *space) {
       latency = log[++i];
     values[slot] = latency;
   }
-  // Near the end, the log's pages past what its text needs are given back at once.
-  if (next_hour >= HOURS * 5 / 6 && used > 40960)
-    madvise(log + 40960, (used - 40960) * 4, MADV_DONTNEED);
+  if (log)
+    give_region(log);
   char label[33] = "2026-MM-DDTHH:00:00Z            ";
   memcpy(label + 5, &stamps[hour], 8);
-  // The log has been read, so its pages hold the text until it is written.
-  u8 *text = (u8 *)(log ? log : take_region()), *cursor = text;
+  u8 *text = (u8 *)take_region(), *cursor = text;
   auto rank = [](size_t p, size_t n) { return (p * n + 99) / 100 - 1; };
   for (size_t i = 0; i < known; i++) {
     u32 id = (u16)names[i], errors = counts[id * 2 + 1];
@@ -481,12 +474,8 @@ static void *worker(void *) {
       render_hour(hour, space);
       give_region(space);
     } else if (!parse_or_clear(heads)) {
-      if (hour > HOURS) {
-        // Regions still idle when every hour has started are not needed again.
-        while (pooled)
-          madvise(take_region(), capacity * 4, MADV_DONTNEED);
+      if (hour > HOURS)
         return nullptr;
-      }
       sched_yield();
     }
   }
@@ -514,15 +503,9 @@ int main(int argc, char **) {
   // scratch space for answering it, or its text, in whole pages.
   capacity = (3 * (input_size / 20 + WORKERS * 2 * BLOCK) + (1 << 17)) & -1024;
   regions = (u32 *)map_zeroed(std::size(pool) * capacity * 4);
-  // The first charge on a CPU reserves 256 KB for that CPU, and peak memory counts the
-  // reserve. So this thread faults what the workers would otherwise be charged for:
-  // globals, their stacks, regions enough for the busiest hours, and the input's page
-  // tables, which it makes far faster than the workers can use them.
-  size_t globals = (size_t)__bss_start & -4096, warm = input_size / 620 + 16384;
-  madvise((void *)globals, (size_t)_end - globals, MADV_POPULATE_WRITE);
-  name_bytes = (char *)take_region();
-  madvise(name_bytes, 1 << 17, MADV_POPULATE_WRITE);
-  madvise(regions + capacity, warm, MADV_POPULATE_WRITE);
+  // This thread makes the input's page tables, far faster than the workers can use
+  // them, so that no worker waits on one or is charged for it. Each thread's stack is
+  // faulted here too, and needs no unmapping when the thread ends.
   size_t table = 0;
   for (; table < 1 << 24; table += 1 << 21)
     *(volatile const u8 *)(input + std::min(table, input_size));
@@ -535,8 +518,6 @@ int main(int argc, char **) {
     pthread_t thread;
     pthread_create(&thread, &attr, worker, nullptr);
   }
-  for (size_t i = 2; i <= FAULTED; i++)
-    madvise(regions + i * capacity, warm, MADV_POPULATE_WRITE);
   for (; table < input_size + (1 << 21); table += 1 << 21)
     *(volatile const u8 *)(input + std::min(table, input_size));
   int out = open("/out/summary.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -544,15 +525,6 @@ int main(int argc, char **) {
   // Writing the last hour ends the process, which needs no threads to be joined.
   u32 *heads[HOURS * 2] = {};
   for (size_t hour = 0; hour < HOURS;) {
-    // Keeps a faulted region spare, so that workers need not fault one, and near the
-    // end no more than one.
-    while (next_hour >= HOURS * 5 / 6 && pooled > 1)
-      madvise(take_region(), capacity * 4, MADV_DONTNEED);
-    if (!pooled && next_hour < HOURS) {
-      u32 *spare = take_region();
-      madvise(spare, warm, MADV_POPULATE_WRITE);
-      give_region(spare);
-    }
     u32 size = text_sizes[hour];
     if (size) {
       if (write(out, texts[hour], size - 1) != size - 1)
