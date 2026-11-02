@@ -1,13 +1,14 @@
 #include <algorithm>
 #include <atomic>
-#include <charconv>
+#include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <immintrin.h>
-#include <sched.h>
+#include <mutex>
 #include <string_view>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <thread>
 #include <unistd.h>
 
 using u8 = unsigned char;
@@ -23,7 +24,7 @@ constexpr auto relaxed = std::memory_order_relaxed;
 #define AES _mm_aesenc_si128
 
 // The box's hardware threads.
-const size_t WORKERS = 12, STACK = 1 << 20;
+const size_t WORKERS = 12;
 const size_t CHUNK = 1 << 18, CLEAR_STEP = 1 << 23, HOURS = 72, BLOCK = 256;
 const size_t SLOTS = 1 << 13, MAX_IDS = 1 << 11, NONE = -1;
 // A log entry is id << 21 | is_error << 20 | latency. A latency that does not fit,
@@ -40,7 +41,7 @@ using Text = std::string_view;
 alignas(64) static atomic<u64> table[SLOTS];
 // Names in the order they were found, and sorted up to `sorted`. Each is a word:
 // its offset in name_bytes << 32 | its length << 16 | its id.
-static std::atomic_flag names_lock;
+static std::mutex names_lock;
 static u64 order[MAX_IDS];
 static size_t name_count, sorted, name_end;
 alignas(64) static char name_bytes[MAX_IDS * 128];
@@ -51,7 +52,7 @@ alignas(64) static atomic<u32 *> bases[HOURS];
 alignas(64) static atomic<size_t> next_chunk, next_clear;
 // Guards the rest: how far parsing has got, which hours are over and taken, the free
 // regions and the turn to write.
-alignas(64) static std::atomic_flag plan_lock;
+alignas(64) static std::mutex plan_lock;
 static size_t parsed_chunks, hours_over, next_hour, pooled, carved;
 // A chunk that starts this many minutes into an hour shows that the hour before is
 // over, as the spec has the last upload of an hour land within 10 minutes of its end.
@@ -78,12 +79,6 @@ INLINE const u8 *low_bytes(size_t n) { return masks + 128 - n; }
 INLINE v4 load(const void *p) { return _mm256_loadu_si256((const v4 *)p); }
 INLINE v2 load2(const void *p) { return _mm_loadu_si128((const v2 *)p); }
 INLINE void store(void *p, v4 v) { _mm256_storeu_si256((v4 *)p, v); }
-
-// Waits are microseconds at most, and waking from a futex takes longer.
-INLINE void lock(std::atomic_flag &held) {
-  while (held.test_and_set())
-    _mm_pause();
-}
 
 // Zeroed readable and writable memory where only touched pages are real, with nothing
 // reserved.
@@ -152,14 +147,13 @@ INLINE u64 hash_name(const u8 *p, size_t len) {
     atomic<u64> &cell = table[slot % SLOTS];
     u64 seen = cell.load(relaxed);
     if (!seen) {
-      lock(names_lock);
+      std::lock_guard guard(names_lock);
       if (!(seen = cell.load(relaxed))) {
         memcpy(name_bytes + name_end, name, len);
         order[name_count++] = name_end << 32 | len << 16 | (name_count + 1);
         name_end += len;
         cell.store(seen = hash >> 16 << 16 | name_count, relaxed);
       }
-      names_lock.clear();
     }
     if ((seen ^ hash) >> 16 == 0)
       return (u16)seen;
@@ -168,10 +162,8 @@ INLINE u64 hash_name(const u8 *p, size_t len) {
 
 // Regions are real memory only where touched, and come back warm when reused.
 static u32 *take_region() {
-  lock(plan_lock);
-  u32 *region = pooled ? pool[--pooled] : regions + carved++ * capacity;
-  plan_lock.clear();
-  return region;
+  std::lock_guard guard(plan_lock);
+  return pooled ? pool[--pooled] : regions + carved++ * capacity;
 }
 
 // The output file grows until the end, so that is when the peak is set. Only near the
@@ -179,9 +171,8 @@ static u32 *take_region() {
 static void give_region(const void *region) {
   if (next_hour >= HOURS * 5 / 6)
     madvise((void *)region, capacity * 4, MADV_DONTNEED);
-  lock(plan_lock);
+  std::lock_guard guard(plan_lock);
   pool[pooled++] = (u32 *)region;
-  plan_lock.clear();
 }
 
 // Takes a block from the hour's region, to append without any sharing.
@@ -356,7 +347,7 @@ INLINE u64 eight_digits(u32 value) {
 // the room.
 INLINE u8 *put_number(u8 *out, u32 value) {
   if (value >= 100000000) [[unlikely]]
-    return *out = ' ', (u8 *)std::to_chars((char *)out + 1, (char *)out + 11, value).ptr;
+    return out + sprintf((char *)out, " %u", value);
   u64 digits = eight_digits(value);
   int skip = __builtin_ctzll(digits | 1ull << 56) / 8;
   u64 word = digits >> (skip * 8) | 0x3030303030303030;
@@ -374,13 +365,14 @@ static void render_hour(size_t hour, u32 *space) {
   u64 *names = (u64 *)(space + MAX_IDS * 3);
   u32 *values = space + MAX_IDS * 5;
   size_t known;
-  // Few names are new after the first hour, so sorting them is a small job.
-  lock(names_lock);
-  std::sort(order + sorted, order + name_count, by_name);
-  std::inplace_merge(order, order + sorted, order + name_count, by_name);
-  sorted = known = name_count;
-  memcpy(names, order, known * 8);
-  names_lock.clear();
+  {
+    // Few names are new after the first hour, so sorting them is a small job.
+    std::lock_guard guard(names_lock);
+    std::sort(order + sorted, order + name_count, by_name);
+    std::inplace_merge(order, order + sorted, order + name_count, by_name);
+    sorted = known = name_count;
+    memcpy(names, order, known * 8);
+  }
   size_t used = cursors[hour].load(relaxed);
   u32 *log = bases[hour].load(relaxed);
   memset(counts, 0, MAX_IDS * 8);
@@ -444,7 +436,7 @@ static void render_hour(size_t hour, u32 *space) {
 // with the hours already taken as over. A late line means starting again without
 // guessing, before the last hour can be written.
 static size_t next_task() {
-  lock(plan_lock);
+  std::lock_guard guard(plan_lock);
   for (u32 state; (state = chunk_states[parsed_chunks]) & DONE; parsed_chunks++) {
     if ((state >> 16 & 255) < hours_over)
       execl("/proc/self/exe", "again", "again", nullptr), _exit(1);
@@ -453,9 +445,7 @@ static size_t next_task() {
   }
   if (parsed_chunks * CHUNK >= input_size)
     hours_over = HOURS;
-  size_t task = next_hour < hours_over ? next_hour++ : HOURS + (next_hour == HOURS);
-  plan_lock.clear();
-  return task;
+  return next_hour < hours_over ? next_hour++ : HOURS + (next_hour == HOURS);
 }
 
 // Parses a chunk or clears a piece of the input, and says if there was any left.
@@ -480,9 +470,7 @@ static bool parse_or_clear(u32 **heads) {
   return off < input_size && (madvise((void *)(input + off), CLEAR_STEP, MADV_DONTNEED), true);
 }
 
-// Runs on a thread with no state of its own in libc, so it may call only what keeps
-// none. Returning ends the thread with no stack to unmap or free.
-static int worker(void *) {
+static void worker() {
   u32 *heads[HOURS * 2] = {};
   for (;;) {
     size_t hour = next_task();
@@ -492,8 +480,8 @@ static int worker(void *) {
       give_region(space);
     } else if (!parse_or_clear(heads)) {
       if (hour > HOURS)
-        return 0;
-      _mm_pause();
+        return;
+      std::this_thread::yield();
     }
   }
 }
@@ -519,10 +507,9 @@ int main(int argc, char **) {
   // scratch space for answering it, or its text, in whole pages.
   capacity = (3 * (input_size / 20 + WORKERS * 2 * BLOCK) + (1 << 17)) & -1024;
   regions = (u32 *)map_zeroed(std::size(pool) * capacity * 4);
-  auto stacks = (char *)map_zeroed(WORKERS * STACK);
-  for (size_t w = 1; w < WORKERS; w++)
-    clone(worker, stacks + w * STACK, CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD, nullptr);
   int out = open("/out/summary.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  for (size_t w = 1; w < WORKERS; w++)
+    std::thread(worker).detach();
   // This thread alone writes, in order, and parses while the next hour is not ready.
   // Writing the last hour ends the process, which needs no threads to be joined.
   u32 *heads[HOURS * 2] = {};
@@ -533,7 +520,7 @@ int main(int argc, char **) {
         _exit(1);
       give_region(texts[hour++]);
     } else if (!parse_or_clear(heads))
-      _mm_pause();
+      std::this_thread::yield();
   }
   _exit(0);
 }
