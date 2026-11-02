@@ -25,7 +25,7 @@ constexpr auto relaxed = std::memory_order_relaxed;
 
 // The box's hardware threads.
 const size_t WORKERS = 12, STACK = 1 << 18;
-const size_t CHUNK = 1 << 18, CLEAR_STEP = 1 << 23, HOURS = 72, BLOCK = 256;
+const size_t CHUNK = 1 << 18, CLEAR_STEP = 1 << 25, HOURS = 72, BLOCK = 256;
 const size_t SLOTS = 1 << 13, MAX_IDS = 1 << 11, NONE = -1;
 // A log entry is id << 21 | is_error << 20 | latency. A latency that does not fit,
 // on about 1% of lines, puts BIG in the entry and takes the next slot whole. An
@@ -461,8 +461,11 @@ static bool parse_or_clear(u32 **heads) {
     return true;
   }
   // Exit would clear the input's page tables on one thread, with the clock running.
+  // Each call interrupts every thread to flush its TLB, so calls are few and large,
+  // and the last stops at the end of the file rather than clear what lies above it.
   off = next_clear.fetch_add(CLEAR_STEP, relaxed);
-  return off < input_size && (madvise((void *)(input + off), CLEAR_STEP, MADV_DONTNEED), true);
+  size_t len = std::min(CLEAR_STEP, input_size - std::min(off, input_size));
+  return len && (madvise((void *)(input + off), len, MADV_DONTNEED), true);
 }
 
 static void *worker(void *) {
