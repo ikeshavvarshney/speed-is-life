@@ -10,7 +10,6 @@
 #include <string>
 #include <sys/mman.h>
 #include <sys/prctl.h>
-#include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -27,8 +26,9 @@ constexpr auto relaxed = std::memory_order_relaxed;
 #define INLINE [[gnu::always_inline]] inline
 
 const size_t CHUNK = 1 << 19, QUERY_CHUNK = 1 << 14;
-const size_t HUGE_PAGE = 1 << 21;
-const size_t PAGE = 1 << 12, RELEASE_STEP = 1 << 22, PROBE_RATIO = 6;
+const size_t PAGE = 1 << 12, HUGE_PAGE = 1 << 21, RELEASE_STEP = 1 << 22;
+// Decoding a list costs about as much per id as a miss in a search of it costs per 32 ids.
+const size_t IN_PLACE_RATIO = 4;
 // Setting bits costs about half as much per id as a merge.
 const size_t DENSE_LIMIT = 1 << 10;
 // A term this frequent among the queries is likely in over 1/32 of documents,
@@ -82,13 +82,11 @@ INLINE v4 gather(v4 x, u32 mask) {
 // stay readable.
 static const u8 *map_input(const char *path, size_t &size) {
   int fd = open(path, O_RDONLY);
-  struct stat info;
-  fstat(fd, &info);
-  size = info.st_size;
+  size = lseek(fd, 0, SEEK_END);
   void *base =
       mmap(0, size + PAGE, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (size)
-    mmap(base, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
+  // An empty file fails here, and its reads see the anonymous mapping.
+  mmap(base, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
   return (const u8 *)base;
 }
 
@@ -343,7 +341,6 @@ struct alignas(64) Scratch {
   vector<Hit> hits;
 };
 
-static int threads;
 static const u8 *text, *input;
 static size_t text_size, input_size, docs, words, chunks, partitions, blocks;
 static size_t high_terms, low_terms, log_span;
@@ -363,15 +360,13 @@ static Counter *next_log_block;
 static Counter next_query, next_plan, next_chunk, next_unmap, next_partition;
 static Counter next_answer, next_release;
 
+// Query lines all end in a newline.
 static void find_query_chunks() {
   bounds = {0};
-  for (size_t at = QUERY_CHUNK; at < text_size; at += QUERY_CHUNK) {
-    auto newline = (const u8 *)memchr(text + at, '\n', text_size - at);
-    at = newline ? newline - text + 1 : text_size;
-    bounds.push_back(at);
+  while (size_t at = text_size - bounds.back()) {
+    at = bounds.back() + std::min(QUERY_CHUNK, at - 1);
+    bounds.push_back((const u8 *)memchr(text + at, '\n', text_size - at) - text + 1);
   }
-  if (bounds.back() < text_size)
-    bounds.push_back(text_size);
   chunks = bounds.size() - 1;
 }
 
@@ -731,20 +726,18 @@ static size_t decode_list(size_t term, u32 *out) {
   return n;
 }
 
-static void push_int(std::string &out, u64 value) {
-  char digits[20];
-  out.append(digits, std::to_chars(digits, digits + 20, value).ptr);
-}
-
 static void write_line(std::string &out, u64 count, u64 sum, const u32 *first) {
-  push_int(out, count);
-  out += ' ';
-  push_int(out, sum);
-  for (u64 i = 0; i < std::min<u64>(count, 10); i++) {
-    out += ' ';
-    push_int(out, first[i]);
-  }
-  out += '\n';
+  char line[256], *end = line;
+  auto put = [&](u64 value, char after) {
+    end = std::to_chars(end, end + 20, value).ptr;
+    *end++ = after;
+  };
+  put(count, ' ');
+  put(sum, ' ');
+  for (u64 i = 0; i < std::min<u64>(count, 10); i++)
+    put(first[i], ' ');
+  end[-1] = '\n';
+  out.append(line, end);
 }
 
 // Counts a bitset's set bits and sums their positions. Nibble lookups give each
@@ -826,19 +819,27 @@ static size_t intersect(const u32 *a, size_t na, const u32 *b, size_t nb, u32 *o
   return n;
 }
 
-// For lists of very different sizes. Each id of the short list skips ahead in the
-// long one by whole vectors and compares 8 at once.
-static size_t probe(const u32 *a, size_t na, const u32 *b, size_t nb, u32 *out) {
-  size_t j = 0, n = 0;
+// For a list far longer than the ids looked up in it: searched where it lies, by whole
+// vectors, so the list is never decoded.
+static size_t probe_list(const u32 *a, size_t na, size_t term, u32 *out) {
+  const u32 *m = list_marks + term * (blocks + 1);
+  auto ids = (const u16 *)(log_regions + (term >> PARTITION_BITS) * log_span);
+  size_t n = 0, block = 0, j = m[0];
   for (size_t i = 0; i < na; i++) {
-    u32 x = a[i];
-    while (j + 64 < nb && b[j + 63] < x)
-      j += 64;
-    while (b[j + 7] < x)
-      j += 8;
-    v4 equal = _mm256_cmpeq_epi32(load(b + j), _mm256_set1_epi32(x));
-    out[n] = x;
-    n += _mm256_movemask_epi8(equal) != 0;
+    size_t at = a[i] >> BLOCK_BITS;
+    if (at != block) {
+      block = at;
+      j = m[at];
+    }
+    const size_t end = m[at + 1];
+    const u16 low = a[i];
+    while (j + 128 <= end && ids[j + 127] < low)
+      j += 128;
+    while (j + 16 <= end && ids[j + 15] < low)
+      j += 16;
+    u32 equal = _mm256_movemask_epi8(_mm256_cmpeq_epi16(load(ids + j), _mm256_set1_epi16(low)));
+    out[n] = a[i];
+    n += (equal & _bzhi_u32(~0u, 2 * std::min<size_t>(end - j, 16))) != 0;
   }
   return n;
 }
@@ -859,10 +860,7 @@ struct Evaluator {
   bool dense = false;
 
   void to_dense(const u64 *start) {
-    if (start)
-      memcpy(bits, start, words * 8);
-    else
-      memset(bits, 0, words * 8);
+    memcpy(bits, start, words * 8);
     for (size_t i = 0; i < n; i++)
       bits[r[i] / 64] |= 1ull << (r[i] % 64);
     dense = true;
@@ -896,6 +894,17 @@ struct Evaluator {
       }
       return;
     }
+    if (!dense && op != OP_OR) {
+      size_t shared = find_shared(id);
+      if (op == OP_AND) {
+        n = shared;
+      } else {
+        n = merge<OP_NOT>(r, n, tmp, shared, l);
+        std::swap(tmp, l);
+      }
+      std::swap(r, tmp);
+      return;
+    }
     size_t nl = decode_list(id, l);
     if (dense) {
       if (op == OP_AND) {
@@ -912,50 +921,43 @@ struct Evaluator {
       }
       return;
     }
-    if (op == OP_OR) {
-      if (n + nl > DENSE_LIMIT) {
-        to_dense(nullptr);
-        apply(op, id);
-        return;
-      }
-      n = merge<OP_OR>(r, n, l, nl, tmp);
-    } else {
-      size_t shared = find_shared(nl);
-      if (op == OP_AND) {
-        n = shared;
-      } else {
-        n = merge<OP_NOT>(r, n, tmp, shared, l);
-        std::swap(tmp, l);
-      }
+    if (n + nl > DENSE_LIMIT) {
+      to_dense(high_bits + high_terms * words);
+      apply(op, id);
+      return;
     }
+    n = merge<OP_OR>(r, n, l, nl, tmp);
     std::swap(r, tmp);
   }
 
-  // Leaves in `tmp` the ids that `r` and `l` share.
-  size_t find_shared(size_t nl) {
+  // Leaves in `tmp` the ids that `r` and the term's list share.
+  size_t find_shared(u32 id) {
+    if (n * IN_PLACE_RATIO < list_size(id))
+      return probe_list(r, n, id, tmp);
+    return shared_with_decoded(decode_list(id, l));
+  }
+
+  size_t shared_with_decoded(size_t nl) {
     for (int i = 0; i < 8; i++) {
       r[n + i] = UINT32_MAX;
       l[nl + i] = UINT32_MAX - 1;
     }
-    if (n * PROBE_RATIO < nl)
-      return probe(r, n, l, nl, tmp);
-    if (nl * PROBE_RATIO < n)
-      return probe(l, nl, r, n, tmp);
     return intersect(r, n, l, nl, tmp);
   }
 
   // A last OR or NOT needs no result list: the shared ids give its size and sum, and
   // only the start of the result is built.
   void finish_from_shared(u32 op, u32 id, std::string &out) {
-    size_t nl = decode_list(id, l), shared = find_shared(nl);
-    u64 sum = sum_of(r, n) - sum_of(tmp, shared);
     if (op == OP_OR) {
+      size_t nl = decode_list(id, l), shared = shared_with_decoded(nl);
+      u64 sum = sum_of(r, n) - sum_of(tmp, shared);
       u32 first[20];
       merge<OP_OR>(r, std::min<size_t>(n, 10), l, std::min<size_t>(nl, 10), first);
       write_line(out, n + nl - shared, sum + sum_of(l, nl), first);
     } else {
+      size_t shared = find_shared(id);
       merge<OP_NOT>(r, std::min(n, shared + 10), tmp, shared, l);
-      write_line(out, n - shared, sum, l);
+      write_line(out, n - shared, sum_of(r, n) - sum_of(tmp, shared), l);
     }
   }
 
@@ -1025,10 +1027,7 @@ static void answer_queries(Scratch &scratch) {
         u32 *end = phrase_docs.data() + matched[phrase + 1];
         std::sort(first, end);
         end = std::unique(first, end);
-        u64 sum = 0;
-        for (u32 *at = first; at < end; at++)
-          sum += *at;
-        write_line(out, end - first, sum, first);
+        write_line(out, end - first, sum_of(first, end - first), first);
         phrase++;
       }
     }
@@ -1040,7 +1039,8 @@ static void after_plan() {
   free(draft.slots);
   munmap(query_slots, text_size * 2);
   munmap(query_lengths, text_size * 2);
-  high_bits = (u64 *)reserve(high_terms * words * 8 + 64);
+  // One more row than terms: nothing writes it, so it reads as zeros.
+  high_bits = (u64 *)reserve((high_terms + 1) * words * 8);
   partitions = low_terms / PARTITION_TERMS + 1;
   // A token takes at least 2 bytes of input, and 2 bytes here.
   log_span = (input_size + (1 << 24)) & -PAGE;
@@ -1069,6 +1069,8 @@ static void after_parsing() {
   munmap((void *)input, input_size + PAGE);
 }
 
+static void nop() {}
+
 static void write_output() {
   int fd = open("/out/results.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
   for (auto &chunk : query_chunks)
@@ -1078,16 +1080,10 @@ static void write_output() {
 }
 
 static void between_steps() noexcept {
+  static void (*const steps[])() = {plan_terms, after_plan, after_parsing,
+                                    nop,        nop,        write_output};
   static int step = 0;
-  if (step == 0)
-    plan_terms();
-  if (step == 1)
-    after_plan();
-  if (step == 2)
-    after_parsing();
-  if (step == 5)
-    write_output();
-  step++;
+  steps[step++]();
 }
 
 static std::barrier<void (*)() noexcept> *sync_all;
@@ -1142,7 +1138,7 @@ int main() {
         lane_orders[mask] |= lane << (8 * used++);
   cpu_set_t cpus;
   sched_getaffinity(0, sizeof cpus, &cpus);
-  threads = CPU_COUNT(&cpus);
+  const int threads = CPU_COUNT(&cpus);
   text = map_input("/data/queries.txt", text_size);
   find_query_chunks();
   size_t size = std::max<size_t>(std::bit_ceil(text_size / 16 + 16), 1 << 10);
