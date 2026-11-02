@@ -17,7 +17,7 @@ constexpr auto relaxed = std::memory_order_relaxed;
 #define INLINE [[gnu::always_inline]] inline
 #define LOAD(p) _mm_loadu_si128((const __m128i *)(p))
 
-const size_t CHUNK = 1 << 18, REGION_CHUNK = 1 << 16, UNMAP = 1 << 23;
+const size_t CHUNK = 1 << 17, REGION_CHUNK = 1 << 16, UNMAP = 1 << 23;
 // 240 countries at every scale (spec section 2.3), plus _UNMATCHED. The box has 12
 // threads, and more than that would only cost time.
 const size_t COUNTRIES = 241, HUGE_PAGE = 1 << 21, MAX_THREADS = 12;
@@ -33,7 +33,7 @@ const int NAME_BITS = 17;
 const size_t WORDS = (1 << NAME_BITS) / 64;
 // The shortest record is 11 bytes and has 5 marks, so a batch holds at most 466
 // marks, plus 4 left over and 8 written past the last.
-const size_t BLOCKS = 12, MAX_MARKS = 512, MAX_RECORDS = MAX_MARKS / 5 + 1;
+const size_t BLOCKS = 16, MAX_MARKS = 512, MAX_RECORDS = MAX_MARKS / 5 + 1;
 
 // One worker's running values for one country, on one cache line. `sums` is
 // added to as one vector: id sum, amount sum, count << 32 | name bytes, note
