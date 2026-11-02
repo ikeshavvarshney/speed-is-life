@@ -123,7 +123,10 @@ Parsing is mostly instruction-bound even here: memory adds only 6 ticks. The hot
 | G2 | G1 with the PGO profile trained on the laptop and committed as data, so the Dockerfile has no training stage (4 lines fewer) | run-ecc9403f442a, run-f4a113312595, run-9ef3361a61e9 | 0.0159, 0.0159, 0.0155 | 0.245, 0.240, 0.235 | 17.7, 17.2, 17.6 | 409 | 55.59, 55.86, 56.37 | Kept, see G4 |
 | G3 | G2 with regions trimmed only once every hour has started, as the peak is at the end | run-a2375667e3e7 | 0.0188 | 0.290 | 20.0 | 411 | 49.79 | Rejected. Regions faulted in mid-run bursts stayed charged, and all the releases landed on the final tail |
 | G4 | G1's source with one name shortened so a line no longer wraps, profile trained in the build | run-1ddb3ed8560f, run-a2cc3d2e6077 | 0.0182, 0.0166 | 0.279, 0.256 | 18.3, 16.5 | 412 | 51.48, 55.01 | Rejected, and it changed the plan. The rename cannot change the code, and the second run reused the same cached image. So the build itself was slower: a profile trained during the build varies from build to build, and final scoring builds once on the box |
-| G5 | G4's source with G2's committed profile: the binary is byte-identical to G2's (sha256 `595f6323...`), with one line fewer | see push log | | | | 408 | | Final version. Its build is deterministic, so the final build is the binary measured as G2 |
+| G5 | G4's source with G2's committed profile: the binary is byte-identical to G2's (sha256 `595f6323...`), with one line fewer | run-64581e133247, run-2edaa439b1b4 | 0.0156, 0.0156 | 0.2395, 0.241 | 17.3, 17.0 | 408 | 56.41, 56.51 | Final version |
+| B12 | G5 with a committed profile that really covers the hot functions (below), trained on the laptop with 12 threads | run-520d037d2f50 | 0.0169 | 0.260 | 20.3 | 408 | 52.36 | Rejected |
+
+**A profile that did not apply.** Comparing two profiles showed why G2 and G5 were so steady. Clang names a `static` function in a profile by the source path it was compiled from. The training compiled `/w/main.cpp` and the Dockerfile compiles `main.cpp`, so the profile matched only `main` and the library's sort routines. Every hot function, from `parse_or_clear` to `select_ranks`, ran unprofiled. A profile trained under the right name (B12) was slower, and so was one of the two builds that trained during the build (G4). So for this code, profiling the hot loops is unreliable, and the final build keeps them unprofiled. Its binary is the same in every build, and its five runs average A/B 0.240, against the baseline's 0.248.
 
 **What G1 changed, and why:**
 
@@ -132,7 +135,7 @@ Parsing is mostly instruction-bound even here: memory adds only 6 ticks. The hot
 3. **Scratch.** Selection's scratch sits right after the hour's values instead of at the top of the region, so it lands in pages already touched.
 4. **Digit mask.** The latency's digits are masked by one table load rather than a computed shift, an `andnot` and an `and`.
 
-The committed-profile build (G2, now G5) averages A/B 0.240 over three runs, against the baseline's 0.248: about 3% less time, at the same memory and the same line count. Profiles trained during the build gave a fast binary once (G1, 0.230 and 0.237) and a slow one once (G4, 0.279 and 0.256). That is a gamble on a build made once, so a fixed profile is the safer choice for final scoring.
+The final build (G2, now G5) averages A/B 0.240 over five runs, against the baseline's 0.248: about 3% less time, at the same memory and the same line count. Profiles trained during the build gave a fast binary once (G1, 0.230 and 0.237) and a slow one once (G4, 0.279 and 0.256). That is a gamble on a build made once, so a fixed build is the safer choice for final scoring.
 
 **Why memory stays near 17 to 18 MB:**
 
