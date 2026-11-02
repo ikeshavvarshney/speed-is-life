@@ -34,7 +34,7 @@ const size_t WORDS = (1 << NAME_BITS) / 64;
 // The shortest record is 11 bytes and has 5 marks, so a batch holds at most 466
 // marks, plus 4 left over and 8 written past the last.
 const size_t BLOCKS = 16, MAX_MARKS = 512, MAX_RECORDS = MAX_MARKS / 5 + 1;
-const size_t PARTS = 64, PENDING = 32;
+const size_t PENDING = 16;
 
 // One worker's running values for one country, on one cache line. `sums` is
 // added to as one vector: id sum, amount sum, count << 32 | name bytes, note
@@ -43,6 +43,7 @@ const size_t PARTS = 64, PENDING = 32;
 struct alignas(64) Group {
   u64 sums[4];
   int min, max;
+  u32 pending; // Names waiting to be set in the country's bitset.
 };
 
 struct Rec {
@@ -73,13 +74,9 @@ struct Job {
   alignas(64) atomic<size_t> next, done;
 };
 
-// Name bits a worker has yet to set, by partition of the countries. Setting each
-// bit with a locked instruction cost 8% of the run, measured without the lock.
-// This way a worker takes one lock per PENDING bits, and that lock covers every
-// word of the partition, as each word belongs to one country.
-struct Pending {
-  alignas(64) u32 counts[PARTS], bits[PARTS][PENDING];
-};
+// Setting each name bit with a locked instruction cost 8% of the run, measured
+// without the lock. So a worker holds a few names per country, and takes that
+// country's lock once to set them with plain writes.
 struct alignas(64) Lock {
   std::atomic_flag held;
 };
@@ -102,8 +99,8 @@ struct Memory {
   int code_count;
   atomic<bool> bits_ready;
   Job region_job, chunk_job, flush_job, country_job;
-  Lock part_locks[PARTS];
-  Pending pending[MAX_THREADS];
+  Lock locks[COUNTRIES];
+  u32 pending[MAX_THREADS][COUNTRIES][PENDING];
   // One more than there are codes, so the last entry stands for _UNMATCHED.
   atomic<u8> seen_codes[CODES + 1];
   char code_of[COUNTRIES][3], lines[COUNTRIES][LINE], text[COUNTRIES * LINE];
@@ -227,24 +224,26 @@ INLINE size_t intern(atomic<u64> *table, u64 hash) {
   }
 }
 
-// Applies a batch of bits. Lines come from other cores, so each is prefetched for
-// writing a few bits ahead, which overlaps those misses.
-static void flush(Pending &pending, size_t part) {
-  auto &lock = mem.part_locks[part].held;
+// The lines mostly come from other cores. Fetching them before taking the lock
+// overlaps those misses, and keeps them out of the time the lock is held.
+static void flush(size_t worker, size_t country) {
+  u32 &count = mem.groups[worker * COUNTRIES + country].pending;
+  const u32 *names = mem.pending[worker][country];
+  u64 *words = mem.name_bits + country * WORDS;
+  for (u32 i = 0; i < count; i++)
+    __builtin_prefetch(words + names[i] / 64, 1);
+  auto &lock = mem.locks[country].held;
   while (lock.test_and_set(std::memory_order_acquire))
     _mm_pause();
-  const u32 *bits = pending.bits[part];
-  for (u32 i = 0; i < pending.counts[part]; i++) {
-    __builtin_prefetch(mem.name_bits + (bits[i + 14] >> 6), 1);
-    mem.name_bits[bits[i] >> 6] |= 1ull << (bits[i] & 63);
-  }
+  for (u32 i = 0; i < count; i++)
+    words[names[i] / 64] |= 1ull << (names[i] % 64);
   lock.clear(std::memory_order_release);
-  pending.counts[part] = 0;
+  count = 0;
 }
 
 static void parse_chunk(size_t first, size_t stop, size_t index) {
   Group *mine = mem.groups + index * COUNTRIES;
-  Pending &pending = mem.pending[index];
+  auto pending = mem.pending[index];
   const u8 *base = input, *ids = mem.by_id;
   const __m128i top = _mm_set1_epi32(REGION_END);
   const __m128i three = _mm_setr_epi16(3, 0, 3, 0, 0, 0, 0, 0);
@@ -347,7 +346,7 @@ static void parse_chunk(size_t first, size_t stop, size_t index) {
     // so the cache misses of a batch overlap instead of stalling one at a time.
     for (size_t r = 0; r < n; r++) {
       const Rec &rec = recs[r];
-      u32 country = ids[rec.region], part = country % PARTS;
+      u32 country = ids[rec.region];
       Group &group = mine[country];
       auto sums = (v4 *)group.sums;
       // Every value but the amount is positive, so sign extending suits them all.
@@ -358,10 +357,9 @@ static void parse_chunk(size_t first, size_t stop, size_t index) {
         group.min = amount;
       if (amount > group.max) [[unlikely]]
         group.max = amount;
-      u32 &count = pending.counts[part];
-      pending.bits[part][count++] = country << NAME_BITS | intern(table, rec.hash);
-      if (count == PENDING)
-        flush(pending, part);
+      pending[country][group.pending++] = intern(table, rec.hash);
+      if (group.pending == PENDING)
+        flush(index, country);
     }
     if (start >= stop)
       return;
@@ -459,8 +457,8 @@ static int worker(void *index) {
       parse_chunk(first, stop, (size_t)index);
   });
   // Every worker has finished parsing, so any thread may flush any worker's bits.
-  run(mem.flush_job, threads * PARTS, 1,
-      [](size_t i) { flush(mem.pending[i / PARTS], i % PARTS); });
+  run(mem.flush_job, threads * COUNTRIES, 1,
+      [](size_t i) { flush(i / COUNTRIES, i % COUNTRIES); });
   run(mem.country_job, COUNTRIES, 1, finish_country);
   return 0;
 }
