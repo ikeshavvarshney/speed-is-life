@@ -160,10 +160,11 @@ static u32 *take_region() {
   return pooled ? pool[--pooled] : regions + carved++ * capacity;
 }
 
-// The output file grows until the end, so that is when the peak is set. Only near the
-// end is memory left in a free region worth more to the score than the saved faults.
+// The output file grows until the end, and the busiest hours are the last ones, so the
+// peak is set once every hour has started. Before that a region given back would only
+// be faulted again for a later hour, so only then is what it holds given back.
 static void give_region(const void *region) {
-  if (next_hour >= HOURS * 5 / 6)
+  if (next_hour == HOURS)
     madvise((void *)region, capacity * 4, MADV_DONTNEED);
   std::lock_guard guard(plan_lock);
   pool[pooled++] = (u32 *)region;
@@ -250,10 +251,10 @@ static size_t parse_chunk(const u8 *line, const u8 *end, u32 **heads) {
 }
 
 // One layer of a sorting network: each lane is compared with the lane named in
-// `partner`, and the lanes set in BLEND take the larger value.
-template <int BLEND> INLINE v4 sort_layer(v4 v, v4 partner) {
-  v4 other = _mm256_permutevar8x32_epi32(v, partner);
-  return _mm256_blend_epi32(_mm256_min_epu32(v, other), _mm256_max_epu32(v, other), BLEND);
+// `partner`, and the lanes set in B take the larger value.
+template <int B> INLINE v4 sort_layer(v4 v, v4 partner) {
+  v4 w = _mm256_permutevar8x32_epi32(v, partner);
+  return _mm256_blend_epi32(_mm256_min_epu32(v, w), _mm256_max_epu32(v, w), B);
 }
 
 // Sorts up to eight values in a register, with no branches: lanes past n read as
@@ -474,8 +475,12 @@ static void *worker(void *) {
       render_hour(hour, space);
       give_region(space);
     } else if (!parse_or_clear(heads)) {
-      if (hour > HOURS)
+      if (hour > HOURS) {
+        // Regions still idle when every hour has started are not needed again.
+        while (pooled)
+          madvise(take_region(), capacity * 4, MADV_DONTNEED);
         return nullptr;
+      }
       sched_yield();
     }
   }
