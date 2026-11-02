@@ -60,8 +60,6 @@ static const u8 *map_input(const char *path, size_t &size) {
                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   auto base = (const u8 *)((raw + HUGE_PAGE - 1) & -HUGE_PAGE);
   mmap((void *)base, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
-  // Stops the kernel from marking each page as recently used when it is unmapped.
-  madvise((void *)base, size, MADV_SEQUENTIAL);
   // Page tables for the first of it. See the note in main.
   for (size_t off = 0; off < std::min(size, 8 * HUGE_PAGE); off += HUGE_PAGE)
     *(volatile const u8 *)(base + off);
@@ -277,7 +275,7 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
     // The hardware prefetcher stops at each 4 KB page, so without this the first
     // lines of every page are demand misses to memory.
     if ((block & 4095) >= 4096 - BLOCKS * 64)
-      for (int i = 1; i <= 6; i++)
+      for (int i = 1; i <= 12; i++)
         _mm_prefetch(base + (block | 4095) + i * 64, _MM_HINT_T0);
     size_t whole = filled / 5, n = 0;
     for (size_t r = 0; r < whole && start < stop; r++) {
