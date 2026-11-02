@@ -58,7 +58,8 @@ Rust scored K 20.6 to 21.2 over recent runs, so C++ is level on K. Two memory gu
 | Step | Run ID | T (s) | S | K | Result |
 |---|---|---|---|---|---|
 | Thread stacks capped below 2 MB, so huge pages do not charge them (c8c82af) | not run alone | | | | Reverted: the next push replaced it before it ran |
-| Built with clang 17 from the swift:6.2 image instead of gcc 16 (932f8ed) | run-5162d57c3ae8 | | 456 | 20.68 | Rejected: inside gcc's range of K 20.1 to 21.3, so no gain |
+| Built with clang 17 from the swift:6.2 image instead of gcc 16 (932f8ed) | run-5162d57c3ae8 | not recorded | 456 | 20.68 | Rejected: inside gcc's range of K 20.1 to 21.3, so no gain |
+| Best run: the code of run-950a97e36a10, run again by a later push (d051694) | run-e62eb6af6e64 | 0.1940 | 456 | 21.33 | Same code, so this shows the spread: identical code scored K 20.15 to 21.33 |
 | Back to the gcc 16 build of the best run, run-e62eb6af6e64 (2d0d9ef) | run-2f197a870ae4 | 0.1966 | 456 | 21.11 | Kept, final version |
 
 Over many runs the gcc build scored K 20.1 to 21.3, and the board varies about 2% between runs. One clang run inside that range proved nothing, so the final version is the gcc build that every earlier measurement used.

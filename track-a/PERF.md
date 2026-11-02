@@ -90,7 +90,7 @@ Tried after the port and rejected:
 | Forked workers, each mapping one chunk | run-a4b88ab43be5 | T 0.0180, M 20.4, S 538 |
 | One mapping populated ahead of the parsers | run-3ead9dcb37eb | T 0.0252 |
 | Each thread maps the input | run-19905ebfb7db | M up 3 MB |
-| `pread` of 64 KB chunks | run-c49ca13a0e9e | T 0.0174, 7% slower than `mmap` under clang |
+| `pread` of 64 KB chunks | local only | 7% slower than `mmap` under clang, measured locally. Its run ID was recorded in error as step 7's (run-c49ca13a0e9e) |
 
 ## Final day (2026-11-02): where the time and memory go
 
