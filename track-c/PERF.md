@@ -93,8 +93,6 @@ The board's 9.08 MB and 0.0236 s (run-ed8076394be0, K 42.79) became 10.5 MB and 
 
 ## Everything around the parse loop, and memory (2026-11-01 to 02)
 
-Full table with every commit and run ID: `OPTIMIZATION_LOG.md`.
-
 **Measure first.** Phase times on the box (run-6339eae738c1), after the first rewrite below, out of about 19.0 ms: exec and exit 0.7 ms, setup on the main thread 0.95 ms, regions 0.2 ms, parse about 16.4 ms by subtraction, post-parse 0.6 ms, output about 0.05 ms. Bits were about 32 cycles per record and group about 30 (run-9609e00b8f24). That run's scan and decode split was spoiled: encoding M with a `memset` before a relative sleep inflated T.
 
 | Step | Change | Run ID | T (s) | M (MB) | S | K | Outcome |
