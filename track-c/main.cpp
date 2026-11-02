@@ -419,8 +419,10 @@ static int worker(void *index) {
   // See the note in main. This moves far faster than the other threads, which
   // wait for it only if they ever catch up.
   if (!index)
-    for (size_t off = 0; off < input_size; mem.mapped = off += HUGE_PAGE)
+    for (size_t off = 0; off < input_size; mem.mapped.store(off, relaxed)) {
       *(volatile const u8 *)(input + off);
+      off += HUGE_PAGE;
+    }
   Group *mine = mem.groups + (size_t)index * COUNTRIES;
   run(mem.chunk_job, input_size, CHUNK, [=](size_t off) {
     size_t stop = std::min(off + CHUNK, input_size);
