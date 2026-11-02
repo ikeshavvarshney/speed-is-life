@@ -39,39 +39,34 @@ extern char __bss_start[], _end[];
 // first few lines it is only read, so it is shared without contention and nothing
 // needs merging. With the slot that gives 60 bits of hash, which over 1,842 names
 // collide with odds of 2e-12. Ids are given out in the order names are first seen.
-alignas(64) static atomic<u64> table[SLOTS];
+// `stamps`, `cursors` and `next_chunk` are written by every thread, so each is kept
+// off the lines that each line of input reads.
+alignas(64) static atomic<u64> table[SLOTS], stamps[HOURS];
+alignas(64) static atomic<size_t> cursors[HOURS], next_chunk, next_clear;
+alignas(64) static atomic<u32 *> bases[HOURS];
 // Names in the order they were found, and sorted up to `sorted`. Each is a word:
-// its offset in name_bytes << 32 | its length << 16 | its id.
-static std::mutex names_lock;
+// its offset in name_bytes << 32 | its length << 16 | its id. `plan_lock` guards the
+// rest: how far parsing has got, which hours are over and taken, and the free regions.
+alignas(64) static std::mutex names_lock, plan_lock;
 static u64 order[MAX_IDS];
 static size_t name_count, sorted, name_end;
 static char *name_bytes;
-// Written by every thread, so kept off the lines that each line of input reads.
-alignas(64) static atomic<u64> stamps[HOURS];
-alignas(64) static atomic<size_t> cursors[HOURS];
-alignas(64) static atomic<u32 *> bases[HOURS];
-alignas(64) static atomic<size_t> next_chunk, next_clear;
-// Guards the rest: how far parsing has got, which hours are over and taken, the free
-// regions and the turn to write.
-alignas(64) static std::mutex plan_lock;
-static size_t parsed_chunks, hours_over, next_hour, pooled, carved;
-// A chunk that starts this many minutes into an hour shows that the hour before is
-// over, as the spec has the last upload of an hour land within 10 minutes of its end.
-// After a restart it is too long for any hour to end before all parsing has.
-static size_t grace;
-static u32 *pool[HOURS * 3];
+// `grace`: a chunk that starts this many minutes into an hour shows that the hour
+// before is over, as the spec has the last upload of an hour land within 10 minutes
+// of its end. After a restart it is too long for any hour to end before all parsing has.
+static size_t parsed, hours_over, next_hour, pooled, carved, grace;
 // What the thread that parsed a chunk leaves for planning the hours: its first line's
-// minute, its lowest hour and a bit to say that it is done.
-alignas(64) static atomic<u32> chunk_states[1 << 12];
-// Each hour's text and one more than its size, which also says that it is ready.
-alignas(64) static atomic<u32> text_sizes[HOURS];
+// minute, its lowest hour and a bit to say that it is done. Then each hour's size plus
+// one, which also says that its text is ready.
+alignas(64) static atomic<u32> chunk_states[1 << 12], text_sizes[HOURS];
 static u8 *texts[HOURS];
 
 alignas(64) static size_t input_size, capacity;
 static const u8 *input;
-static u32 *regions;
-// A vector whose first `n` bytes are set, for n up to 128, then clear bytes.
-alignas(64) static u8 masks[192];
+static u32 *regions, *pool[HOURS * 3];
+// A vector whose first `n` bytes are set, for n up to 128, then clear bytes. After
+// them, 16 zeros and 16 of 15, which keep the low half of the last bytes of a vector.
+alignas(64) static u8 masks[224];
 // For each set of lanes, a permutation that moves them to the front, keeping order,
 // and the other lanes after them.
 static u64 moves[256];
@@ -112,8 +107,7 @@ INLINE u32 parse_latency(const u8 *&p) {
   v2 newline = _mm_cmpeq_epi8(load2(p), _mm_set1_epi8('\n'));
   int len = __builtin_ctz(_mm_movemask_epi8(newline));
   p += len + 1;
-  v2 digits = _mm_andnot_si128(load2(low_bytes(16 - len)), load2(p - 17));
-  digits = _mm_and_si128(digits, _mm_set1_epi8(15));
+  v2 digits = _mm_and_si128(load2(masks + 192 + len), load2(p - 17));
   v2 pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(10 | 1 << 8));
   v2 fours = _mm_madd_epi16(pairs, _mm_set1_epi32(100 | 1 << 16));
   fours = _mm_packus_epi32(fours, fours);
@@ -167,11 +161,15 @@ static u32 *take_region() {
   return pooled ? pool[--pooled] : regions + carved++ * capacity;
 }
 
-// Once every hour has started no more logs are written, and the peak is set as the
-// output reaches its full size, so what a region holds is worth giving back then.
+// The output file grows until the end, so that is when the peak is set. Near the end,
+// memory in a region beyond one spare is worth more to the score given back, and once
+// every hour has started no region is needed again. A region given back is dropped,
+// so that a worker never takes one it would have to fault again.
 static void give_region(const void *region) {
-  if (next_hour == HOURS)
+  if (next_hour == HOURS || (next_hour >= HOURS * 5 / 6 && pooled)) {
     madvise((void *)region, capacity * 4, MADV_DONTNEED);
+    return;
+  }
   std::lock_guard guard(plan_lock);
   pool[pooled++] = (u32 *)region;
 }
@@ -365,15 +363,13 @@ static void render_hour(size_t hour, u32 *space) {
   u32 *counts = space, *starts = space + MAX_IDS * 2;
   u64 *names = (u64 *)(space + MAX_IDS * 3);
   u32 *values = space + MAX_IDS * 5;
-  size_t known;
-  {
-    // Few names are new after the first hour, so sorting them is a small job.
-    std::lock_guard guard(names_lock);
-    std::sort(order + sorted, order + name_count, by_name);
-    std::inplace_merge(order, order + sorted, order + name_count, by_name);
-    sorted = known = name_count;
-    memcpy(names, order, known * 8);
-  }
+  // Few names are new after the first hour, so sorting them is a small job.
+  names_lock.lock();
+  std::sort(order + sorted, order + name_count, by_name);
+  std::inplace_merge(order, order + sorted, order + name_count, by_name);
+  size_t known = sorted = name_count;
+  memcpy(names, order, known * 8);
+  names_lock.unlock();
   size_t used = cursors[hour].load(relaxed);
   u32 *log = bases[hour].load(relaxed);
   memset(counts, 0, MAX_IDS * 8);
@@ -401,11 +397,13 @@ static void render_hour(size_t hour, u32 *space) {
       latency = log[++i];
     values[slot] = latency;
   }
-  if (log)
-    give_region(log);
+  // Near the end, the log's pages past what its text needs are given back at once.
+  if (next_hour >= HOURS * 5 / 6 && used > 40960)
+    madvise(log + 40960, (used - 40960) * 4, MADV_DONTNEED);
   char label[33] = "2026-MM-DDTHH:00:00Z            ";
   memcpy(label + 5, &stamps[hour], 8);
-  u8 *text = (u8 *)take_region(), *cursor = text;
+  // The log has been read, so its pages hold the text until it is written.
+  u8 *text = (u8 *)(log ? log : take_region()), *cursor = text;
   auto rank = [](size_t p, size_t n) { return (p * n + 99) / 100 - 1; };
   for (size_t i = 0; i < known; i++) {
     u32 id = (u16)names[i], errors = counts[id * 2 + 1];
@@ -441,13 +439,13 @@ static void render_hour(size_t hour, u32 *space) {
 // guessing, before the last hour can be written.
 static size_t next_task() {
   std::lock_guard guard(plan_lock);
-  for (u32 state; (state = chunk_states[parsed_chunks]) & DONE; parsed_chunks++) {
+  for (u32 state; (state = chunk_states[parsed]) & DONE; parsed++) {
     if ((state >> 16 & 255) < hours_over)
       execl("/proc/self/exe", "again", "again", nullptr), _exit(1);
     size_t over = (std::max<size_t>(state & 65535, grace) - grace) / 60;
     hours_over = std::max(hours_over, over);
   }
-  if (parsed_chunks * CHUNK >= input_size)
+  if (parsed * CHUNK >= input_size)
     hours_over = HOURS;
   return next_hour < hours_over ? next_hour++ : HOURS + (next_hour == HOURS);
 }
@@ -456,7 +454,7 @@ static size_t next_task() {
 static bool parse_or_clear(u32 **heads) {
   // No hour can be answered until every chunk before it is done, so if a thread stalls
   // the others would only pile up logs, and peak memory is the worst of five runs.
-  if (next_chunk.load(relaxed) > parsed_chunks + 48 && hours_over < HOURS)
+  if (next_chunk.load(relaxed) > parsed + 48 && hours_over < HOURS)
     return false;
   size_t chunk = next_chunk.fetch_add(1, relaxed), off = chunk * CHUNK;
   if (off < input_size) {
@@ -500,6 +498,7 @@ int main(int argc, char **) {
   // thread stack or a small mapping.
   prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
   memset(masks, 255, 128);
+  memset(masks + 208, 15, 16);
   for (u64 m = 0, all = 0x0706050403020100; m < 256; m++) {
     u64 ones = _pdep_u64(m, 0x0101010101010101) * 255;
     u64 half = _mm_popcnt_u64(m) * 4;
@@ -523,19 +522,13 @@ int main(int argc, char **) {
   madvise((void *)globals, (size_t)_end - globals, MADV_POPULATE_WRITE);
   name_bytes = (char *)take_region();
   madvise(name_bytes, 1 << 17, MADV_POPULATE_WRITE);
-  auto fault_region = [&](size_t i) {
-    madvise(regions + i * capacity, warm, MADV_POPULATE_WRITE);
-  };
-  auto fault_table = [&](size_t off) {
-    *(volatile const u8 *)(input + std::min(off, input_size));
-  };
-  fault_region(1);
-  for (size_t off = 0; off < 1 << 24; off += 1 << 21)
-    fault_table(off);
+  madvise(regions + capacity, warm, MADV_POPULATE_WRITE);
+  size_t table = 0;
+  for (; table < 1 << 24; table += 1 << 21)
+    *(volatile const u8 *)(input + std::min(table, input_size));
   auto stacks = (char *)map_zeroed(WORKERS * STACK);
   pthread_attr_t attr;
   pthread_attr_init(&attr);
-  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
   for (size_t w = 1; w < WORKERS; w++) {
     memset(stacks + w * STACK - 16384, 0, 16384);
     pthread_attr_setstack(&attr, stacks + (w - 1) * STACK, STACK);
@@ -543,14 +536,23 @@ int main(int argc, char **) {
     pthread_create(&thread, &attr, worker, nullptr);
   }
   for (size_t i = 2; i <= FAULTED; i++)
-    fault_region(i);
-  for (size_t off = 1 << 24; off < input_size + (1 << 21); off += 1 << 21)
-    fault_table(off);
+    madvise(regions + i * capacity, warm, MADV_POPULATE_WRITE);
+  for (; table < input_size + (1 << 21); table += 1 << 21)
+    *(volatile const u8 *)(input + std::min(table, input_size));
   int out = open("/out/summary.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
   // This thread alone writes, in order, and parses while the next hour is not ready.
   // Writing the last hour ends the process, which needs no threads to be joined.
   u32 *heads[HOURS * 2] = {};
   for (size_t hour = 0; hour < HOURS;) {
+    // Keeps a faulted region spare, so that workers need not fault one, and near the
+    // end no more than one.
+    while (next_hour >= HOURS * 5 / 6 && pooled > 1)
+      madvise(take_region(), capacity * 4, MADV_DONTNEED);
+    if (!pooled && next_hour < HOURS) {
+      u32 *spare = take_region();
+      madvise(spare, warm, MADV_POPULATE_WRITE);
+      give_region(spare);
+    }
     u32 size = text_sizes[hour];
     if (size) {
       if (write(out, texts[hour], size - 1) != size - 1)
