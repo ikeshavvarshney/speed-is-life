@@ -60,6 +60,8 @@ static const u8 *map_input(const char *path, size_t &size) {
                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   auto base = (const u8 *)((raw + HUGE_PAGE - 1) & -HUGE_PAGE);
   mmap((void *)base, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
+  // Stops the kernel from marking each page as recently used when it is unmapped.
+  madvise((void *)base, size, MADV_SEQUENTIAL);
   // Page tables for the first of it. See the note in main.
   for (size_t off = 0; off < std::min(size, 8 * HUGE_PAGE); off += HUGE_PAGE)
     *(volatile const u8 *)(base + off);
@@ -422,12 +424,13 @@ static int worker(void *index) {
   run(mem.region_job, regions_size - 1, REGION_CHUNK, load_regions);
   while (!mem.bits_ready)
     _mm_pause();
+  // See the note in main. The other threads start at the file's start, and this
+  // moves far faster than they do, so it stays ahead of them.
+  if (!index)
+    for (size_t off = 0; off < input_size; off += HUGE_PAGE)
+      *(volatile const u8 *)(input + off);
   Group *mine = mem.groups + (size_t)index * COUNTRIES;
-  // Chunks are taken far apart, as threads faulting pages under one page table
-  // wait for its lock. 37 shares no factor with a count of chunks near 770.
-  size_t chunks = (input_size + CHUNK - 1) / CHUNK;
-  run(mem.chunk_job, chunks, 1, [=](size_t i) {
-    size_t off = (chunks % 37 ? i * 37 % chunks : i) * CHUNK;
+  run(mem.chunk_job, input_size, CHUNK, [=](size_t off) {
     // The first search skips the header, as it starts with no LF before it.
     size_t first = first_record(off + !off);
     size_t stop = std::min(off + CHUNK, input_size);
@@ -469,8 +472,6 @@ int main() {
           (void *)t);
   // Only the bitsets are on this page, so the workers can load regions meanwhile.
   clear_page(1);
-  for (size_t off = 0; off < input_size; off += HUGE_PAGE)
-    *(volatile const u8 *)(input + off);
   mem.bits_ready = true;
   worker(0);
 
