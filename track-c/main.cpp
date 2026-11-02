@@ -61,7 +61,7 @@ static const u8 *map_input(const char *path, size_t &size) {
   auto base = (const u8 *)((raw + HUGE_PAGE - 1) & -HUGE_PAGE);
   mmap((void *)base, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
   // Page tables for the first of it. See the note in main.
-  for (size_t off = 0; off < std::min(size, 8 * HUGE_PAGE); off += HUGE_PAGE)
+  for (size_t off = 0; off < std::min(size, 2 * HUGE_PAGE); off += HUGE_PAGE)
     *(volatile const u8 *)(base + off);
   return base;
 }
@@ -88,7 +88,6 @@ struct Memory {
   std::atomic_flag codes_lock;
   int code_count;
   atomic<bool> bits_ready;
-  alignas(64) atomic<size_t> mapped;
   Job region_job, chunk_job, country_job;
   // One more than there are codes, so the last entry stands for _UNMATCHED.
   atomic<u8> seen_codes[CODES + 1];
@@ -112,7 +111,7 @@ static void load_regions(size_t off) {
   size_t i = off + 1, stop = std::min(i + REGION_CHUNK, regions_size);
   while (regions[i - 1] != '\n')
     i++;
-  for (; i < stop; i += 5) {
+  while (i < stop) {
     size_t id = 0;
     for (; regions[i] != ','; i++)
       id = id * 10 + regions[i] - '0';
@@ -128,6 +127,7 @@ static void load_regions(size_t off) {
       mem.codes_lock.clear(std::memory_order_release);
     }
     mem.by_id[id] = mem.seen_codes[key].load(relaxed);
+    i += 5;
   }
 }
 
@@ -290,8 +290,11 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
       if (base[start] == 0xEF) [[unlikely]]
         start += 3;
       size_t end = lf - (base[lf - 1] == '\r'), amount_at = c4 + 1;
-      int sign = -(base[amount_at] == '-');
-      amount_at -= sign;
+      int sign = 0;
+      if (base[amount_at] == '-') [[unlikely]] {
+        sign = -1;
+        amount_at++;
+      }
       v4 numbers = decode(digit_word(base + c1, c1 - start),
                           digit_word(base + c4, c4 - m[2] - 1),
                           digit_word(base + end, end - amount_at));
@@ -313,24 +316,26 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
     for (size_t r = 0; r < n; r++) {
       const Rec &rec = recs[r];
       Group &group = mine[ids[rec.region]];
+      auto sums = (v4 *)group.sums;
       // Every value but the amount is positive, so sign extending suits them all.
-      *(v4 *)group.sums += one_count + _mm256_cvtepi32_epi64(rec.values);
+      *sums += one_count + _mm256_cvtepi32_epi64(rec.values);
       int amount = _mm_extract_epi32(rec.values, 1);
       // A new extreme is rare, so this avoids two writes per record.
       if (amount < group.min) [[unlikely]]
         group.min = amount;
       if (amount > group.max) [[unlikely]]
         group.max = amount;
-      // From here on `region` holds the name's bit, counted from the first bitset.
-      u32 at = ids[rec.region] << NAME_BITS | intern(table, rec.hash);
-      __builtin_prefetch(bits + at / 64, 1);
-      recs[r].region = at;
+      size_t name = intern(table, rec.hash);
+      size_t word = ids[rec.region] * WORDS + name / 64;
+      __builtin_prefetch(bits + word, 1);
+      recs[r].hash = word;
+      recs[r].region = name % 64;
     }
     // A set bit costs no write, and a write costs a locked instruction that
     // often has to fetch the line from another core, so it is the last step.
     for (size_t r = 0; r < n; r++) {
-      auto &word = bits[recs[r].region / 64];
-      u64 bit = 1ull << (recs[r].region % 64);
+      auto &word = bits[recs[r].hash];
+      u64 bit = 1ull << recs[r].region;
       if (!(word.load(relaxed) & bit))
         word.fetch_or(bit, relaxed);
     }
@@ -351,7 +356,8 @@ static void parse_chunk(size_t first, size_t stop, Group *mine) {
 // Past a chunk's start, the next record starts after an LF followed by a digit
 // or BOM. Newlines inside notes are always followed by a lowercase word or a
 // quote (spec section 2.2).
-static size_t first_record(size_t i) {
+static size_t first_record(size_t off) {
+  size_t i = off;
   while (i < input_size && !(input[i - 1] == '\n' && (u8(input[i] - '0') < 10 || input[i] == 0xEF)))
     i++;
   return i;
@@ -416,24 +422,16 @@ static int worker(void *index) {
   run(mem.region_job, regions_size - 1, REGION_CHUNK, load_regions);
   while (!mem.bits_ready)
     _mm_pause();
-  // See the note in main. This moves far faster than the other threads, which
-  // wait for it only if they ever catch up.
+  // See the note in main. The other threads start at the file's start, and this
+  // moves far faster than they do, so it stays ahead of them.
   if (!index)
-    for (size_t off = 0; off < input_size; mem.mapped.store(off, relaxed)) {
+    for (size_t off = 0; off < input_size; off += HUGE_PAGE)
       *(volatile const u8 *)(input + off);
-      off += HUGE_PAGE;
-    }
   Group *mine = mem.groups + (size_t)index * COUNTRIES;
   run(mem.chunk_job, input_size, CHUNK, [=](size_t off) {
-    size_t stop = std::min(off + CHUNK, input_size);
-    while (mem.mapped.load(relaxed) < std::min(stop + HUGE_PAGE, input_size))
-      _mm_pause();
     // The first search skips the header, as it starts with no LF before it.
     size_t first = first_record(off + !off);
-    // Faults together here, not between the batches of a chunk, as each one costs
-    // the parsing loop its cached state. The kernel maps 64 KB per fault.
-    for (size_t at = off; at < stop; at += 1 << 16)
-      *(volatile const u8 *)(input + at);
+    size_t stop = std::min(off + CHUNK, input_size);
     if (first < stop)
       parse_chunk(first, stop, mine);
   });
